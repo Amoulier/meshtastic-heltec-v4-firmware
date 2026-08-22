@@ -443,12 +443,16 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
 
             // Alert GPIO Buzzer when receiving a bell = alertBellBuzzer: true
             // Alert GPIO Buzzer when receiving a message = alertMessageBuzzer: true
-            // If you are already buzzing, keep going
-            buzzerShouldAlert =
-                buzzerShouldAlert || (canBuzz() && ((moduleConfig.external_notification.alert_bell_buzzer && containsBell) ||
-                                                    (moduleConfig.external_notification.alert_message_buzzer && !is_muted)));
+            // DIRECT_MSG_ONLY must reject every non-DM event, including bell alerts, before
+            // buzzerShouldAlert is armed. runOnce() uses this flag to start or repeat the ringtone.
+            const bool buzzerMessageAllowed = !buzzerModeIsDirectOnly || isDmToUs;
+            const bool currentBuzzerShouldAlert =
+                canBuzz() && buzzerMessageAllowed &&
+                ((moduleConfig.external_notification.alert_bell_buzzer && containsBell) ||
+                 (moduleConfig.external_notification.alert_message_buzzer && !is_muted));
+            buzzerShouldAlert = buzzerShouldAlert || currentBuzzerShouldAlert;
 
-            if (genericShouldAlert || vibraShouldAlert || buzzerShouldAlert) {
+            if (genericShouldAlert || vibraShouldAlert || currentBuzzerShouldAlert) {
                 nagCycleCutoff = millis() + (moduleConfig.external_notification.nag_timeout
                                                  ? (moduleConfig.external_notification.nag_timeout * 1000)
                                                  : moduleConfig.external_notification.output_ms);
