@@ -92,7 +92,9 @@ int32_t ExternalNotificationModule::runOnce()
 #endif
 
     const bool buzzerWindowExpired =
-        buzzerShouldAlert && (!canBuzz() || buzzerNagCycleCutoff == UINT32_MAX || Throttle::deadlinePassed(buzzerNagCycleCutoff));
+        buzzerShouldAlert &&
+        (!buzzerModeAllowsNotification(config.device.buzzer_mode, buzzerAlertIsDirectMessage) ||
+         buzzerNagCycleCutoff == UINT32_MAX || Throttle::deadlinePassed(buzzerNagCycleCutoff));
     if (buzzerWindowExpired) {
         stopBuzzerNow();
         isRtttlPlaying = false;
@@ -284,6 +286,7 @@ void ExternalNotificationModule::stopBuzzerNow()
         setExternalState(2, false);
     }
     buzzerShouldAlert = false;
+    buzzerAlertIsDirectMessage = false;
     buzzerNagCycleCutoff = UINT32_MAX;
 
 #ifdef HAS_I2S
@@ -448,6 +451,7 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
                 isNagging = true;
                 if (currentBuzzerShouldAlert) {
                     buzzerShouldAlert = true;
+                    buzzerAlertIsDirectMessage = isDmToUs;
                     buzzerNagCycleCutoff = nagCycleCutoff;
                 }
             }
