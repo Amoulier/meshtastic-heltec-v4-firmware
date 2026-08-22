@@ -111,9 +111,8 @@ void playTonesRTTTL(const ToneDuration *tone_durations, int size)
 
 void playTones(const ToneDuration *tone_durations, int size, BuzzerToneType type = BuzzerToneType::SYSTEM)
 {
-    const bool allowed = type == BuzzerToneType::SYSTEM
-                             ? buzzerModeAllowsSystemTones(config.device.buzzer_mode)
-                             : buzzerModeAllowsNotification(config.device.buzzer_mode, false);
+    const bool allowed = type == BuzzerToneType::SYSTEM ? buzzerModeAllowsSystemTones(config.device.buzzer_mode)
+                                                        : buzzerModeAllowsNotification(config.device.buzzer_mode, false);
     if (!allowed) {
         return;
     }
