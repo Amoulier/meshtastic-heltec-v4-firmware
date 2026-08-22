@@ -1,6 +1,7 @@
 #if defined(T_LORA_PAGER)
 
 #include "TLoraPagerKeyboard.h"
+#include "buzz/BuzzerMode.h"
 #include "main.h"
 
 #ifndef LEDC_BACKLIGHT_CHANNEL
@@ -120,8 +121,7 @@ void TLoraPagerKeyboard::pressed(uint8_t key)
     if (state == Init || state == Busy) {
         return;
     }
-    if (config.device.buzzer_mode == meshtastic_Config_DeviceConfig_BuzzerMode_ALL_ENABLED ||
-        config.device.buzzer_mode == meshtastic_Config_DeviceConfig_BuzzerMode_SYSTEM_ONLY) {
+    if (buzzerModeAllowsSystemTones(config.device.buzzer_mode)) {
         hapticFeedback();
     }
 
