@@ -25,6 +25,8 @@ struct ToneDuration {
     int duration_ms;
 };
 
+enum class BuzzerToneType { SYSTEM, NOTIFICATION };
+
 // Some common frequencies.
 #define NOTE_SILENT 1
 #define NOTE_C3 131
@@ -107,9 +109,12 @@ void playTonesRTTTL(const ToneDuration *tone_durations, int size)
 }
 #endif
 
-void playTones(const ToneDuration *tone_durations, int size)
+void playTones(const ToneDuration *tone_durations, int size, BuzzerToneType type = BuzzerToneType::SYSTEM)
 {
-    if (!buzzerModeAllowsSystemTones(config.device.buzzer_mode)) {
+    const bool allowed = type == BuzzerToneType::SYSTEM
+                             ? buzzerModeAllowsSystemTones(config.device.buzzer_mode)
+                             : buzzerModeAllowsNotification(config.device.buzzer_mode, false);
+    if (!allowed) {
         return;
     }
 #ifdef HAS_I2S
@@ -167,7 +172,7 @@ void playBeep()
 void playLongBeep()
 {
     ToneDuration melody[] = {{NOTE_B3, DURATION_1_1}};
-    playTones(melody, sizeof(melody) / sizeof(ToneDuration));
+    playTones(melody, sizeof(melody) / sizeof(ToneDuration), BuzzerToneType::NOTIFICATION);
 }
 
 void playGPSEnableBeep()
