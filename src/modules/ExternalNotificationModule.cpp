@@ -92,8 +92,7 @@ int32_t ExternalNotificationModule::runOnce()
 #endif
 
     const bool buzzerWindowExpired =
-        buzzerShouldAlert && (!canBuzz() || buzzerNagCycleCutoff == UINT32_MAX ||
-                              Throttle::deadlinePassed(buzzerNagCycleCutoff));
+        buzzerShouldAlert && (!canBuzz() || buzzerNagCycleCutoff == UINT32_MAX || Throttle::deadlinePassed(buzzerNagCycleCutoff));
     if (buzzerWindowExpired) {
         stopBuzzerNow();
         isRtttlPlaying = false;
@@ -144,8 +143,7 @@ int32_t ExternalNotificationModule::runOnce()
 #endif
 
 #ifdef HAS_DRV2605
-        if (moduleConfig.external_notification.alert_message_vibra ||
-            moduleConfig.external_notification.alert_bell_vibra) {
+        if (moduleConfig.external_notification.alert_message_vibra || moduleConfig.external_notification.alert_bell_vibra) {
             drv.go();
         }
 #endif
@@ -435,10 +433,9 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
 
             // Alert GPIO Buzzer when receiving a bell = alertBellBuzzer: true
             // Alert GPIO Buzzer when receiving a message = alertMessageBuzzer: true
-            const bool currentBuzzerShouldAlert =
-                buzzerModeAllowsNotification(config.device.buzzer_mode, isDmToUs) &&
-                ((moduleConfig.external_notification.alert_bell_buzzer && containsBell) ||
-                 (moduleConfig.external_notification.alert_message_buzzer && !is_muted));
+            const bool currentBuzzerShouldAlert = buzzerModeAllowsNotification(config.device.buzzer_mode, isDmToUs) &&
+                                                  ((moduleConfig.external_notification.alert_bell_buzzer && containsBell) ||
+                                                   (moduleConfig.external_notification.alert_message_buzzer && !is_muted));
 
             if (genericShouldAlert || vibraShouldAlert || currentBuzzerShouldAlert) {
                 const uint32_t alertDuration =
