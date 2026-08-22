@@ -92,9 +92,8 @@ int32_t ExternalNotificationModule::runOnce()
 #endif
 
     const bool buzzerWindowExpired =
-        buzzerShouldAlert &&
-        (!buzzerModeAllowsNotification(config.device.buzzer_mode, buzzerAlertIsDirectMessage) ||
-         buzzerNagCycleCutoff == UINT32_MAX || Throttle::deadlinePassed(buzzerNagCycleCutoff));
+        buzzerShouldAlert && (!buzzerModeAllowsNotification(config.device.buzzer_mode, buzzerAlertIsDirectMessage) ||
+                              buzzerNagCycleCutoff == UINT32_MAX || Throttle::deadlinePassed(buzzerNagCycleCutoff));
     if (buzzerWindowExpired) {
         stopBuzzerNow();
         isRtttlPlaying = false;
