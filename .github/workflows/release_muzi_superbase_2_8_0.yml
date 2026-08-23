@@ -40,8 +40,47 @@ jobs:
           name: firmware-nrf52840-muzi-base-2.8.0-superbase.1
           path: release-assets
 
-      - name: Create complete firmware bundle
-        run: zip -j -9 firmware-muzi-base-v2.8.0-superbase.1.zip release-assets/*
+      - name: Select Muzi Base release files
+        shell: bash
+        run: |
+          shopt -s nullglob
+          uf2_files=(release-assets/firmware-muzi-base-*.uf2)
+          manifest_files=(release-assets/firmware-muzi-base-*.mt.json)
+
+          if [[ ${#uf2_files[@]} -ne 1 || ${#manifest_files[@]} -ne 1 ]]; then
+            echo "Expected exactly one Muzi Base UF2 and one Muzi Base manifest" >&2
+            printf 'UF2: %s\n' "${uf2_files[@]}" >&2
+            printf 'Manifest: %s\n' "${manifest_files[@]}" >&2
+            exit 1
+          fi
+
+          mkdir curated-release-assets
+          cp "${uf2_files[0]}" "${manifest_files[0]}" curated-release-assets/
+
+      - name: Create Muzi Base firmware bundle
+        run: zip -j -9 firmware-muzi-base-v2.8.0-superbase.1.zip curated-release-assets/*
+
+      - name: Remove stale release assets
+        uses: actions/github-script@v8
+        with:
+          script: |
+            try {
+              const { data: release } = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: 'v2.8.0-superbase.1',
+              });
+
+              for (const asset of release.assets) {
+                await github.rest.repos.deleteReleaseAsset({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  asset_id: asset.id,
+                });
+              }
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
 
       - name: Publish prerelease
         uses: softprops/action-gh-release@v3
@@ -78,5 +117,5 @@ jobs:
             This is an unofficial prerelease from the fork and is not an official Meshtastic stable release.
           files: |
             firmware-muzi-base-v2.8.0-superbase.1.zip
-            release-assets/*.uf2
-            release-assets/*.mt.json
+            curated-release-assets/firmware-muzi-base-*.uf2
+            curated-release-assets/firmware-muzi-base-*.mt.json
