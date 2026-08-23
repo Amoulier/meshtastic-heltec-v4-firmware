@@ -1061,6 +1061,8 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
     config.position.gps_mode = USERPREFS_CONFIG_GPS_MODE;
 #elif !HAS_GPS || GPS_DEFAULT_NOT_PRESENT
     config.position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT;
+#elif defined(GPS_DEFAULT_DISABLED)
+    config.position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_DISABLED;
 #elif !defined(GPS_RX_PIN)
     if (config.position.rx_gpio == 0)
         config.position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT;

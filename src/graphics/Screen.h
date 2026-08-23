@@ -283,6 +283,10 @@ class Screen : public concurrency::OSThread
 
     bool isScreenOn() { return screenOn; }
 
+    /// Prevent automatic screen wakes until the user explicitly restores the display.
+    void setDisplayDisabled(bool disabled);
+    bool isDisplayDisabled() const { return displayDisabled; }
+
     // Stores the last 4 of our hardware ID, to make finding the device for pairing easier
     // FIXME: Needs refactoring and getMacAddr needs to be moved to a utility class
     char ourId[5];
@@ -798,11 +802,17 @@ class Screen : public concurrency::OSThread
     bool useDisplay = false;
     /// Whether the display is currently powered
     bool screenOn = false;
+    bool displayDisabled = false;
+    bool displayRailPowered = true;
     // Whether we are showing the regular screen (as opposed to booth screen or
     // Bluetooth PIN screen)
     bool showingNormalScreen = false;
     /// Track USB power state to only wake screen on actual power state changes
     bool lastPowerUSBState = false;
+
+    void setDisplayRailPower(bool on);
+    static bool loadDisplayDisabled();
+    static void saveDisplayDisabled(bool disabled);
 
     // Implementation to Adjust Brightness
     uint8_t brightness = BRIGHTNESS_DEFAULT; // H = 254, MH = 192, ML = 130 L = 103

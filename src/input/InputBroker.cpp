@@ -4,6 +4,7 @@
 #include "graphics/Screen.h"
 #include "input/HapticFeedback.h"
 #include "modules/ExternalNotificationModule.h"
+#include <cstring>
 #ifdef MESHTASTIC_LOCKDOWN
 #include "security/LockdownDisplay.h"
 #endif
@@ -111,6 +112,17 @@ void InputBroker::processInputEventQueue()
 
 int InputBroker::handleInputEvent(const InputEvent *event)
 {
+#if defined(HELTEC_V4_OLED)
+    if (screen && screen->isDisplayDisabled()) {
+        const bool userButtonLongPress = event && event->source && strcmp(event->source, "UserButton") == 0 &&
+                                         event->inputEvent == INPUT_BROKER_SELECT;
+        if (userButtonLongPress) {
+            screen->setDisplayDisabled(false);
+            powerFSM.trigger(EVENT_INPUT);
+        }
+        return 0;
+    }
+#endif
 #if HAS_SCREEN
     bool screenWasOff = false;
     if (screen) {
@@ -406,7 +418,11 @@ void InputBroker::Init()
         };
         userConfig.singlePress = INPUT_BROKER_USER_PRESS;
         userConfig.longPress = INPUT_BROKER_SELECT;
+#if defined(HELTEC_V4_OLED)
+        userConfig.longPressTime = 1000;
+#else
         userConfig.longPressTime = 500;
+#endif
         userConfig.longLongPress = INPUT_BROKER_SHUTDOWN;
         UserButtonThread->initButton(userConfig);
     } else

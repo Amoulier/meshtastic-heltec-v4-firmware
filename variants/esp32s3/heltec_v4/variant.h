@@ -1,4 +1,4 @@
-#define VEXT_ENABLE 36 // active low, powers the oled display and the lora antenna boost
+#define VEXT_ENABLE 36 // active low, powers the OLED/accessory rail; the LoRa FEM uses LORA_PA_POWER
 #define BUTTON_PIN 0
 
 #define ADC_CTRL 37

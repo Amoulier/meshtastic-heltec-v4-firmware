@@ -2538,9 +2538,9 @@ void menuHandler::screenOptionsMenu()
     bool hasSupportBrightness = false;
 #endif
 
-    enum optionsNumbers { Back, Brightness, FrameToggles, DisplayUnits, MessageBubbles, Theme };
-    static const char *optionsArray[7] = {"Back"};
-    static int optionsEnumArray[7] = {Back};
+    enum optionsNumbers { Back, Brightness, FrameToggles, DisplayUnits, MessageBubbles, Theme, DisableDisplay };
+    static const char *optionsArray[8] = {"Back"};
+    static int optionsEnumArray[8] = {Back};
     int options = 1;
 
     // Only show brightness for B&W displays
@@ -2561,6 +2561,11 @@ void menuHandler::screenOptionsMenu()
 #if GRAPHICS_TFT_COLORING_ENABLED
     optionsArray[options] = "Theme";
     optionsEnumArray[options++] = Theme;
+#endif
+
+#if defined(HELTEC_V4_OLED)
+    optionsArray[options] = "Disable Display";
+    optionsEnumArray[options++] = DisableDisplay;
 #endif
 
     BannerOverlayOptions bannerOptions;
@@ -2584,6 +2589,10 @@ void menuHandler::screenOptionsMenu()
         } else if (selected == Theme) {
             menuHandler::menuQueue = menuHandler::ThemeMenu;
             screen->runNow();
+        } else if (selected == DisableDisplay) {
+            menuHandler::showConfirmationBanner("Disable display?\nHold PRG to restore", []() -> void {
+                screen->setDisplayDisabled(true);
+            });
         } else {
             menuQueue = SystemBaseMenu;
             screen->runNow();

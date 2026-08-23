@@ -87,6 +87,9 @@ extern NicheGraphics::BaseUIEInkDisplay *setupNicheGraphicsBaseUI();
 #include "modules/WaypointModule.h"
 #include "sleep.h"
 #include "target_specific.h"
+#if defined(HELTEC_V4_OLED)
+#include <Preferences.h>
+#endif
 extern MessageStore messageStore;
 
 #if HAS_WIFI && !defined(ARCH_PORTDUINO)
@@ -110,6 +113,11 @@ using namespace meshtastic; /** @todo remove */
 
 namespace graphics
 {
+
+#if defined(HELTEC_V4_OLED)
+static constexpr const char *DISPLAY_PREFS_NAMESPACE = "meshtastic";
+static constexpr const char *DISPLAY_DISABLED_KEY = "display_off";
+#endif
 
 // This means the *visible* area (sh1106 can address 132, but shows 128 for example)
 #define IDLE_FRAMERATE 1 // in fps
@@ -677,6 +685,12 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
     if (!useDisplay)
         return;
 
+    if (on && displayDisabled)
+        return;
+
+    if (on)
+        setDisplayRailPower(true);
+
     if (on != screenOn) {
         if (on) {
             LOG_INFO("Turn on screen");
@@ -834,6 +848,7 @@ void Screen::setup()
 
     // Enable display rendering
     useDisplay = true;
+    displayDisabled = loadDisplayDisabled();
 
     // Load saved brightness from UI config
     // For OLED displays (SSD1306), default brightness is 255 if not set
@@ -974,12 +989,21 @@ void Screen::setup()
     handleSetOn(false); // Ensure proper init for Arduino targets
 #endif
 
-    //  Turn on display and trigger first draw
-    handleSetOn(true);
+    // Turn on display and trigger first draw unless the user disabled it persistently.
+    if (displayDisabled) {
+        dispdev->displayOff();
+        enabled = false;
+        setDisplayRailPower(false);
+        LOG_INFO("Display remains disabled; hold PRG to restore");
+    } else {
+        handleSetOn(true);
+    }
     graphics::currentResolution = graphics::determineScreenResolution(dispdev->height(), dispdev->width());
-    updateUiFrame(ui);
+    if (!displayDisabled)
+        updateUiFrame(ui);
 #ifndef USE_EINK
-    updateUiFrame(ui); // Some SSD1306 clones drop the first draw, so run twice
+    if (!displayDisabled)
+        updateUiFrame(ui); // Some SSD1306 clones drop the first draw, so run twice
 #endif
     serialSinceMsec = millis();
 
@@ -1016,12 +1040,101 @@ void Screen::setup()
     MeshModule::observeUIEvents(&uiFrameEventObserver);
 }
 
+bool Screen::loadDisplayDisabled()
+{
+#if defined(HELTEC_V4_OLED)
+    Preferences preferences;
+    if (!preferences.begin(DISPLAY_PREFS_NAMESPACE, true))
+        return false;
+    const bool disabled = preferences.getBool(DISPLAY_DISABLED_KEY, false);
+    preferences.end();
+    return disabled;
+#else
+    return false;
+#endif
+}
+
+void Screen::saveDisplayDisabled(bool disabled)
+{
+#if defined(HELTEC_V4_OLED)
+    Preferences preferences;
+    if (!preferences.begin(DISPLAY_PREFS_NAMESPACE, false))
+        return;
+    preferences.putBool(DISPLAY_DISABLED_KEY, disabled);
+    preferences.end();
+#else
+    (void)disabled;
+#endif
+}
+
+void Screen::setDisplayRailPower(bool on)
+{
+#if defined(HELTEC_V4_OLED) && defined(VEXT_ENABLE)
+    if (displayRailPowered == on)
+        return;
+
+#ifdef RESET_OLED
+    if (!on) {
+        pinMode(RESET_OLED, OUTPUT);
+        digitalWrite(RESET_OLED, LOW);
+    }
+#endif
+    pinMode(VEXT_ENABLE, OUTPUT);
+    digitalWrite(VEXT_ENABLE, on ? VEXT_ON_VALUE : !VEXT_ON_VALUE);
+    displayRailPowered = on;
+
+    if (on) {
+        delay(10);
+#ifdef RESET_OLED
+        pinMode(RESET_OLED, OUTPUT);
+        digitalWrite(RESET_OLED, HIGH);
+        delay(2);
+        digitalWrite(RESET_OLED, LOW);
+        delay(10);
+        digitalWrite(RESET_OLED, HIGH);
+#endif
+    }
+#else
+    (void)on;
+#endif
+}
+
+void Screen::setDisplayDisabled(bool disabled)
+{
+    if (displayDisabled == disabled)
+        return;
+
+    displayDisabled = disabled;
+    saveDisplayDisabled(disabled);
+
+    if (disabled) {
+        handleSetOn(false);
+        dispdev->displayOff();
+        enabled = false;
+        setDisplayRailPower(false);
+        LOG_INFO("Display disabled persistently");
+    } else {
+        setDisplayRailPower(true);
+#if defined(HELTEC_V4_OLED)
+        dispdev->init();
+        dispdev->setBrightness(brightness);
+        if (!config.display.flip_screen)
+            dispdev->flipScreenVertically();
+#endif
+        handleSetOn(true);
+        LOG_INFO("Display restored by user");
+    }
+}
+
 void Screen::setOn(bool on, FrameCallback einkScreensaver)
 {
 #if defined(T_LORA_PAGER)
     if (cardKbI2cImpl)
         cardKbI2cImpl->toggleBacklight(on);
 #endif
+    if (on && displayDisabled)
+        return;
+
     if (!on) {
 #ifdef MESHTASTIC_LOCKDOWN
         // Screen powering off (idle timeout, shutdown, deep sleep) latches
