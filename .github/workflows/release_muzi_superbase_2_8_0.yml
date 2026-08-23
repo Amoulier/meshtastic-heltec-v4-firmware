@@ -6,6 +6,7 @@ on:
       - release/muzi-base-2.8.0-superbase.1
     paths:
       - .github/workflows/release_muzi_superbase_2_8_0.yml
+      - test/test_radio/test_main.cpp
   workflow_dispatch:
 
 permissions: read-all
