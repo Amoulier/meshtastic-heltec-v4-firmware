@@ -1,0 +1,85 @@
+name: Release MuziWorks Superbase 2.8.0
+
+on:
+  push:
+    branches:
+      - release/muzi-base-2.8.0-superbase.1
+    paths:
+      - .github/workflows/release_muzi_superbase_2_8_0.yml
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  native-tests:
+    uses: ./.github/workflows/test_native.yml
+
+  build-muzi-base:
+    uses: ./.github/workflows/build_firmware.yml
+    with:
+      version: 2.8.0-superbase.1
+      platform: nrf52840
+      pio_env: muzi-base
+
+  build-t-deck-audit:
+    uses: ./.github/workflows/build_firmware.yml
+    with:
+      version: 2.8.0-superbase.1-audit
+      platform: esp32s3
+      pio_env: t-deck
+
+  release:
+    needs:
+      - native-tests
+      - build-muzi-base
+      - build-t-deck-audit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download Muzi Base firmware
+        uses: actions/download-artifact@v8
+        with:
+          name: firmware-nrf52840-muzi-base-2.8.0-superbase.1
+          path: release-assets
+
+      - name: Create complete firmware bundle
+        run: zip -j -9 firmware-muzi-base-v2.8.0-superbase.1.zip release-assets/*
+
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v2.8.0-superbase.1
+          target_commitish: ${{ github.sha }}
+          name: Meshtastic 2.8.0 for MuziWorks Superbase — Power and Buzzer Fixes
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            Custom Meshtastic 2.8.0 build for the MuziWorks Superbase (`muzi-base`), updated to the current upstream `develop` branch at release time.
+
+            ## Included improvements
+
+            - Corrects **DMs Only** so the buzzer sounds only for direct messages addressed to the node.
+            - Centralizes policy for All Enabled, All Disabled, Notifications, System Only, and DMs Only.
+            - Prevents zero-timeout RTTTL alerts from repeating or truncating unexpectedly.
+            - Adds ownership-safe shared audio playback so notifications do not interrupt system tones.
+            - Restores shared I2S output pins after natural or explicit playback completion.
+            - Allows the firmware to power down the Muzi Base GPS rail when GPS is disabled or idle.
+            - Changes the Muzi Base default screen timeout to 30 seconds.
+            - Reduces idle ICM20948 polling to 1 Hz while the sensor is sleeping.
+
+            **RX Boosted Gain was not modified.**
+
+            ## Validation
+
+            This release is published only after the full native test workflow and clean `muzi-base` and `t-deck` firmware builds succeed. Direct-message buzzer behavior was also validated on a physical MuziWorks Superbase. Battery-life improvement still depends on node configuration, traffic, display, GPS, Bluetooth, and MQTT use, so measure field runtime after installation.
+
+            ## Installation
+
+            Download the `.uf2` file, place the Superbase in its UF2/DFU bootloader, and copy the firmware to the mounted drive. Back up the node configuration before updating.
+
+            This is an unofficial prerelease from the fork and is not an official Meshtastic stable release.
+          files: |
+            firmware-muzi-base-v2.8.0-superbase.1.zip
+            release-assets/*.uf2
+            release-assets/*.mt.json
