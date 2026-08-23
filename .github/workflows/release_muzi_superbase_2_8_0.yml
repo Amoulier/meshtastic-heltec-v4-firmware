@@ -8,7 +8,10 @@ on:
       - .github/workflows/release_muzi_superbase_2_8_0.yml
   workflow_dispatch:
 
-permissions: read-all
+permissions:
+  contents: read
+  actions: read
+  checks: write
 
 jobs:
   native-tests:
