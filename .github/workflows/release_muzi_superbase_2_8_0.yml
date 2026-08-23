@@ -25,18 +25,10 @@ jobs:
       platform: nrf52840
       pio_env: muzi-base
 
-  build-t-deck-audit:
-    uses: ./.github/workflows/build_firmware.yml
-    with:
-      version: 2.8.0-superbase.1-audit
-      platform: esp32s3
-      pio_env: t-deck
-
   release:
     needs:
       - native-tests
       - build-muzi-base
-      - build-t-deck-audit
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -76,7 +68,7 @@ jobs:
 
             ## Validation
 
-            This release is published only after the full native test workflow and clean `muzi-base` and `t-deck` firmware builds succeed. Direct-message buzzer behavior was also validated on a physical MuziWorks Superbase. Battery-life improvement still depends on node configuration, traffic, display, GPS, Bluetooth, and MQTT use, so measure field runtime after installation.
+            This release is published only after the full native test workflow and a clean `muzi-base` firmware build succeed. Direct-message buzzer behavior was also validated on a physical MuziWorks Superbase. Battery-life improvement still depends on node configuration, traffic, display, GPS, Bluetooth, and MQTT use, so measure field runtime after installation.
 
             ## Installation
 
