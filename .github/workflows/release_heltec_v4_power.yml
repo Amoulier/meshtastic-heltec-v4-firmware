@@ -1,0 +1,57 @@
+name: Release Heltec V4 Power Optimized
+
+on:
+  push:
+    branches:
+      - "feature/heltec-v4-power-optimization"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build_firmware.yml
+    with:
+      version: heltec-v4-power-v2.8.0.1
+      platform: esp32s3
+      pio_env: heltec-v4
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download Heltec V4 firmware
+        uses: actions/download-artifact@v8
+        with:
+          name: firmware-esp32s3-heltec-v4-heltec-v4-power-v2.8.0.1
+          path: release-assets
+
+      - name: Verify release contents
+        run: |
+          test -n "$(find release-assets -maxdepth 1 -type f -name 'firmware-heltec-v4-*.bin' -print -quit)"
+          find release-assets -maxdepth 1 -type f -print | sort
+
+      - name: Publish Heltec V4 release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: heltec-v4-power-v2.8.0.1
+          target_commitish: ${{ github.sha }}
+          name: Heltec V4 Power Optimized v2.8.0.1
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            Custom Meshtastic firmware exclusively for the Heltec V4 OLED.
+
+            Included improvements:
+            - Persistent `Display Options -> Disable Display` control.
+            - OLED power rail and reset line are shut down when the display is disabled.
+            - Incoming messages and other automatic events do not wake a disabled display.
+            - Holding the PRG button for about one second restores the display.
+            - GPS is disabled by default on a fresh Heltec V4 OLED installation.
+            - GPS initialization and probing are skipped while GPS is disabled.
+            - Display and GPS controls remain independent.
+            - RX Boosted Gain behavior is unchanged.
+
+            Target: `heltec-v4` only. This release does not contain Muziworks Superbase firmware or TFT/R8 builds.
+          files: release-assets/*
+          fail_on_unmatched_files: true
