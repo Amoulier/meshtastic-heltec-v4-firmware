@@ -46,7 +46,10 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
     case INPUT_BROKER_MSG_MUTE_TOGGLE:
         if (moduleConfig.external_notification.enabled && externalNotificationModule) {
             externalNotificationModule->setMute(!externalNotificationModule->getMute());
-            IF_SCREEN(if (!externalNotificationModule->getMute()) externalNotificationModule->stopNow(); screen->showSimpleBanner(
+            if (externalNotificationModule->getMute()) {
+                externalNotificationModule->stopNow();
+            }
+            IF_SCREEN(screen->showSimpleBanner(
                 externalNotificationModule->getMute() ? "Notifications\nDisabled" : "Notifications\nEnabled", 3000);)
         }
         return 0;

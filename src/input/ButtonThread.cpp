@@ -257,7 +257,9 @@ int32_t ButtonThread::runOnce()
             case 4:
                 if (moduleConfig.external_notification.enabled && externalNotificationModule) {
                     externalNotificationModule->setMute(!externalNotificationModule->getMute());
-                    IF_SCREEN(if (!externalNotificationModule->getMute()) externalNotificationModule->stopNow();)
+                    if (externalNotificationModule->getMute()) {
+                        externalNotificationModule->stopNow();
+                    }
                     if (externalNotificationModule->getMute()) {
                         LOG_INFO("Temporarily Muted");
                         play4ClickDown(); // Disable tone

@@ -91,6 +91,10 @@ class ExternalNotificationModule : public SinglePortModule, private concurrency:
 
     bool isSilenced = false;
     bool buzzerShouldAlert = false;
+    bool buzzerAlertIsDirectMessage = false;
+    uint32_t buzzerNagCycleCutoff = UINT32_MAX;
+
+    void stopBuzzerNow();
 
     virtual AdminMessageHandleResult handleAdminMessageForModule(const meshtastic_MeshPacket &mp,
                                                                  meshtastic_AdminMessage *request,
