@@ -5,8 +5,7 @@ on:
     branches:
       - "feature/heltec-v4-power-optimization"
 
-permissions:
-  contents: write
+permissions: read-all
 
 jobs:
   build:
@@ -17,6 +16,9 @@ jobs:
       pio_env: heltec-v4
 
   release:
+    permissions:
+      actions: read
+      contents: write
     runs-on: ubuntu-latest
     needs: build
     steps:
