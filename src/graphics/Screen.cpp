@@ -191,6 +191,9 @@ static void drawLockdownLockScreen(OLEDDisplay *display)
 
 static inline void updateUiFrame(OLEDDisplayUi *ui)
 {
+    if (screen && screen->isDisplayDisabled())
+        return;
+
 #ifdef MESHTASTIC_LOCKDOWN
     if (meshtastic_security::shouldRedactDisplay() && screen != nullptr) {
         OLEDDisplay *display = screen->getDisplayDevice();
@@ -327,6 +330,9 @@ void Screen::showSimpleBanner(const char *message, uint32_t durationMs)
 // Called to trigger a banner with custom message and duration
 void Screen::showOverlayBanner(BannerOverlayOptions banner_overlay_options)
 {
+    if (isDisplayDisabled())
+        return;
+
 #ifdef USE_EINK
     EINK_ADD_FRAMEFLAG(dispdev, DEMAND_FAST); // Skip full refresh for all overlay menus
 #endif
@@ -685,7 +691,7 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
     if (!useDisplay)
         return;
 
-    if (on && displayDisabled)
+    if (on && isDisplayDisabled())
         return;
 
     if (on)
@@ -848,7 +854,7 @@ void Screen::setup()
 
     // Enable display rendering
     useDisplay = true;
-    displayDisabled = loadDisplayDisabled();
+    displayDisabled.store(loadDisplayDisabled(), std::memory_order_release);
 
     // Load saved brightness from UI config
     // For OLED displays (SSD1306), default brightness is 255 if not set
@@ -990,7 +996,7 @@ void Screen::setup()
 #endif
 
     // Turn on display and trigger first draw unless the user disabled it persistently.
-    if (displayDisabled) {
+    if (isDisplayDisabled()) {
         dispdev->displayOff();
         enabled = false;
         setDisplayRailPower(false);
@@ -999,10 +1005,10 @@ void Screen::setup()
         handleSetOn(true);
     }
     graphics::currentResolution = graphics::determineScreenResolution(dispdev->height(), dispdev->width());
-    if (!displayDisabled)
+    if (!isDisplayDisabled())
         updateUiFrame(ui);
 #ifndef USE_EINK
-    if (!displayDisabled)
+    if (!isDisplayDisabled())
         updateUiFrame(ui); // Some SSD1306 clones drop the first draw, so run twice
 #endif
     serialSinceMsec = millis();
@@ -1101,13 +1107,12 @@ void Screen::setDisplayRailPower(bool on)
 
 void Screen::setDisplayDisabled(bool disabled)
 {
-    if (displayDisabled == disabled)
+    if (isDisplayDisabled() == disabled)
         return;
 
-    displayDisabled = disabled;
-    saveDisplayDisabled(disabled);
-
     if (disabled) {
+        displayDisabled.store(true, std::memory_order_release);
+        saveDisplayDisabled(true);
         handleSetOn(false);
         dispdev->displayOff();
         enabled = false;
@@ -1121,6 +1126,8 @@ void Screen::setDisplayDisabled(bool disabled)
         if (!config.display.flip_screen)
             dispdev->flipScreenVertically();
 #endif
+        displayDisabled.store(false, std::memory_order_release);
+        saveDisplayDisabled(false);
         handleSetOn(true);
         LOG_INFO("Display restored by user");
     }
@@ -1132,7 +1139,7 @@ void Screen::setOn(bool on, FrameCallback einkScreensaver)
     if (cardKbI2cImpl)
         cardKbI2cImpl->toggleBacklight(on);
 #endif
-    if (on && displayDisabled)
+    if (on && isDisplayDisabled())
         return;
 
     if (!on) {
@@ -1150,6 +1157,9 @@ void Screen::setOn(bool on, FrameCallback einkScreensaver)
 
 void Screen::forceDisplay(bool forceUiUpdate)
 {
+    if (isDisplayDisabled())
+        return;
+
     // Nasty hack to force epaper updates for 'key' frames.  FIXME, cleanup.
 #ifdef USE_EINK
     // If requested, make sure queued commands are run, and UI has rendered a new frame
@@ -1201,6 +1211,11 @@ int32_t Screen::runOnce()
 {
     // If we don't have a screen, don't ever spend any CPU for us.
     if (!useDisplay) {
+        enabled = false;
+        return RUN_SAME;
+    }
+
+    if (isDisplayDisabled()) {
         enabled = false;
         return RUN_SAME;
     }

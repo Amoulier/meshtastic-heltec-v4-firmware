@@ -5,6 +5,7 @@
 #include "detect/ScanI2C.h"
 #include "mesh/generated/meshtastic/config.pb.h"
 #include <OLEDDisplay.h>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -285,7 +286,7 @@ class Screen : public concurrency::OSThread
 
     /// Prevent automatic screen wakes until the user explicitly restores the display.
     void setDisplayDisabled(bool disabled);
-    bool isDisplayDisabled() const { return displayDisabled; }
+    bool isDisplayDisabled() const { return displayDisabled.load(std::memory_order_acquire); }
 
     // Stores the last 4 of our hardware ID, to make finding the device for pairing easier
     // FIXME: Needs refactoring and getMacAddr needs to be moved to a utility class
@@ -802,7 +803,7 @@ class Screen : public concurrency::OSThread
     bool useDisplay = false;
     /// Whether the display is currently powered
     bool screenOn = false;
-    bool displayDisabled = false;
+    std::atomic<bool> displayDisabled{false};
     bool displayRailPowered = true;
     // Whether we are showing the regular screen (as opposed to booth screen or
     // Bluetooth PIN screen)

@@ -16,6 +16,7 @@ jobs:
       pio_env: heltec-v4
 
   release:
+    if: startsWith(github.event.head_commit.message, 'release(heltec-v4):')
     permissions:
       actions: read
       contents: write
