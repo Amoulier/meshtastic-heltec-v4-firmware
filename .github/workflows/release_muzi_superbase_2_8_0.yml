@@ -22,7 +22,7 @@ jobs:
   build-muzi-base:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: 2.8.0-superbase.1
+      version: 2.8.0-superbase.2
       platform: nrf52840
       pio_env: muzi-base
 
@@ -37,7 +37,7 @@ jobs:
       - name: Download Muzi Base firmware
         uses: actions/download-artifact@v8
         with:
-          name: firmware-nrf52840-muzi-base-2.8.0-superbase.1
+          name: firmware-nrf52840-muzi-base-2.8.0-superbase.2
           path: release-assets
 
       - name: Select Muzi Base release files
@@ -46,46 +46,41 @@ jobs:
           shopt -s nullglob
           uf2_files=(release-assets/firmware-muzi-base-*.uf2)
           manifest_files=(release-assets/firmware-muzi-base-*.mt.json)
+          ota_files=(release-assets/firmware-muzi-base-*-ota.zip)
 
-          if [[ ${#uf2_files[@]} -ne 1 || ${#manifest_files[@]} -ne 1 ]]; then
-            echo "Expected exactly one Muzi Base UF2 and one Muzi Base manifest" >&2
+          if [[ ${#uf2_files[@]} -ne 1 || ${#manifest_files[@]} -ne 1 || ${#ota_files[@]} -ne 1 ]]; then
+            echo "Expected exactly one Muzi Base UF2, manifest, and OTA DFU package" >&2
             printf 'UF2: %s\n' "${uf2_files[@]}" >&2
             printf 'Manifest: %s\n' "${manifest_files[@]}" >&2
+            printf 'OTA: %s\n' "${ota_files[@]}" >&2
             exit 1
           fi
 
           mkdir curated-release-assets
-          cp "${uf2_files[0]}" "${manifest_files[0]}" curated-release-assets/
+          cp "${uf2_files[0]}" "${manifest_files[0]}" "${ota_files[0]}" curated-release-assets/
+
+      - name: Validate Nordic OTA DFU package
+        shell: bash
+        run: |
+          ota_file=(curated-release-assets/firmware-muzi-base-*-ota.zip)
+          mapfile -t ota_entries < <(unzip -Z1 "${ota_file[0]}" | sort)
+          expected_entries=(application.bin application.dat manifest.json)
+
+          if [[ "${ota_entries[*]}" != "${expected_entries[*]}" ]]; then
+            echo "Unexpected Nordic DFU package contents" >&2
+            printf 'Found: %s\n' "${ota_entries[*]}" >&2
+            exit 1
+          fi
+
+          unzip -p "${ota_file[0]}" manifest.json | python -m json.tool
 
       - name: Create Muzi Base firmware bundle
-        run: zip -j -9 firmware-muzi-base-v2.8.0-superbase.1.zip curated-release-assets/*
-
-      - name: Remove stale release assets
-        uses: actions/github-script@v8
-        with:
-          script: |
-            try {
-              const { data: release } = await github.rest.repos.getReleaseByTag({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                tag: 'v2.8.0-superbase.1',
-              });
-
-              for (const asset of release.assets) {
-                await github.rest.repos.deleteReleaseAsset({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  asset_id: asset.id,
-                });
-              }
-            } catch (error) {
-              if (error.status !== 404) throw error;
-            }
+        run: zip -j -9 firmware-muzi-base-v2.8.0-superbase.2-bundle.zip curated-release-assets/*.uf2 curated-release-assets/*.mt.json
 
       - name: Publish prerelease
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v2.8.0-superbase.1
+          tag_name: v2.8.0-superbase.2
           target_commitish: ${{ github.sha }}
           name: Meshtastic 2.8.0 for MuziWorks Superbase — Power and Buzzer Fixes
           prerelease: true
@@ -112,10 +107,14 @@ jobs:
 
             ## Installation
 
-            Download the `.uf2` file, place the Superbase in its UF2/DFU bootloader, and copy the firmware to the mounted drive. Back up the node configuration before updating.
+            - **OTA:** use the `firmware-muzi-base-*-ota.zip` Nordic DFU package. Do not extract it before selecting it in the OTA updater.
+            - **USB recovery/manual install:** place the Superbase in its UF2 bootloader and copy the standalone `.uf2` file to the mounted drive.
+
+            OTA requires the MuziWorks OTAFIX bootloader. Back up the node configuration before updating and keep the node powered throughout the transfer.
 
             This is an unofficial prerelease from the fork and is not an official Meshtastic stable release.
           files: |
-            firmware-muzi-base-v2.8.0-superbase.1.zip
+            firmware-muzi-base-v2.8.0-superbase.2-bundle.zip
             curated-release-assets/firmware-muzi-base-*.uf2
             curated-release-assets/firmware-muzi-base-*.mt.json
+            curated-release-assets/firmware-muzi-base-*-ota.zip
