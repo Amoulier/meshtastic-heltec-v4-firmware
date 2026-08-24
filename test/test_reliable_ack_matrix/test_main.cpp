@@ -5,6 +5,7 @@
 
 #include "MeshTypes.h" // before TestUtil.h: provides NodeNum etc.
 #include "TestUtil.h"
+#include "UptimeClock.h"
 #include <unity.h>
 
 #include "airtime.h"
