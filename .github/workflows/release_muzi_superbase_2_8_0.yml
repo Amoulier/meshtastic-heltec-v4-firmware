@@ -63,16 +63,24 @@ jobs:
         shell: bash
         run: |
           ota_file=(curated-release-assets/firmware-muzi-base-*-ota.zip)
-          mapfile -t ota_entries < <(unzip -Z1 "${ota_file[0]}" | sort)
-          expected_entries=(application.bin application.dat manifest.json)
+          python - "${ota_file[0]}" <<'PY'
+          import json
+          import sys
+          import zipfile
 
-          if [[ "${ota_entries[*]}" != "${expected_entries[*]}" ]]; then
-            echo "Unexpected Nordic DFU package contents" >&2
-            printf 'Found: %s\n' "${ota_entries[*]}" >&2
-            exit 1
-          fi
+          with zipfile.ZipFile(sys.argv[1]) as package:
+              entries = sorted(package.namelist())
+              manifest = json.loads(package.read("manifest.json"))
 
-          unzip -p "${ota_file[0]}" manifest.json | python -m json.tool
+          application = manifest["manifest"]["application"]
+          expected = sorted(["manifest.json", application["bin_file"], application["dat_file"]])
+          if entries != expected:
+              raise SystemExit(f"Unexpected Nordic DFU package contents: {entries}")
+          if not application["bin_file"].endswith(".bin") or not application["dat_file"].endswith(".dat"):
+              raise SystemExit("Nordic DFU manifest has invalid application filenames")
+
+          print(json.dumps(manifest, indent=2, sort_keys=True))
+          PY
 
       - name: Create Muzi Base firmware bundle
         run: zip -j -9 firmware-muzi-base-v2.8.0-superbase.2-bundle.zip curated-release-assets/*.uf2 curated-release-assets/*.mt.json
