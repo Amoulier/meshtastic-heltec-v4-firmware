@@ -11,7 +11,7 @@ jobs:
   build:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: heltec-v4-power-v2.8.0.1
+      version: heltec-v4-power-v2.8.0.2
       platform: esp32s3
       pio_env: heltec-v4
 
@@ -26,7 +26,7 @@ jobs:
       - name: Download Heltec V4 firmware
         uses: actions/download-artifact@v8
         with:
-          name: firmware-esp32s3-heltec-v4-heltec-v4-power-v2.8.0.1
+          name: firmware-esp32s3-heltec-v4-heltec-v4-power-v2.8.0.2
           path: release-assets
 
       - name: Verify release contents
@@ -37,9 +37,9 @@ jobs:
       - name: Publish Heltec V4 release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: heltec-v4-power-v2.8.0.1
+          tag_name: heltec-v4-power-v2.8.0.2
           target_commitish: ${{ github.sha }}
-          name: Heltec V4 Power Optimized v2.8.0.1
+          name: Heltec V4 Power Optimized v2.8.0.2
           prerelease: true
           generate_release_notes: false
           body: |
@@ -54,6 +54,11 @@ jobs:
             - GPS initialization and probing are skipped while GPS is disabled.
             - Display and GPS controls remain independent.
             - RX Boosted Gain behavior is unchanged.
+
+            Hardware validation:
+            - Persistent display disable was tested on a Heltec WiFi LoRa 32 V4.3 OLED.
+            - Incoming messages did not wake the persistently disabled OLED.
+            - Holding PRG for about one second restored the display.
 
             Target: `heltec-v4` only. This release does not contain Muziworks Superbase firmware or TFT/R8 builds.
           files: release-assets/*
