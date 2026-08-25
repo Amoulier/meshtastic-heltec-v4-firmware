@@ -2589,10 +2589,14 @@ void menuHandler::screenOptionsMenu()
         } else if (selected == Theme) {
             menuHandler::menuQueue = menuHandler::ThemeMenu;
             screen->runNow();
+#if defined(HELTEC_V4_OLED)
         } else if (selected == DisableDisplay) {
-            menuHandler::showConfirmationBanner("Disable display?\nHold PRG to restore", []() -> void {
-                screen->setDisplayDisabled(true);
-            });
+            // Defer the confirmation until the current SELECT event has been consumed and the
+            // Display Options banner has reset. Opening it here would feed that same SELECT into
+            // the new confirmation, choose its default "No", and discard it immediately.
+            menuHandler::menuQueue = menuHandler::DisableDisplayConfirm;
+            screen->runNow();
+#endif
         } else {
             menuQueue = SystemBaseMenu;
             screen->runNow();
@@ -2600,6 +2604,13 @@ void menuHandler::screenOptionsMenu()
     };
     screen->showOverlayBanner(bannerOptions);
 }
+
+#if defined(HELTEC_V4_OLED)
+void menuHandler::disableDisplayConfirmMenu()
+{
+    showConfirmationBanner("Disable display?\nHold PRG to restore", []() -> void { screen->setDisplayDisabled(true); });
+}
+#endif
 
 void menuHandler::powerMenu()
 {
@@ -3094,6 +3105,11 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
     case ScreenOptionsMenu:
         screenOptionsMenu();
         break;
+#if defined(HELTEC_V4_OLED)
+    case DisableDisplayConfirm:
+        disableDisplayConfirmMenu();
+        break;
+#endif
     case PowerMenu:
         powerMenu();
         break;

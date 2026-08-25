@@ -44,6 +44,9 @@ class menuHandler
         WifiToggleMenu,
         BluetoothToggleMenu,
         ScreenOptionsMenu,
+#if defined(HELTEC_V4_OLED)
+        DisableDisplayConfirm,
+#endif
         PowerMenu,
         SystemBaseMenu,
         KeyVerificationInit,
@@ -138,6 +141,9 @@ class menuHandler
     static void keyVerificationInitMenu();
     static void keyVerificationFinalPrompt();
     static void bluetoothToggleMenu();
+#if defined(HELTEC_V4_OLED)
+    static void disableDisplayConfirmMenu();
+#endif
 };
 
 /* Generic Menu Options designations  */
