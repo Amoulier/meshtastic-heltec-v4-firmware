@@ -27,7 +27,10 @@ ProcessMessage WaypointModule::handleReceived(const meshtastic_MeshPacket &mp)
     devicestate.rx_waypoint = mp;
     devicestate.has_rx_waypoint = true;
 
-    powerFSM.trigger(EVENT_RECEIVED_MSG);
+#if defined(HELTEC_V4_OLED)
+    if (!screen || !screen->isDisplayDisabled())
+#endif
+        powerFSM.trigger(EVENT_RECEIVED_MSG);
 
 #if HAS_SCREEN
 

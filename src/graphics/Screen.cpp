@@ -330,8 +330,10 @@ void Screen::showSimpleBanner(const char *message, uint32_t durationMs)
 // Called to trigger a banner with custom message and duration
 void Screen::showOverlayBanner(BannerOverlayOptions banner_overlay_options)
 {
-    if (isDisplayDisabled())
+    if (isDisplayDisabled()) {
+        setDisplayRailPower(false);
         return;
+    }
 
 #ifdef USE_EINK
     EINK_ADD_FRAMEFLAG(dispdev, DEMAND_FAST); // Skip full refresh for all overlay menus
@@ -691,8 +693,10 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
     if (!useDisplay)
         return;
 
-    if (on && isDisplayDisabled())
+    if (on && isDisplayDisabled()) {
+        setDisplayRailPower(false);
         return;
+    }
 
     if (on)
         setDisplayRailPower(true);
@@ -1076,7 +1080,9 @@ void Screen::saveDisplayDisabled(bool disabled)
 void Screen::setDisplayRailPower(bool on)
 {
 #if defined(HELTEC_V4_OLED) && defined(VEXT_ENABLE)
-    if (displayRailPowered == on)
+    // Reassert the disabled state even when our cached rail state already says off. This keeps
+    // RESET low and VEXT off if another asynchronous path touched either GPIO.
+    if (on && displayRailPowered)
         return;
 
 #ifdef RESET_OLED
@@ -1107,8 +1113,13 @@ void Screen::setDisplayRailPower(bool on)
 
 void Screen::setDisplayDisabled(bool disabled)
 {
-    if (isDisplayDisabled() == disabled)
+    if (isDisplayDisabled() == disabled) {
+        if (disabled) {
+            enabled = false;
+            setDisplayRailPower(false);
+        }
         return;
+    }
 
     if (disabled) {
         displayDisabled.store(true, std::memory_order_release);
@@ -1139,8 +1150,10 @@ void Screen::setOn(bool on, FrameCallback einkScreensaver)
     if (cardKbI2cImpl)
         cardKbI2cImpl->toggleBacklight(on);
 #endif
-    if (on && isDisplayDisabled())
+    if (on && isDisplayDisabled()) {
+        setDisplayRailPower(false);
         return;
+    }
 
     if (!on) {
 #ifdef MESHTASTIC_LOCKDOWN
@@ -1217,6 +1230,7 @@ int32_t Screen::runOnce()
 
     if (isDisplayDisabled()) {
         enabled = false;
+        setDisplayRailPower(false);
         return RUN_SAME;
     }
 
@@ -2545,6 +2559,13 @@ bool shouldWakeOnReceivedMessage()
     - If role is not CLIENT / CLIENT_MUTE / CLIENT_HIDDEN / CLIENT_BASE
     - If the battery level is very low
     */
+#if defined(HELTEC_V4_OLED)
+    // A persistently disabled display must not feed message reception into the power FSM. The
+    // packet is still stored and delivered normally; only the automatic display wake is suppressed.
+    if (screen && screen->isDisplayDisabled()) {
+        return false;
+    }
+#endif
     if (moduleConfig.external_notification.enabled) {
         return false;
     }
