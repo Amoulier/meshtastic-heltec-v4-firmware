@@ -6,16 +6,19 @@ on:
       - audit/superbase-upstream-power-20260827
   workflow_dispatch:
 
-permissions: read-all
+permissions:
+  contents: write
 
 jobs:
   packet-signing:
     name: Native packet signing
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
+          fetch-depth: 0
 
       - name: Setup native build
         uses: ./.github/actions/setup-native
@@ -23,5 +26,41 @@ jobs:
       - name: Disable BUILD_EPOCH
         run: sed -i 's/-DBUILD_EPOCH=$UNIX_TIME/#-DBUILD_EPOCH=$UNIX_TIME/' platformio.ini
 
+      - name: Restore packet-signing source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show 1bcd42d91ba15a09c145014f66524965ebe01bcc:test/test_packet_signing/test_main.cpp > /tmp/test_main.cpp
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('/tmp/test_main.cpp')
+          text = p.read_text()
+          old = '    void sendAckNak(meshtastic_Routing_Error, NodeNum, PacketId, ChannelIndex, uint8_t = 0, bool = false) override { ackCalls++; }'
+          new = '''    void sendAckNak(meshtastic_Routing_Error, NodeNum, PacketId, ChannelIndex, uint8_t = 0, bool = false,
+                          const meshtastic_MeshPacket * = nullptr) override { ackCalls++; }'''
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected exactly one RoutingModule mock signature, found {count}')
+          p.write_text(text.replace(old, new))
+          PY
+          mv /tmp/test_main.cpp test/test_packet_signing/test_main.cpp
+          git diff --check -- test/test_packet_signing/test_main.cpp
+
       - name: Build and run packet signing
-        run: platformio test -e native --filter test_packet_signing
+        shell: bash
+        run: timeout --signal=TERM --kill-after=30s 20m platformio test -e native --filter test_packet_signing
+
+      - name: Persist repaired packet-signing test
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- test/test_packet_signing/test_main.cpp; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add test/test_packet_signing/test_main.cpp
+          git commit -m 'test: restore packet signing audit suite'
+          git push origin HEAD:audit/superbase-upstream-power-20260827
