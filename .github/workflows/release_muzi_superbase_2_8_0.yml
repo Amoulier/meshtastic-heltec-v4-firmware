@@ -3,10 +3,9 @@ name: Release MuziWorks Superbase 2.8.0
 on:
   push:
     branches:
-      - release/muzi-base-2.8.0-superbase.1
+      - release/muzi-base-2.8.0-superbase.4
     paths:
       - .github/workflows/release_muzi_superbase_2_8_0.yml
-      - test/test_radio/test_main.cpp
   workflow_dispatch:
 
 permissions: read-all
@@ -22,7 +21,7 @@ jobs:
   build-muzi-base:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: 2.8.0-superbase.2
+      version: 2.8.0-superbase.4
       platform: nrf52840
       pio_env: muzi-base
 
@@ -37,7 +36,7 @@ jobs:
       - name: Download Muzi Base firmware
         uses: actions/download-artifact@v8
         with:
-          name: firmware-nrf52840-muzi-base-2.8.0-superbase.2
+          name: firmware-nrf52840-muzi-base-2.8.0-superbase.4
           path: release-assets
 
       - name: Select Muzi Base release files
@@ -83,46 +82,51 @@ jobs:
           PY
 
       - name: Create Muzi Base firmware bundle
-        run: zip -j -9 firmware-muzi-base-v2.8.0-superbase.2-bundle.zip curated-release-assets/*.uf2 curated-release-assets/*.mt.json
+        run: zip -j -9 firmware-muzi-base-v2.8.0-superbase.4-bundle.zip curated-release-assets/*.uf2 curated-release-assets/*.mt.json curated-release-assets/*-ota.zip
 
       - name: Publish prerelease
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v2.8.0-superbase.2
+          tag_name: v2.8.0-superbase.4
           target_commitish: ${{ github.sha }}
-          name: Meshtastic 2.8.0 for MuziWorks Superbase — Power and Buzzer Fixes
+          name: Meshtastic 2.8.0 for MuziWorks Superbase — Upstream Sync and Power Optimization
           prerelease: true
           generate_release_notes: false
           body: |
-            Custom Meshtastic 2.8.0 build for the MuziWorks Superbase (`muzi-base`), updated to the current upstream `develop` branch at release time.
+            Custom Meshtastic 2.8.0 firmware exclusively for the MuziWorks Superbase (`muzi-base`).
 
-            ## Included improvements
+            ## New in this release
 
-            - Corrects **DMs Only** so the buzzer sounds only for direct messages addressed to the node.
-            - Centralizes policy for All Enabled, All Disabled, Notifications, System Only, and DMs Only.
-            - Prevents zero-timeout RTTTL alerts from repeating or truncating unexpectedly.
-            - Adds ownership-safe shared audio playback so notifications do not interrupt system tones.
-            - Restores shared I2S output pins after natural or explicit playback completion.
-            - Allows the firmware to power down the Muzi Base GPS rail when GPS is disabled or idle.
-            - Changes the Muzi Base default screen timeout to 30 seconds.
-            - Reduces idle ICM20948 polling to 1 Hz while the sensor is sleeping.
+            - Integrates the reviewed upstream `develop` changes while preserving the Superbase-specific behavior already validated in this fork.
+            - Keeps the MQTT implicit-ACK fix so a successfully relayed channel broadcast does not later change to **Failed to deliver to mesh** because of a retransmit timeout.
+            - Keeps the corrected **DMs Only** buzzer behavior and the existing Superbase audio/power fixes.
+            - Keeps the Muzi Base stationary position interval at 12 hours instead of adopting the upstream 6-hour interval, reducing unnecessary stationary transmissions.
+            - Improves idle battery use on the Superbase ICM20948: when the screen is off and motion wake/double-tap are not requested, the auxiliary AK09916 magnetometer is placed in power-down together with the sleeping IMU and restored to continuous 100 Hz operation when the IMU wakes.
+            - The AK09916 power optimization is scoped only to `MUZI_BASE`; other ICM20948 targets retain their previous behavior.
 
-            **RX Boosted Gain was not modified.**
+            **RX Boosted Gain and LoRa TX power were not modified.**
 
             ## Validation
 
-            This release is published only after the full native test workflow and a clean `muzi-base` firmware build succeed. Direct-message buzzer behavior was also validated on a physical MuziWorks Superbase. Battery-life improvement still depends on node configuration, traffic, display, GPS, Bluetooth, and MQTT use, so measure field runtime after installation.
+            - Final Superbase native audit: all 8 shards passed.
+            - Packet-signing native audit: passed.
+            - MuziWorks Superbase nRF52840 build: passed.
+            - The release workflow reruns the full native test workflow and performs a fresh `muzi-base` build before publishing.
+            - The Nordic OTA ZIP is structurally validated before upload.
+
+            This build is intended for physical field testing of functionality and battery runtime before being considered stable.
 
             ## Installation
 
-            - **OTA:** use the `firmware-muzi-base-*-ota.zip` Nordic DFU package. Do not extract it before selecting it in the OTA updater.
-            - **USB recovery/manual install:** place the Superbase in its UF2 bootloader and copy the standalone `.uf2` file to the mounted drive.
+            - **OTA:** select the `firmware-muzi-base-*-ota.zip` file without extracting it. OTA requires the MuziWorks OTAFIX bootloader.
+            - **USB/UF2:** enter the UF2 bootloader and copy the standalone `firmware-muzi-base-*.uf2` file to the mounted `muzi-Base` drive.
+            - The bundle ZIP contains the OTA package, UF2 firmware, and Meshtastic manifest for convenience.
 
-            OTA requires the MuziWorks OTAFIX bootloader. Back up the node configuration before updating and keep the node powered throughout the transfer.
+            Back up the node configuration and keep the device powered throughout installation.
 
-            This is an unofficial prerelease from the fork and is not an official Meshtastic stable release.
+            This is an unofficial prerelease from this fork and is not an official Meshtastic stable release.
           files: |
-            firmware-muzi-base-v2.8.0-superbase.2-bundle.zip
+            firmware-muzi-base-v2.8.0-superbase.4-bundle.zip
             curated-release-assets/firmware-muzi-base-*.uf2
             curated-release-assets/firmware-muzi-base-*.mt.json
             curated-release-assets/firmware-muzi-base-*-ota.zip
