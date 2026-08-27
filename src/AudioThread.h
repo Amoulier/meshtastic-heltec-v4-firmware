@@ -91,16 +91,12 @@ class AudioThread : public concurrency::OSThread
         rtttlFile = nullptr;
         rtttlOwner = RtttlOwner::NONE;
 
-#ifdef AUDIO_AMP_ENABLE
-        AUDIO_AMP_ENABLE(true);
-#endif
+        ampEnable(true);
         auto sam = std::unique_ptr<ESP8266SAM>(new ESP8266SAM);
         sam->Say(audioOut.get(), text);
         setCPUFast(false);
         audioOut->stop();
-#ifdef AUDIO_AMP_ENABLE
-        AUDIO_AMP_ENABLE(false);
-#endif
+        ampEnable(false);
         restoreOutputPinMode();
     }
 
@@ -121,9 +117,7 @@ class AudioThread : public concurrency::OSThread
         if (i2sRtttl != nullptr) {
             i2sRtttl->stop();
         }
-#ifdef AUDIO_AMP_ENABLE
-        AUDIO_AMP_ENABLE(true);
-#endif
+        ampEnable(true);
         setCPUFast(true);
         rtttlFile = std::unique_ptr<AudioFileSourcePROGMEM>(new AudioFileSourcePROGMEM(data, len));
         i2sRtttl = std::unique_ptr<AudioGeneratorRTTTL>(new AudioGeneratorRTTTL());
@@ -152,9 +146,7 @@ class AudioThread : public concurrency::OSThread
         rtttlFile = nullptr;
         rtttlOwner = RtttlOwner::NONE;
         setCPUFast(false);
-#ifdef AUDIO_AMP_ENABLE
-        AUDIO_AMP_ENABLE(false);
-#endif
+        ampEnable(false);
         restoreOutputPinMode();
     }
 
@@ -162,6 +154,21 @@ class AudioThread : public concurrency::OSThread
     {
 #if defined(T_DECK) || (defined(BUTTON_PIN) && BUTTON_PIN == 0)
         pinMode(0, INPUT);
+#endif
+    }
+
+    // Amps like the NS4150 need time to leave shutdown, longer when the enable is an I/O expander write.
+    // Without a variant's AUDIO_AMP_SETTLE_MS the short system tones are over before any audio gets out.
+    static void ampEnable(bool on)
+    {
+#ifdef AUDIO_AMP_ENABLE
+        AUDIO_AMP_ENABLE(on);
+#ifdef AUDIO_AMP_SETTLE_MS
+        if (on)
+            delay(AUDIO_AMP_SETTLE_MS);
+#endif
+#else
+        (void)on;
 #endif
     }
 

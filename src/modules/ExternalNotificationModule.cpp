@@ -522,19 +522,7 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
 
             if (vibraShouldAlert) {
                 LOG_INFO("externalNotificationModule - Vibra alert");
-#ifdef HAS_DRV2605
-                // Set DRV2605 waveform when vibration alert is triggered
-                drv.setWaveform(0, 16); // Long buzzer 100%
-                drv.setWaveform(1, 0);  // Pause
-                drv.setWaveform(2, 16);
-                drv.setWaveform(3, 0);
-                drv.setWaveform(4, 16);
-                drv.setWaveform(5, 0);
-                drv.setWaveform(6, 16);
-                drv.setWaveform(7, 0);
-                drv.go();
-#endif
-                setExternalState(1, true);
+                triggerVibraOutput();
             }
 
             if (currentBuzzerShouldAlert) {
@@ -571,6 +559,101 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
     return ProcessMessage::CONTINUE; // Let others look at this message also if they want
 }
 
+void ExternalNotificationModule::triggerBuzzerOutput()
+{
+    if (moduleConfig.external_notification.use_i2s_as_buzzer) {
+#ifdef HAS_I2S
+        if (audioThread->beginRttlIfIdle(rtttlConfig.ringtone, strlen_P(rtttlConfig.ringtone),
+                                         AudioThread::RtttlOwner::EXTERNAL_NOTIFICATION)) {
+            buzzerPlaybackStarted = true;
+            buzzerPlaybackBackend = BuzzerPlaybackBackend::I2S;
+        }
+#endif
+    } else if (moduleConfig.external_notification.use_pwm && config.device.buzzer_gpio) {
+        rtttl::begin(config.device.buzzer_gpio, rtttlConfig.ringtone);
+        buzzerPlaybackStarted = true;
+        buzzerPlaybackBackend = BuzzerPlaybackBackend::PWM;
+    } else {
+#if defined(HAS_I2S_SPEAKER_NRF52)
+        // runOnce starts this backend and records playback only after begin().
+#else
+        setExternalState(2, true);
+        buzzerPlaybackStarted = true;
+        buzzerPlaybackBackend = BuzzerPlaybackBackend::DIGITAL;
+#endif
+    }
+}
+
+void ExternalNotificationModule::triggerVibraOutput()
+{
+#ifdef HAS_DRV2605
+    drv.setWaveform(0, 16);
+    drv.setWaveform(1, 0);
+    drv.setWaveform(2, 16);
+    drv.setWaveform(3, 0);
+    drv.setWaveform(4, 16);
+    drv.setWaveform(5, 0);
+    drv.setWaveform(6, 16);
+    drv.setWaveform(7, 0);
+    drv.go();
+#endif
+    setExternalState(1, true);
+}
+
+void ExternalNotificationModule::armNagCycle()
+{
+    const uint32_t durationMs = moduleConfig.external_notification.nag_timeout
+                                    ? moduleConfig.external_notification.nag_timeout * 1000UL
+                                    : (moduleConfig.external_notification.output_ms
+                                           ? moduleConfig.external_notification.output_ms
+                                           : EXT_NOTIFICATION_MODULE_OUTPUT_MS);
+    nagCycleCutoff = Time::getMillis() + durationMs;
+    LOG_INFO("Toggling nagCycleCutoff to %lu", nagCycleCutoff);
+    isNagging = true;
+}
+
+void ExternalNotificationModule::startNotification()
+{
+    if (!moduleConfig.external_notification.enabled || isSilenced)
+        return;
+
+    const bool generic = moduleConfig.external_notification.alert_message;
+    const bool vibra = moduleConfig.external_notification.alert_message_vibra;
+    const bool buzzer = buzzerModeAllowsNotification(config.device.buzzer_mode, false) &&
+                        moduleConfig.external_notification.alert_message_buzzer &&
+                        (!moduleConfig.external_notification.use_pwm || config.device.buzzer_gpio);
+    if (!generic && !vibra && !buzzer)
+        return;
+
+    armNagCycle();
+
+    if (buzzer) {
+        buzzerShouldAlert = true;
+        buzzerPlaybackStarted = false;
+        buzzerAlertIsDirectMessage = false;
+        buzzerAlertStarted = Time::getMillis();
+        buzzerAlertDurationMs = moduleConfig.external_notification.nag_timeout
+                                    ? moduleConfig.external_notification.nag_timeout * 1000UL
+                                    : (moduleConfig.external_notification.output_ms
+                                           ? moduleConfig.external_notification.output_ms
+                                           : EXT_NOTIFICATION_MODULE_OUTPUT_MS);
+    }
+
+    if (generic) {
+        LOG_INFO("externalNotificationModule - Generic alert");
+        setExternalState(0, true);
+    }
+    if (vibra) {
+        LOG_INFO("externalNotificationModule - Vibra alert");
+        triggerVibraOutput();
+    }
+    if (buzzer) {
+        LOG_INFO("externalNotificationModule - Buzzer alert");
+        triggerBuzzerOutput();
+    }
+
+    setIntervalFromNow(0); // run once so the nag/stop lifecycle in runOnce() takes over
+}
 /**
  * @brief An admin message arrived to AdminModule. We are asked whether we want to handle that.
  *
