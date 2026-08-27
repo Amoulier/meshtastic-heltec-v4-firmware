@@ -1,9 +1,6 @@
 name: Sharded native audit for Superbase
 
 on:
-  push:
-    branches:
-      - audit/superbase-upstream-power-20260827
   workflow_dispatch:
 
 permissions: read-all

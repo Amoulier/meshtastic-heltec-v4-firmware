@@ -1,0 +1,40 @@
+name: Critical native audit for Superbase
+
+on:
+  push:
+    branches:
+      - audit/superbase-upstream-power-20260827
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  critical-suite:
+    name: Critical ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - test_packet_signing
+          - test_phone_api_config_dump
+          - test_pki_admin_fallback
+          - test_position_module
+          - test_position_precision
+          - test_radio
+          - test_reliable_ack_matrix
+          - test_rolling_counter
+          - test_routing_response_hops
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+
+      - name: Setup native build
+        uses: ./.github/actions/setup-native
+
+      - name: Disable BUILD_EPOCH
+        run: sed -i 's/-DBUILD_EPOCH=$UNIX_TIME/#-DBUILD_EPOCH=$UNIX_TIME/' platformio.ini
+
+      - name: Build and run critical suite
+        run: platformio test -e coverage --filter "${{ matrix.suite }}"
