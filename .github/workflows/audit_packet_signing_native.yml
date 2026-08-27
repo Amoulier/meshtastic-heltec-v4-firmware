@@ -1,0 +1,27 @@
+name: Packet signing native audit for Superbase
+
+on:
+  push:
+    branches:
+      - audit/superbase-upstream-power-20260827
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  packet-signing:
+    name: Native packet signing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+
+      - name: Setup native build
+        uses: ./.github/actions/setup-native
+
+      - name: Disable BUILD_EPOCH
+        run: sed -i 's/-DBUILD_EPOCH=$UNIX_TIME/#-DBUILD_EPOCH=$UNIX_TIME/' platformio.ini
+
+      - name: Build and run packet signing
+        run: platformio test -e native --filter test_packet_signing
