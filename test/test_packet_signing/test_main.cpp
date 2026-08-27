@@ -1,2246 +1,1 @@
-// Tests for XEdDSA packet-signing *policy* - the receive-path accept/reject behavior and the
-// send-path signing policy - as opposed to the raw sign/verify primitive (covered in test_crypto).
-//
-// The decision logic under test lives in Router.cpp free functions. Groups A/B drive a real
-// encode -> decode round-trip through the default channel (perhapsEncode/perhapsDecode, black-box,
-// no production changes); later groups exercise routing order and policy helpers directly.
-//
-//   Group A  receive-side accept/reject matrix (verify, downgrade protection, signer-bit learning)
-//   Group B  send-side signing policy (which outgoing packets perhapsEncode signs)
-//   Group C  routing pipeline ordering (authenticate before duplicate/retry/relay state)
-//   Group D  encoding invariants the routing gates depend on
-//   Group E  decoded-ingress policy (checkXeddsaReceivePolicy, the plaintext-MQTT trust boundary)
-
-#include "MeshTypes.h" // include BEFORE TestUtil.h
-#include "NodeStatus.h"
-#include "TestUtil.h"
-#include "airtime.h"
-#include "support/MockMeshService.h"
-#include <unity.h>
-
-// The whole suite exercises XEdDSA sign/verify and checkXeddsaReceivePolicy, all of which are
-// compiled out unless both PKI and XEdDSA are enabled (e.g. stm32 sets MESHTASTIC_EXCLUDE_XEDDSA).
-#if !(MESHTASTIC_EXCLUDE_PKI) && !(MESHTASTIC_EXCLUDE_XEDDSA)
-
-#include "UptimeClock.h"
-#include "mesh/Channels.h"
-#include "mesh/CryptoEngine.h"
-#include "mesh/MeshRadio.h"
-#include "mesh/MeshService.h"
-#include "mesh/NodeDB.h"
-#include "mesh/ReliableRouter.h"
-#include "mesh/Router.h"
-#include "mesh/SinglePortModule.h"
-#include "modules/NodeInfoModule.h"
-#include "modules/RoutingModule.h"
-#include "mqtt/MQTT.h"
-#include <ErriezCRC32.h>
-#include <cstdio>
-#include <cstring>
-#include <memory>
-#include <pb_decode.h>
-#include <pb_encode.h>
-#include <vector>
-
-// ---------------------------------------------------------------------------
-// Test fixture identifiers
-// ---------------------------------------------------------------------------
-static constexpr NodeNum LOCAL_NODE = 0x0A0A0A0A;
-static constexpr NodeNum REMOTE_NODE = 0x0B0B0B0B;
-
-// A "small" broadcast payload whose signed encoding easily fits a LoRa frame, and an "oversized"
-// one whose signed encoding does not, yet still encodes within a LoRa frame unsigned.
-static constexpr size_t SMALL_PAYLOAD = 16;
-static constexpr size_t OVERSIZED_PAYLOAD = 180;
-
-// ---------------------------------------------------------------------------
-// MockNodeDB - inject nodes with controlled public keys / signer bits.
-// Mirrors the pattern in test/test_hop_scaling. meshNodes/numMeshNodes are public on NodeDB.
-// ---------------------------------------------------------------------------
-class MockNodeDB : public NodeDB
-{
-  public:
-    void installDefaultsPreservingIdentity() { installDefaultConfig(true); }
-
-    void clearTestNodes()
-    {
-        testNodes.clear();
-        meshNodes = &testNodes;
-        numMeshNodes = 0;
-    }
-
-    // Add a bare node and return a stable handle (fetch via getMeshNode so the pointer stays valid
-    // even if the vector reallocates after later adds).
-    void addNode(NodeNum num)
-    {
-        meshtastic_NodeInfoLite node = meshtastic_NodeInfoLite_init_zero;
-        node.num = num;
-        testNodes.push_back(node);
-        meshNodes = &testNodes;
-        numMeshNodes = testNodes.size();
-    }
-
-    void setPublicKey(NodeNum num, const uint8_t *pubKey)
-    {
-        meshtastic_NodeInfoLite *n = getMeshNode(num);
-        TEST_ASSERT_NOT_NULL(n);
-        n->public_key.size = 32;
-        memcpy(n->public_key.bytes, pubKey, 32);
-    }
-
-    void setSignerBit(NodeNum num, bool value)
-    {
-        meshtastic_NodeInfoLite *n = getMeshNode(num);
-        TEST_ASSERT_NOT_NULL(n);
-        nodeInfoLiteSetBit(n, NODEINFO_BITFIELD_HAS_XEDDSA_SIGNED_MASK, value);
-    }
-
-    void setLongName(NodeNum num, const char *name)
-    {
-        meshtastic_NodeInfoLite *n = getMeshNode(num);
-        TEST_ASSERT_NOT_NULL(n);
-        strncpy(n->long_name, name, sizeof(n->long_name) - 1);
-        n->long_name[sizeof(n->long_name) - 1] = '\0';
-    }
-
-    const char *longName(NodeNum num)
-    {
-        meshtastic_NodeInfoLite *n = getMeshNode(num);
-        TEST_ASSERT_NOT_NULL(n);
-        return n->long_name;
-    }
-
-    std::vector<meshtastic_NodeInfoLite> testNodes;
-};
-
-static MockNodeDB *mockNodeDB = nullptr;
-
-class AuthPipelineRadio : public RadioInterface
-{
-  public:
-    ErrorCode send(meshtastic_MeshPacket *p) override
-    {
-        sendCalls++;
-        packetPool.release(p);
-        return failSend ? ERRNO_DISABLED : ERRNO_OK;
-    }
-    bool cancelSending(NodeNum, PacketId) override
-    {
-        cancelCalls++;
-        return true;
-    }
-    bool findInTxQueue(NodeNum, PacketId) override
-    {
-        findCalls++;
-        return false;
-    }
-    bool removePendingTXPacket(NodeNum, PacketId, uint32_t) override
-    {
-        removeCalls++;
-        return true;
-    }
-    uint32_t getPacketTime(uint32_t, bool = false) override { return 7; }
-    void reset()
-    {
-        sendCalls = cancelCalls = findCalls = removeCalls = 0;
-        failSend = false;
-    }
-
-    bool failSend = false;
-    uint32_t sendCalls = 0;
-    uint32_t cancelCalls = 0;
-    uint32_t findCalls = 0;
-    uint32_t removeCalls = 0;
-};
-
-class AuthPipelineRouter : public ReliableRouter
-{
-  public:
-    bool filter(meshtastic_MeshPacket *p) { return ReliableRouter::shouldFilterReceived(p); }
-    bool historyContains(const meshtastic_MeshPacket *p) { return wasSeenRecently(p, false); }
-    void remember(const meshtastic_MeshPacket *p) { wasSeenRecently(p, true); }
-    void forgetRelayer(uint8_t relay, PacketId id, NodeNum from) { removeRelayer(relay, id, from); }
-    bool handleUpgrade(meshtastic_MeshPacket *p) { return perhapsHandleUpgradedPacket(p); }
-    void addPending(const meshtastic_MeshPacket &p, uint32_t nextTx)
-    {
-        auto *copy = packetPool.allocCopy(p);
-        TEST_ASSERT_NOT_NULL(copy);
-        const GlobalPacketId key(copy);
-        pending.emplace(key, PendingPacket(copy, NUM_INTERMEDIATE_RETX));
-        pending.at(key).nextTxMsec = nextTx;
-    }
-    uint32_t pendingNextTx(NodeNum from, PacketId id)
-    {
-        PendingPacket *entry = findPendingPacket(from, id);
-        return entry ? entry->nextTxMsec : 0;
-    }
-    uint8_t pendingTotalAttempts(NodeNum from, PacketId id)
-    {
-        PendingPacket *entry = findPendingPacket(from, id);
-        return entry ? entry->initialNumRetransmissions + 1 : 0;
-    }
-    size_t pendingCount() const { return pending.size(); }
-    void clearPending()
-    {
-        for (auto &entry : pending)
-            packetPool.release(entry.second.packet);
-        pending.clear();
-    }
-};
-
-class AuthPipelineRoutingModule : public RoutingModule
-{
-  public:
-    void sendAckNak(meshtastic_Routing_Error, NodeNum, PacketId, ChannelIndex, uint8_t = 0, bool = false) override { ackCalls++; }
-    uint32_t ackCalls = 0;
-};
-
-class AuthPipelineModule : public SinglePortModule
-{
-  public:
-    AuthPipelineModule() : SinglePortModule("authPipeline", meshtastic_PortNum_POSITION_APP) {}
-    ProcessMessage handleReceived(const meshtastic_MeshPacket &) override
-    {
-        calls++;
-        return ProcessMessage::CONTINUE;
-    }
-    uint32_t calls = 0;
-};
-
-class AuthPipelineMqtt : public MQTT
-{
-  public:
-    int queueSize() { return mqttQueue.numUsed(); }
-    void clearQueue()
-    {
-        while (QueueEntry *entry = mqttQueue.dequeuePtr(0))
-            delete entry;
-    }
-};
-
-static AuthPipelineRouter *pipelineRouter = nullptr;
-static AuthPipelineRadio *pipelineRadio = nullptr;
-static AuthPipelineRoutingModule *pipelineRouting = nullptr;
-static AuthPipelineModule *pipelineModule = nullptr;
-static AuthPipelineMqtt *pipelineMqtt = nullptr;
-static MeshService *pipelineService = nullptr;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// Build a decoded packet with a deterministic payload of the requested size.
-static meshtastic_MeshPacket makeDecoded(NodeNum from, NodeNum to, meshtastic_PortNum port, size_t payloadLen)
-{
-    meshtastic_MeshPacket p = meshtastic_MeshPacket_init_zero;
-    p.from = from;
-    p.to = to;
-    p.id = 0x12345678;
-    p.channel = 0; // primary channel index (perhapsEncode rewrites this to the channel hash)
-    p.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
-    p.decoded.portnum = port;
-    p.decoded.payload.size = payloadLen;
-    for (size_t i = 0; i < payloadLen; i++)
-        p.decoded.payload.bytes[i] = (uint8_t)(i & 0xff);
-    return p;
-}
-
-// Sign a decoded packet with the CryptoEngine's current key - used to simulate a *remote* signer,
-// because perhapsEncode only auto-signs packets that originate from us.
-static void signWithCurrentKey(meshtastic_MeshPacket *p)
-{
-    bool ok = crypto->xeddsa_sign(p->from, p->id, p->decoded.portnum, p->decoded.payload.bytes, p->decoded.payload.size,
-                                  p->decoded.xeddsa_signature.bytes);
-    TEST_ASSERT_TRUE_MESSAGE(ok, "xeddsa_sign failed in test setup");
-    p->decoded.xeddsa_signature.size = XEDDSA_SIGNATURE_SIZE;
-}
-
-// Encrypt (perhapsEncode) then decrypt+evaluate (perhapsDecode) the same packet in place.
-static DecodeState roundTrip(meshtastic_MeshPacket *p)
-{
-    meshtastic_Routing_Error enc = perhapsEncode(p);
-    TEST_ASSERT_EQUAL_MESSAGE(meshtastic_Routing_Error_NONE, enc, "perhapsEncode did not succeed");
-    TEST_ASSERT_EQUAL_MESSAGE(meshtastic_MeshPacket_encrypted_tag, p->which_payload_variant,
-                              "perhapsEncode left packet unencrypted");
-    return perhapsDecode(p);
-}
-
-static meshtastic_MeshPacket channelEncode(meshtastic_MeshPacket p)
-{
-    uint8_t encoded[MAX_LORA_PAYLOAD_LEN + 1] = {};
-    const size_t encodedSize = pb_encode_to_bytes(encoded, sizeof(encoded), &meshtastic_Data_msg, &p.decoded);
-    TEST_ASSERT_GREATER_THAN(0, encodedSize);
-    const int16_t hash = channels.setActiveByIndex(p.channel);
-    TEST_ASSERT_GREATER_OR_EQUAL(0, hash);
-    crypto->encryptPacket(p.from, p.id, encodedSize, encoded);
-    memcpy(p.encrypted.bytes, encoded, encodedSize);
-    p.encrypted.size = encodedSize;
-    p.channel = hash;
-    p.which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
-    return p;
-}
-
-static meshtastic_MeshPacket makeSignedWirePacket(NodeNum from, NodeNum to, PacketId id, uint8_t hopLimit = 1,
-                                                  uint8_t hopStart = 2, uint8_t nextHop = NO_NEXT_HOP_PREFERENCE,
-                                                  uint8_t relayNode = 0x33, bool valid = true)
-{
-    meshtastic_MeshPacket p = makeDecoded(from, to, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    p.id = id;
-    p.hop_limit = hopLimit;
-    p.hop_start = hopStart;
-    p.next_hop = nextHop;
-    p.relay_node = relayNode;
-    p.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
-    signWithCurrentKey(&p);
-    if (!valid)
-        p.decoded.xeddsa_signature.bytes[0] ^= 0x80;
-    return channelEncode(p);
-}
-
-static bool remoteSignerBit()
-{
-    return nodeInfoLiteHasXeddsaSigned(mockNodeDB->getMeshNode(REMOTE_NODE));
-}
-
-static void setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy policy)
-{
-    config.security.packet_signature_policy = policy;
-}
-
-// Size a Data message exactly as the wire encoder would.
-static size_t encodedDataSize(const meshtastic_Data *d)
-{
-    size_t s = 0;
-    TEST_ASSERT_TRUE_MESSAGE(pb_get_encoded_size(&s, &meshtastic_Data_msg, d), "pb_get_encoded_size failed");
-    return s;
-}
-
-// Would this Data still fit a LoRa frame with a 64-byte signature attached? Mirror of the
-// production gate in Router.cpp (signedDataFits / the perhapsDecode downgrade predicate).
-static bool signedEncodingFits(const meshtastic_Data *d)
-{
-    meshtastic_Data copy = *d;
-    copy.xeddsa_signature.size = XEDDSA_SIGNATURE_SIZE;
-    return encodedDataSize(&copy) + MESHTASTIC_HEADER_LENGTH <= MAX_LORA_PAYLOAD_LEN;
-}
-
-// Append a length-delimited field whose tag this build's Data schema does not define, as a sender
-// on a newer schema would emit. nanopb skips unknown fields at decode, so these bytes count toward
-// the raw wire size but not the decoded struct. Returns the number of bytes appended.
-static size_t appendUnknownField(uint8_t *dst, size_t dstLen, size_t contentLen)
-{
-    constexpr uint32_t UNKNOWN_FIELD_NUMBER = 100; // not a field of meshtastic_Data
-    std::vector<uint8_t> content(contentLen, 0x77);
-    pb_ostream_t stream = pb_ostream_from_buffer(dst, dstLen);
-    TEST_ASSERT_TRUE(pb_encode_tag(&stream, PB_WT_STRING, UNKNOWN_FIELD_NUMBER));
-    TEST_ASSERT_TRUE(pb_encode_string(&stream, content.data(), content.size()));
-    return stream.bytes_written;
-}
-
-// Channel-encrypt raw Data bytes into a packet, exactly as perhapsEncode's non-PKI path does.
-// Used to inject wire bytes perhapsEncode would never produce (it only encodes p->decoded).
-static void encryptAsChannelPacket(meshtastic_MeshPacket *p, uint8_t *wire, size_t size)
-{
-    const int16_t hash = channels.setActiveByIndex(0);
-    TEST_ASSERT_GREATER_OR_EQUAL_MESSAGE(0, hash, "no usable primary channel");
-    crypto->encryptPacket(getFrom(p), p->id, size, wire);
-    memcpy(p->encrypted.bytes, wire, size);
-    p->encrypted.size = size;
-    p->channel = hash; // on the wire the channel field carries the hash, not the index
-    p->which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
-}
-
-// Build A10's frame: an unsigned broadcast carrying a POSITION payload plus unknown fields, sized
-// so the raw wire length exceeds the signature-fit threshold while the decoded fields stay under
-// it. Channel-encrypted like a normal sender. The asserts pin that split, which is what makes A10
-// and A11 meaningful.
-static meshtastic_MeshPacket makeBroadcastWithUnknownFields()
-{
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-
-    uint8_t wire[MAX_LORA_PAYLOAD_LEN + 1];
-    const size_t base = pb_encode_to_bytes(wire, sizeof(wire), &meshtastic_Data_msg, &p.decoded);
-    TEST_ASSERT_GREATER_THAN_MESSAGE(0, base, "failed to encode the base Data");
-    const size_t raw = base + appendUnknownField(wire + base, sizeof(wire) - base, 160);
-
-    // The decoded fields fit a signature, so a sender that signs would have signed this Data.
-    TEST_ASSERT_LESS_OR_EQUAL_MESSAGE(MAX_LORA_PAYLOAD_LEN, base + XEDDSA_SIGNATURE_FIELD_BYTES + MESHTASTIC_HEADER_LENGTH,
-                                      "decoded fields must fit a signature, else the test is vacuous");
-    // The unknown fields put the raw size over that threshold, so the two sizings disagree here.
-    TEST_ASSERT_GREATER_THAN_MESSAGE(MAX_LORA_PAYLOAD_LEN, raw + XEDDSA_SIGNATURE_FIELD_BYTES + MESHTASTIC_HEADER_LENGTH,
-                                     "unknown fields must push the raw size past the fit threshold");
-    // The frame is still one a radio could actually send.
-    TEST_ASSERT_LESS_OR_EQUAL_MESSAGE(MAX_LORA_PAYLOAD_LEN, raw + MESHTASTIC_HEADER_LENGTH, "frame must still fit a LoRa frame");
-
-    encryptAsChannelPacket(&p, wire, raw);
-    return p;
-}
-
-// ---------------------------------------------------------------------------
-// Unity lifecycle
-// ---------------------------------------------------------------------------
-void setUp(void)
-{
-    service = pipelineService;
-
-    // Construct the mock FIRST: the NodeDB constructor can reload persisted state from the
-    // host filesystem (portduino VFS) and repopulate the globals - a saved private key
-    // re-enables the PKI encrypt path and fails the unicast tests on hosts with leftover prefs.
-    mockNodeDB = new MockNodeDB();
-    mockNodeDB->clearTestNodes();
-#if WARM_NODE_COUNT > 0
-    mockNodeDB->warmStore.clear();
-#endif
-    nodeDB = mockNodeDB;
-
-    // Clean global config/owner AFTER the ctor; zeroed config => rebroadcast ALL (no KNOWN_ONLY
-    // drop) and security.private_key.size == 0 (PKI encrypt path skipped => simple channel crypto).
-    config = meshtastic_LocalConfig_init_zero;
-    moduleConfig = meshtastic_LocalModuleConfig_init_zero;
-    owner = meshtastic_User_init_zero;
-    // Exercise the downgrade-protection matrix by default. Production defaults to
-    // COMPATIBLE so existing meshes remain interoperable; tests that cover that
-    // mode opt in explicitly.
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_BALANCED);
-    myNodeInfo.my_node_num = LOCAL_NODE; // drives isFromUs()/getFrom()/isToUs()
-
-    // Working primary channel with the default PSK so encrypt/decrypt round-trips.
-    channels.initDefaults();
-    channels.onConfigChanged();
-
-    pipelineRouter->clearPending();
-    pipelineRouter->rxDupe = 0;
-    pipelineRouter->txRelayCanceled = 0;
-    pipelineRadio->reset();
-    pipelineRouting->ackCalls = 0;
-    pipelineModule->calls = 0;
-    pipelineMqtt->clearQueue();
-    while (meshtastic_MeshPacket *queued = pipelineService->getForPhone())
-        packetPool.release(queued);
-    while (meshtastic_QueueStatus *queued = pipelineService->getQueueStatusForPhone())
-        pipelineService->releaseQueueStatusToPool(queued);
-    resetRoutingAuthEvaluationCount();
-}
-
-// Set while C14's saturated AirTime is installed; see useDutyCycleSaturatedAirTime() below.
-static AirTime *c14SavedAirTime = nullptr;
-
-void tearDown(void)
-{
-    delete mockNodeDB;
-    mockNodeDB = nullptr;
-    nodeDB = nullptr;
-
-    // Restore globals here, not at the end of a test body: an assertion aborts the body, and these
-    // would otherwise leak into every later case. The injected clock is the one the N8-N11
-    // suppression-window cases drive; the region and the AirTime swap are C14's duty-cycle setup.
-    Time::useRealClock();
-    Time::resetMonotonicForTests();
-    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
-    initRegion();
-    if (c14SavedAirTime) {
-        airTime = c14SavedAirTime;
-        c14SavedAirTime = nullptr;
-    }
-}
-
-// ===========================================================================
-// Group A - receive-side accept/reject matrix
-// ===========================================================================
-
-// A1: valid signature from a node whose key we know -> accepted, marked signed, signer bit learned.
-void test_A1_valid_signature_accepted_and_learns_signer(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv); // engine now holds REMOTE's key
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setPublicKey(REMOTE_NODE, pub);
-
-    TEST_ASSERT_FALSE(remoteSignerBit()); // not known as a signer yet
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-    signWithCurrentKey(&p);
-
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-    TEST_ASSERT_TRUE(p.xeddsa_signed);
-    TEST_ASSERT_TRUE_MESSAGE(remoteSignerBit(), "verified signature must set the signer bit");
-}
-
-// A2: a tampered signature from a known key -> dropped.
-void test_A2_bad_signature_dropped(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_COMPATIBLE);
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setPublicKey(REMOTE_NODE, pub);
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-    signWithCurrentKey(&p);
-    p.decoded.xeddsa_signature.bytes[0] ^= 0xFF; // corrupt the signature
-
-    TEST_ASSERT_EQUAL(DECODE_POLICY_REJECT, roundTrip(&p));
-}
-
-// A3: signed packet but we have no key for the sender -> accepted unverified, signer bit NOT set.
-void test_A3_signed_no_pubkey_accepted_unverified(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_BALANCED);
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-    mockNodeDB->addNode(REMOTE_NODE); // node exists, but no public key stored
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-    signWithCurrentKey(&p);
-
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-    TEST_ASSERT_FALSE_MESSAGE(p.xeddsa_signed, "cannot be marked verified without a key");
-    TEST_ASSERT_FALSE_MESSAGE(remoteSignerBit(), "must not learn signer without verifying");
-}
-
-// A4: downgrade protection - unsigned small broadcast from a known signer -> dropped.
-void test_A4_downgrade_unsigned_broadcast_from_signer_dropped(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true); // we've seen this node sign before
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-    // from != us, so perhapsEncode leaves it unsigned.
-
-    TEST_ASSERT_EQUAL(DECODE_POLICY_REJECT, roundTrip(&p));
-}
-
-// A5: no prior knowledge - unsigned small broadcast from a non-signer -> accepted.
-void test_A5_unsigned_broadcast_from_nonsigner_accepted(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE); // signer bit clear
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-    TEST_ASSERT_FALSE(p.xeddsa_signed);
-}
-
-// A6: unsigned UNICAST from a known signer -> accepted (unicasts are never signed).
-void test_A6_unsigned_unicast_from_signer_accepted(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    // Unicast to us; PRIVATE_APP avoids the unrelated legacy-DM rejection for TEXT_MESSAGE_APP.
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, LOCAL_NODE, meshtastic_PortNum_PRIVATE_APP, SMALL_PAYLOAD);
-
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-}
-
-// A7: unsigned OVERSIZED broadcast from a known signer -> accepted (couldn't have carried a sig).
-void test_A7_unsigned_oversized_broadcast_from_signer_accepted(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, OVERSIZED_PAYLOAD);
-
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-}
-
-// A8: F2 regression - unsigned broadcast from a signer in the old "dead band": its *encoded* Data
-// can't take a 64-byte signature and still fit a LoRa frame, but the old payload-size heuristic
-// (payload + 64 < DATA_PAYLOAD_LEN) judged it signable and dropped it as a downgrade. Must be
-// accepted: an honest signer physically cannot sign this packet.
-void test_A8_unsigned_deadband_broadcast_from_signer_accepted(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    // Shape it like a real sender's Data: perhapsEncode adds the bitfield to packets a node
-    // originates, so remote broadcast traffic carries it too.
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, 167);
-    p.decoded.has_bitfield = true;
-    p.decoded.bitfield = 0;
-
-    // Pin the payload inside the dead band; if Data's encoding ever shifts, retune the payload
-    // size above instead of letting this test pass vacuously.
-    TEST_ASSERT_TRUE_MESSAGE(p.decoded.payload.size + XEDDSA_SIGNATURE_SIZE < meshtastic_Constants_DATA_PAYLOAD_LEN,
-                             "payload must sit in the old heuristic's drop range");
-    TEST_ASSERT_FALSE_MESSAGE(signedEncodingFits(&p.decoded), "signed encoding must NOT fit a LoRa frame");
-
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-    TEST_ASSERT_FALSE(p.xeddsa_signed);
-}
-
-// A9: the boundary holds - the largest broadcast whose signed encoding still fits is still
-// subject to the downgrade drop when it arrives unsigned from a known signer.
-// (Deliberately non-discriminating: the old heuristic dropped this packet too. A9 pins the
-// boundary against over-correction; A8 and B4 are the F2 regression discriminators.)
-void test_A9_unsigned_boundary_broadcast_from_signer_still_dropped(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, 166);
-    p.decoded.has_bitfield = true;
-    p.decoded.bitfield = 0;
-
-    // Exactly at the limit: signed encoding fills the frame to the last byte. Pinned so the
-    // boundary can't silently drift.
-    meshtastic_Data signedCopy = p.decoded;
-    signedCopy.xeddsa_signature.size = XEDDSA_SIGNATURE_SIZE;
-    TEST_ASSERT_EQUAL_MESSAGE(MAX_LORA_PAYLOAD_LEN, encodedDataSize(&signedCopy) + MESHTASTIC_HEADER_LENGTH,
-                              "payload no longer sits exactly on the fit boundary - retune it");
-
-    TEST_ASSERT_EQUAL(DECODE_POLICY_REJECT, roundTrip(&p));
-}
-
-void test_A10_compatible_accepts_unsigned_broadcast_from_signer(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_COMPATIBLE);
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-}
-
-void test_A11_strict_rejects_unsigned_all_portnums_destinations_and_sizes(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    const meshtastic_PortNum ports[] = {
-        meshtastic_PortNum_TEXT_MESSAGE_APP, meshtastic_PortNum_POSITION_APP, meshtastic_PortNum_TELEMETRY_APP,
-        meshtastic_PortNum_NODEINFO_APP,     meshtastic_PortNum_WAYPOINT_APP,
-    };
-    for (const auto port : ports) {
-        meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, port, SMALL_PAYLOAD);
-        TEST_ASSERT_EQUAL(DECODE_POLICY_REJECT, roundTrip(&p));
-    }
-
-    meshtastic_MeshPacket unicast = makeDecoded(REMOTE_NODE, LOCAL_NODE, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    TEST_ASSERT_EQUAL(DECODE_POLICY_REJECT, roundTrip(&unicast));
-
-    meshtastic_MeshPacket oversized =
-        makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_POSITION_APP, OVERSIZED_PAYLOAD);
-    TEST_ASSERT_EQUAL(DECODE_POLICY_REJECT, roundTrip(&oversized));
-}
-
-void test_A12_strict_rejects_signed_packet_without_key(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    signWithCurrentKey(&p);
-    TEST_ASSERT_EQUAL(DECODE_POLICY_REJECT, roundTrip(&p));
-}
-
-void test_A13_strict_accepts_locally_authenticated_pki_packet(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    uint8_t localPub[32], localPriv[32], remotePub[32], remotePriv[32];
-    crypto->generateKeyPair(localPub, localPriv);
-    crypto->generateKeyPair(remotePub, remotePriv);
-    mockNodeDB->addNode(LOCAL_NODE);
-    mockNodeDB->setPublicKey(LOCAL_NODE, localPub);
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setPublicKey(REMOTE_NODE, remotePub);
-
-    meshtastic_Data data = meshtastic_Data_init_zero;
-    data.portnum = meshtastic_PortNum_PRIVATE_APP;
-    data.payload.size = SMALL_PAYLOAD;
-    memset(data.payload.bytes, 0x5A, data.payload.size);
-    uint8_t plaintext[MAX_LORA_PAYLOAD_LEN + 1] = {};
-    const size_t plaintextSize = pb_encode_to_bytes(plaintext, sizeof(plaintext), &meshtastic_Data_msg, &data);
-    TEST_ASSERT_GREATER_THAN(0, plaintextSize);
-
-    meshtastic_NodeInfoLite_public_key_t localKey = {32, {0}};
-    memcpy(localKey.bytes, localPub, sizeof(localPub));
-    meshtastic_MeshPacket p = meshtastic_MeshPacket_init_zero;
-    p.from = REMOTE_NODE;
-    p.to = LOCAL_NODE;
-    p.id = 0x0CC01234;
-    p.channel = 0;
-    p.which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
-    crypto->setDHPrivateKey(remotePriv);
-    TEST_ASSERT_TRUE(crypto->encryptCurve25519(p.to, p.from, localKey, p.id, plaintextSize, plaintext, p.encrypted.bytes));
-    p.encrypted.size = plaintextSize + MESHTASTIC_PKC_OVERHEAD;
-
-    // Only the receiver's private key can establish the local pki_encrypted authentication marker.
-    crypto->setDHPrivateKey(localPriv);
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, perhapsDecode(&p));
-    TEST_ASSERT_TRUE(p.pki_encrypted);
-    TEST_ASSERT_EQUAL(meshtastic_PortNum_PRIVATE_APP, p.decoded.portnum);
-}
-
-void test_A13b_strict_rejects_spoofed_pki_flag_on_encrypted_ingress(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, LOCAL_NODE, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_NONE, perhapsEncode(&p));
-    p.pki_encrypted = true;
-    p.public_key.size = 32;
-    memset(p.public_key.bytes, 0xAB, p.public_key.size);
-
-    TEST_ASSERT_EQUAL(DECODE_POLICY_REJECT, perhapsDecode(&p));
-    TEST_ASSERT_FALSE(p.pki_encrypted);
-    TEST_ASSERT_EQUAL(0, p.public_key.size);
-}
-
-void test_A14_strict_bootstraps_identity_bound_signed_nodeinfo(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-    const NodeNum signer = crc32Buffer(pub, sizeof(pub));
-
-    meshtastic_User user = meshtastic_User_init_zero;
-    user.public_key.size = sizeof(pub);
-    memcpy(user.public_key.bytes, pub, sizeof(pub));
-    meshtastic_MeshPacket p = makeDecoded(signer, NODENUM_BROADCAST, meshtastic_PortNum_NODEINFO_APP, 0);
-    p.decoded.payload.size =
-        pb_encode_to_bytes(p.decoded.payload.bytes, sizeof(p.decoded.payload.bytes), &meshtastic_User_msg, &user);
-    signWithCurrentKey(&p);
-
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-    const meshtastic_NodeInfoLite *node = mockNodeDB->getMeshNode(signer);
-    TEST_ASSERT_NOT_NULL(node);
-    TEST_ASSERT_EQUAL_UINT8_ARRAY(pub, node->public_key.bytes, sizeof(pub));
-    TEST_ASSERT_TRUE(p.xeddsa_signed);
-}
-
-void test_A15_strict_rejects_nodeinfo_key_without_identity_binding(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-
-    meshtastic_User user = meshtastic_User_init_zero;
-    user.public_key.size = sizeof(pub);
-    memcpy(user.public_key.bytes, pub, sizeof(pub));
-    meshtastic_MeshPacket p =
-        makeDecoded(crc32Buffer(pub, sizeof(pub)) ^ 1, NODENUM_BROADCAST, meshtastic_PortNum_NODEINFO_APP, 0);
-    p.decoded.payload.size =
-        pb_encode_to_bytes(p.decoded.payload.bytes, sizeof(p.decoded.payload.bytes), &meshtastic_User_msg, &user);
-    signWithCurrentKey(&p);
-
-    TEST_ASSERT_EQUAL(DECODE_POLICY_REJECT, roundTrip(&p));
-    TEST_ASSERT_NULL(mockNodeDB->getMeshNode(p.from));
-}
-
-void test_A16_compatible_rejects_invalid_first_contact_nodeinfo(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_COMPATIBLE);
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-
-    meshtastic_User user = meshtastic_User_init_zero;
-    user.public_key.size = sizeof(pub);
-    memcpy(user.public_key.bytes, pub, sizeof(pub));
-    meshtastic_MeshPacket p =
-        makeDecoded(crc32Buffer(pub, sizeof(pub)) ^ 1, NODENUM_BROADCAST, meshtastic_PortNum_NODEINFO_APP, 0);
-    p.decoded.payload.size =
-        pb_encode_to_bytes(p.decoded.payload.bytes, sizeof(p.decoded.payload.bytes), &meshtastic_User_msg, &user);
-    signWithCurrentKey(&p);
-
-    TEST_ASSERT_EQUAL(DECODE_POLICY_REJECT, roundTrip(&p));
-}
-
-#if WARM_NODE_COUNT > 0
-void test_A17_strict_verifies_signer_from_warm_key_store(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-    TEST_ASSERT_TRUE(mockNodeDB->warmStore.absorb(REMOTE_NODE, 1, pub));
-    TEST_ASSERT_NULL(mockNodeDB->getMeshNode(REMOTE_NODE));
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    signWithCurrentKey(&p);
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-    TEST_ASSERT_TRUE(p.xeddsa_signed);
-    const meshtastic_NodeInfoLite *rehydrated = mockNodeDB->getMeshNode(REMOTE_NODE);
-    TEST_ASSERT_NOT_NULL_MESSAGE(rehydrated, "verified warm signer must be re-admitted to the hot store");
-    TEST_ASSERT_EQUAL_UINT8_ARRAY(pub, rehydrated->public_key.bytes, sizeof(pub));
-    TEST_ASSERT_TRUE_MESSAGE(nodeInfoLiteHasXeddsaSigned(rehydrated), "re-admitted signer must retain Balanced downgrade memory");
-
-    // Model its next hot-store eviction and prove Balanced still remembers the signer without
-    // allocating a hot node merely to evaluate an unsigned packet.
-    // Mirror what NodeDB eviction actually stores for a signer: warmProtectedCategory() yields
-    // XeddsaSigner *and* the dedicated warm signer bit is set from nodeInfoLiteHasXeddsaSigned().
-    // isKnownXeddsaSigner() reads that signer bit, not the protected category.
-    TEST_ASSERT_TRUE(mockNodeDB->warmStore.absorb(REMOTE_NODE, 2, pub, meshtastic_Config_DeviceConfig_Role_CLIENT,
-                                                  static_cast<uint8_t>(WarmProtected::XeddsaSigner), /*signer=*/true));
-    mockNodeDB->clearTestNodes();
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_BALANCED);
-    meshtastic_MeshPacket unsignedPacket =
-        makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    TEST_ASSERT_FALSE_MESSAGE(checkXeddsaReceivePolicy(&unsignedPacket),
-                              "Balanced downgrade memory must survive repeated hot-store eviction");
-}
-#endif
-
-void test_A18_unsigned_broadcast_from_signer_with_unknown_fields_dropped(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    meshtastic_MeshPacket p = makeBroadcastWithUnknownFields();
-
-    TEST_ASSERT_EQUAL_MESSAGE(DECODE_POLICY_REJECT, perhapsDecode(&p),
-                              "unsigned broadcast from a signer must be dropped despite unknown fields");
-}
-
-void test_A19_unsigned_broadcast_from_nonsigner_with_unknown_fields_accepted(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-
-    meshtastic_MeshPacket p = makeBroadcastWithUnknownFields();
-    const size_t rawSize = p.encrypted.size;
-
-    TEST_ASSERT_EQUAL_MESSAGE(DECODE_SUCCESS, perhapsDecode(&p), "frame from a non-signer must still decode");
-    TEST_ASSERT_EQUAL_MESSAGE(meshtastic_PortNum_POSITION_APP, p.decoded.portnum, "unknown fields must not disturb the portnum");
-    TEST_ASSERT_EQUAL_MESSAGE(SMALL_PAYLOAD, p.decoded.payload.size, "payload must survive the unknown fields");
-    TEST_ASSERT_FALSE(p.xeddsa_signed);
-    TEST_ASSERT_LESS_THAN_MESSAGE(rawSize, encodedDataSize(&p.decoded),
-                                  "unknown fields must drop at decode, leaving decoded size < raw");
-}
-
-// ===========================================================================
-// Group B - send-side signing policy (perhapsEncode)
-// ===========================================================================
-
-// B1: our own small broadcast is auto-signed (and verifies on the way back in).
-void test_B1_local_broadcast_is_signed(void)
-{
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv); // engine signs with this; store the matching pubkey for us
-    mockNodeDB->addNode(LOCAL_NODE);
-    mockNodeDB->setPublicKey(LOCAL_NODE, pub);
-
-    meshtastic_MeshPacket p = makeDecoded(LOCAL_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-    TEST_ASSERT_EQUAL_MESSAGE(XEDDSA_SIGNATURE_SIZE, p.decoded.xeddsa_signature.size, "broadcast should be auto-signed");
-    TEST_ASSERT_TRUE(p.xeddsa_signed);
-}
-
-// B2: preserve the existing wire behavior: non-PKI unicast is not signed.
-void test_B2_local_unicast_not_signed(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-
-    meshtastic_MeshPacket p = makeDecoded(LOCAL_NODE, REMOTE_NODE, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-    TEST_ASSERT_EQUAL_MESSAGE(0, p.decoded.xeddsa_signature.size, "unicast must remain unsigned");
-}
-
-// B3: our own oversized broadcast is NOT signed (signature wouldn't fit).
-void test_B3_local_oversized_broadcast_not_signed(void)
-{
-    meshtastic_MeshPacket p = makeDecoded(LOCAL_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, OVERSIZED_PAYLOAD);
-
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-    TEST_ASSERT_EQUAL_MESSAGE(0, p.decoded.xeddsa_signature.size, "oversized broadcast must not be signed");
-}
-
-// B4: F2 regression sweep - every broadcast payload size that fits a LoRa frame unsigned must
-// still be deliverable: signing steps aside exactly when the signed encoding stops fitting,
-// never producing TOO_LARGE (the old heuristic dead-banded payloads 167-168). Because the first
-// verified packet sets our signer bit in the mock DB, the later unsigned sizes also prove the
-// receiver's downgrade predicate stays exactly symmetric with the sender's sign gate.
-void test_B4_all_broadcast_sizes_deliverable_no_deadband(void)
-{
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-    mockNodeDB->addNode(LOCAL_NODE);
-    mockNodeDB->setPublicKey(LOCAL_NODE, pub);
-
-    bool sawSigned = false, sawUnsigned = false;
-    for (size_t n = 1; n <= 232; n++) {
-        char msg[32];
-        snprintf(msg, sizeof(msg), "payload size %u", (unsigned)n);
-
-        meshtastic_MeshPacket p = makeDecoded(LOCAL_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, n);
-        TEST_ASSERT_EQUAL_MESSAGE(DECODE_SUCCESS, roundTrip(&p), msg);
-
-        // Exact oracle: signed iff the signed encoding fits the frame. signedEncodingFits() forces
-        // the signature size itself, so it reads the same whether or not p.decoded came back signed.
-        const bool isSigned = p.decoded.xeddsa_signature.size == XEDDSA_SIGNATURE_SIZE;
-        TEST_ASSERT_EQUAL_MESSAGE(signedEncodingFits(&p.decoded), isSigned, msg);
-
-        if (isSigned) {
-            TEST_ASSERT_FALSE_MESSAGE(sawUnsigned, msg);    // monotonic: once too big, never signed again
-            TEST_ASSERT_TRUE_MESSAGE(p.xeddsa_signed, msg); // and it verified on the way back in
-            sawSigned = true;
-        } else {
-            sawUnsigned = true;
-        }
-    }
-    TEST_ASSERT_TRUE_MESSAGE(sawSigned, "sweep never produced a signed packet");
-    TEST_ASSERT_TRUE_MESSAGE(sawUnsigned, "sweep never crossed the fit boundary");
-}
-
-// B5: a client-preset signature on a packet outside the existing broadcast sign class is discarded.
-void test_B5_preset_signature_on_local_packet_cleared(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-
-    meshtastic_MeshPacket p = makeDecoded(LOCAL_NODE, REMOTE_NODE, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    p.decoded.xeddsa_signature.size = XEDDSA_SIGNATURE_SIZE;
-    memset(p.decoded.xeddsa_signature.bytes, 0xAB, XEDDSA_SIGNATURE_SIZE);
-
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-    TEST_ASSERT_EQUAL_MESSAGE(0, p.decoded.xeddsa_signature.size, "preset signature must be discarded on unicast");
-}
-
-// B6: the exact-fit gate tracks Data *shape*, not just payload size. A tapback-style broadcast
-// (want_response + reply_id + emoji) carries extra wire bytes that shift the fit boundary; the
-// sweep proves no dead band exists for that shape either, and - once the signer bit is learned -
-// that the receiver's downgrade predicate stays symmetric for it too. Window
-// straddles this shape's boundary; capped at 200 so even the unsigned rich encoding stays well
-// inside the frame (at n=221 it first hits the pre-existing, signing-unrelated TOO_LARGE).
-void test_B6_rich_shape_sweep_no_deadband(void)
-{
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-    mockNodeDB->addNode(LOCAL_NODE);
-    mockNodeDB->setPublicKey(LOCAL_NODE, pub);
-
-    bool sawSigned = false, sawUnsigned = false;
-    for (size_t n = 100; n <= 200; n++) {
-        char msg[32];
-        snprintf(msg, sizeof(msg), "payload size %u", (unsigned)n);
-
-        meshtastic_MeshPacket p = makeDecoded(LOCAL_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, n);
-        p.decoded.want_response = true;
-        p.decoded.reply_id = 0x11223344;
-        p.decoded.emoji = 1;
-        TEST_ASSERT_EQUAL_MESSAGE(DECODE_SUCCESS, roundTrip(&p), msg);
-
-        const bool isSigned = p.decoded.xeddsa_signature.size == XEDDSA_SIGNATURE_SIZE;
-        TEST_ASSERT_EQUAL_MESSAGE(signedEncodingFits(&p.decoded), isSigned, msg);
-
-        if (isSigned) {
-            TEST_ASSERT_FALSE_MESSAGE(sawUnsigned, msg);
-            TEST_ASSERT_TRUE_MESSAGE(p.xeddsa_signed, msg);
-            sawSigned = true;
-        } else {
-            sawUnsigned = true;
-        }
-    }
-    TEST_ASSERT_TRUE_MESSAGE(sawSigned, "rich sweep never produced a signed packet");
-    TEST_ASSERT_TRUE_MESSAGE(sawUnsigned, "rich sweep never crossed the fit boundary");
-}
-
-void test_B7_infrastructure_port_signing_matrix(void)
-{
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-    mockNodeDB->addNode(LOCAL_NODE);
-    mockNodeDB->setPublicKey(LOCAL_NODE, pub);
-
-    const meshtastic_PortNum ports[] = {
-        meshtastic_PortNum_NODEINFO_APP,
-        meshtastic_PortNum_ROUTING_APP,
-        meshtastic_PortNum_TRACEROUTE_APP,
-        meshtastic_PortNum_POSITION_APP,
-    };
-    for (const auto port : ports) {
-        meshtastic_MeshPacket broadcast = makeDecoded(LOCAL_NODE, NODENUM_BROADCAST, port, SMALL_PAYLOAD);
-        TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&broadcast));
-        TEST_ASSERT_EQUAL_MESSAGE(XEDDSA_SIGNATURE_SIZE, broadcast.decoded.xeddsa_signature.size,
-                                  "signable infrastructure broadcast must be signed");
-
-        meshtastic_MeshPacket unicast = makeDecoded(LOCAL_NODE, REMOTE_NODE, port, SMALL_PAYLOAD);
-        TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&unicast));
-        TEST_ASSERT_EQUAL_MESSAGE(0, unicast.decoded.xeddsa_signature.size,
-                                  "infrastructure unicast must preserve existing unsigned behavior");
-    }
-}
-
-void test_B8_licensed_broadcast_and_unicast_are_signed(void)
-{
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-    mockNodeDB->addNode(LOCAL_NODE);
-    mockNodeDB->setPublicKey(LOCAL_NODE, pub);
-    owner.is_licensed = true;
-    channels.ensureLicensedOperation();
-
-    meshtastic_MeshPacket broadcast =
-        makeDecoded(LOCAL_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&broadcast));
-    TEST_ASSERT_EQUAL(XEDDSA_SIGNATURE_SIZE, broadcast.decoded.xeddsa_signature.size);
-    TEST_ASSERT_TRUE(broadcast.xeddsa_signed);
-
-    meshtastic_MeshPacket direct = makeDecoded(LOCAL_NODE, REMOTE_NODE, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&direct));
-    TEST_ASSERT_EQUAL(XEDDSA_SIGNATURE_SIZE, direct.decoded.xeddsa_signature.size);
-    TEST_ASSERT_TRUE(direct.xeddsa_signed);
-}
-
-void test_B9_licensed_unicast_never_uses_pki_encryption(void)
-{
-    uint8_t localPub[32], localPriv[32], remotePub[32], remotePriv[32];
-    crypto->generateKeyPair(localPub, localPriv);
-    memcpy(config.security.private_key.bytes, localPriv, sizeof(localPriv));
-    config.security.private_key.size = sizeof(localPriv);
-    mockNodeDB->addNode(LOCAL_NODE);
-    mockNodeDB->setPublicKey(LOCAL_NODE, localPub);
-    mockNodeDB->addNode(REMOTE_NODE);
-    crypto->generateKeyPair(remotePub, remotePriv);
-    mockNodeDB->setPublicKey(REMOTE_NODE, remotePub);
-    crypto->setDHPrivateKey(localPriv);
-
-    owner.is_licensed = true;
-    channels.ensureLicensedOperation();
-    meshtastic_MeshPacket p = makeDecoded(LOCAL_NODE, REMOTE_NODE, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-
-    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_NONE, perhapsEncode(&p));
-    TEST_ASSERT_FALSE(p.pki_encrypted);
-    meshtastic_Data plaintext = meshtastic_Data_init_zero;
-    TEST_ASSERT_TRUE(pb_decode_from_bytes(p.encrypted.bytes, p.encrypted.size, &meshtastic_Data_msg, &plaintext));
-    TEST_ASSERT_EQUAL(XEDDSA_SIGNATURE_SIZE, plaintext.xeddsa_signature.size);
-}
-
-void test_B10_licensed_oversized_unicast_remains_unsigned(void)
-{
-    owner.is_licensed = true;
-    channels.ensureLicensedOperation();
-    meshtastic_MeshPacket p = makeDecoded(LOCAL_NODE, REMOTE_NODE, meshtastic_PortNum_TEXT_MESSAGE_APP, OVERSIZED_PAYLOAD);
-
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&p));
-    TEST_ASSERT_EQUAL(0, p.decoded.xeddsa_signature.size);
-}
-
-void test_B11_normal_unicast_still_uses_pki(void)
-{
-    uint8_t localPub[32], localPriv[32], remotePub[32], remotePriv[32];
-    crypto->generateKeyPair(localPub, localPriv);
-    crypto->generateKeyPair(remotePub, remotePriv);
-    mockNodeDB->addNode(LOCAL_NODE);
-    mockNodeDB->setPublicKey(LOCAL_NODE, localPub);
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setPublicKey(REMOTE_NODE, remotePub);
-    memcpy(config.security.private_key.bytes, localPriv, sizeof(localPriv));
-    config.security.private_key.size = sizeof(localPriv);
-    crypto->setDHPrivateKey(localPriv);
-
-    meshtastic_MeshPacket p = makeDecoded(LOCAL_NODE, REMOTE_NODE, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_NONE, perhapsEncode(&p));
-    TEST_ASSERT_TRUE(p.pki_encrypted);
-
-    myNodeInfo.my_node_num = REMOTE_NODE;
-    crypto->setDHPrivateKey(remotePriv);
-    TEST_ASSERT_EQUAL(DECODE_SUCCESS, perhapsDecode(&p));
-    TEST_ASSERT_TRUE(p.pki_encrypted);
-    TEST_ASSERT_EQUAL(0, p.decoded.xeddsa_signature.size);
-}
-
-void test_B12_licensed_receiver_does_not_decrypt_pki(void)
-{
-    uint8_t localPub[32], localPriv[32], remotePub[32], remotePriv[32];
-    crypto->generateKeyPair(localPub, localPriv);
-    crypto->generateKeyPair(remotePub, remotePriv);
-    mockNodeDB->addNode(LOCAL_NODE);
-    mockNodeDB->setPublicKey(LOCAL_NODE, localPub);
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setPublicKey(REMOTE_NODE, remotePub);
-    memcpy(config.security.private_key.bytes, localPriv, sizeof(localPriv));
-    config.security.private_key.size = sizeof(localPriv);
-    crypto->setDHPrivateKey(localPriv);
-
-    meshtastic_MeshPacket p = makeDecoded(LOCAL_NODE, REMOTE_NODE, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_NONE, perhapsEncode(&p));
-    TEST_ASSERT_TRUE(p.pki_encrypted);
-
-    owner.is_licensed = true;
-    channels.ensureLicensedOperation();
-    myNodeInfo.my_node_num = REMOTE_NODE;
-    crypto->setDHPrivateKey(remotePriv);
-    TEST_ASSERT_EQUAL(DECODE_FAILURE, perhapsDecode(&p));
-}
-
-void test_B13_licensed_port_and_destination_signing_matrix(void)
-{
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-    mockNodeDB->addNode(LOCAL_NODE);
-    mockNodeDB->setPublicKey(LOCAL_NODE, pub);
-    owner.is_licensed = true;
-    channels.ensureLicensedOperation();
-
-    const meshtastic_PortNum ports[] = {
-        meshtastic_PortNum_TEXT_MESSAGE_APP, meshtastic_PortNum_POSITION_APP, meshtastic_PortNum_TELEMETRY_APP,
-        meshtastic_PortNum_ROUTING_APP,      meshtastic_PortNum_NODEINFO_APP,
-    };
-    const NodeNum destinations[] = {NODENUM_BROADCAST, REMOTE_NODE};
-    for (const auto port : ports) {
-        for (const auto destination : destinations) {
-            meshtastic_MeshPacket packet = makeDecoded(LOCAL_NODE, destination, port, SMALL_PAYLOAD);
-            TEST_ASSERT_EQUAL(DECODE_SUCCESS, roundTrip(&packet));
-            TEST_ASSERT_EQUAL(XEDDSA_SIGNATURE_SIZE, packet.decoded.xeddsa_signature.size);
-            TEST_ASSERT_TRUE(packet.xeddsa_signed);
-            TEST_ASSERT_FALSE(packet.pki_encrypted);
-        }
-    }
-}
-
-// ===========================================================================
-// Group C - routing pipeline and NodeInfo authentication ordering
-// ===========================================================================
-
-class NodeInfoTestShim : public NodeInfoModule
-{
-  public:
-    using MeshModule::currentRequest; // allocReply() only suppresses while a request is in flight
-    using NodeInfoModule::allocReply;
-    using NodeInfoModule::handleReceivedProtobuf;
-};
-
-static meshtastic_MeshPacket makeNodeInfoPacket(bool signed_)
-{
-    meshtastic_MeshPacket mp = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_NODEINFO_APP, SMALL_PAYLOAD);
-    mp.xeddsa_signed = signed_;
-    return mp;
-}
-
-void test_N1_unsigned_nodeinfo_from_signer_dropped(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    NodeInfoTestShim shim;
-    meshtastic_MeshPacket mp = makeNodeInfoPacket(false);
-    meshtastic_User user = meshtastic_User_init_zero;
-    user.is_licensed = owner.is_licensed;
-
-    TEST_ASSERT_TRUE_MESSAGE(shim.handleReceivedProtobuf(mp, &user), "unsigned NodeInfo from signer must be dropped");
-}
-
-void test_N2_signed_nodeinfo_from_signer_not_dropped(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    NodeInfoTestShim shim;
-    meshtastic_MeshPacket mp = makeNodeInfoPacket(true);
-    meshtastic_User user = meshtastic_User_init_zero;
-    user.is_licensed = owner.is_licensed;
-
-    TEST_ASSERT_FALSE(shim.handleReceivedProtobuf(mp, &user));
-}
-
-void test_N3_unsigned_nodeinfo_from_nonsigner_not_dropped(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-
-    NodeInfoTestShim shim;
-    meshtastic_MeshPacket mp = makeNodeInfoPacket(false);
-    meshtastic_User user = meshtastic_User_init_zero;
-    user.is_licensed = owner.is_licensed;
-
-    TEST_ASSERT_FALSE(shim.handleReceivedProtobuf(mp, &user));
-}
-
-void test_N4_unsigned_unicast_nodeinfo_from_signer_accepted(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    NodeInfoTestShim shim;
-    meshtastic_MeshPacket mp = makeDecoded(REMOTE_NODE, LOCAL_NODE, meshtastic_PortNum_NODEINFO_APP, SMALL_PAYLOAD);
-    mp.xeddsa_signed = false;
-    meshtastic_User user = meshtastic_User_init_zero;
-    user.is_licensed = owner.is_licensed;
-
-    TEST_ASSERT_FALSE_MESSAGE(shim.handleReceivedProtobuf(mp, &user),
-                              "unsigned unicast NodeInfo from signer must not be dropped");
-}
-
-static void preparePipelineSigner(NodeNum sender)
-{
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-    mockNodeDB->addNode(sender);
-    mockNodeDB->setPublicKey(sender, pub);
-}
-
-static void runPipelineIngress(const meshtastic_MeshPacket &p)
-{
-    meshtastic_MeshPacket *copy = packetPool.allocCopy(p);
-    TEST_ASSERT_NOT_NULL(copy);
-    pipelineRouter->enqueueReceivedMessage(copy);
-    pipelineRouter->runOnce();
-}
-
-static void assertNoRejectedPipelineEffects(NodeNum sender, uint32_t lastHeardBefore)
-{
-    TEST_ASSERT_EQUAL(0, pipelineRadio->sendCalls);
-    TEST_ASSERT_EQUAL(0, pipelineRadio->cancelCalls);
-    TEST_ASSERT_EQUAL(0, pipelineRadio->findCalls);
-    TEST_ASSERT_EQUAL(0, pipelineRadio->removeCalls);
-    TEST_ASSERT_EQUAL(0, pipelineRouting->ackCalls);
-    TEST_ASSERT_EQUAL(0, pipelineRouter->rxDupe);
-    TEST_ASSERT_EQUAL(0, pipelineRouter->txRelayCanceled);
-    TEST_ASSERT_EQUAL(0, pipelineModule->calls);
-    TEST_ASSERT_EQUAL(0, pipelineMqtt->queueSize());
-    TEST_ASSERT_NULL(pipelineService->getForPhone());
-    const meshtastic_NodeInfoLite *node = mockNodeDB->getMeshNode(sender);
-    TEST_ASSERT_NOT_NULL(node);
-    TEST_ASSERT_EQUAL_UINT32(lastHeardBefore, node->last_heard);
-}
-
-void test_C1_invalid_first_copy_does_not_poison_valid_same_id(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    preparePipelineSigner(REMOTE_NODE);
-    const PacketId id = 0xC1000001;
-    const uint32_t lastHeard = mockNodeDB->getMeshNode(REMOTE_NODE)->last_heard;
-
-    meshtastic_MeshPacket invalid = makeSignedWirePacket(REMOTE_NODE, NODENUM_BROADCAST, id, 1, 2, 0, 0x31, false);
-    moduleConfig.mqtt.enabled = true;
-    runPipelineIngress(invalid);
-    assertNoRejectedPipelineEffects(REMOTE_NODE, lastHeard);
-    TEST_ASSERT_FALSE(pipelineRouter->historyContains(&invalid));
-
-    meshtastic_MeshPacket valid = makeSignedWirePacket(REMOTE_NODE, NODENUM_BROADCAST, id);
-    TEST_ASSERT_EQUAL(static_cast<int>(RoutingAuthVerdict::ACCEPT), static_cast<int>(passesRoutingAuthGate(&valid)));
-    TEST_ASSERT_EQUAL_MESSAGE(meshtastic_MeshPacket_encrypted_tag, valid.which_payload_variant,
-                              "routing auth gate must preserve encrypted relay/MQTT bytes");
-    TEST_ASSERT_FALSE_MESSAGE(pipelineRouter->filter(&valid), "valid same-ID packet was poisoned by rejected first copy");
-    TEST_ASSERT_TRUE(pipelineRouter->historyContains(&valid));
-}
-
-void test_C2_invalid_ordinary_duplicate_has_no_cancel_or_delivery_effects(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    preparePipelineSigner(REMOTE_NODE);
-    const PacketId id = 0xC2000002;
-    meshtastic_MeshPacket prior = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    prior.id = id;
-    prior.hop_limit = 1;
-    prior.hop_start = 2;
-    prior.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
-    pipelineRouter->remember(&prior);
-    const uint32_t lastHeard = mockNodeDB->getMeshNode(REMOTE_NODE)->last_heard;
-
-    meshtastic_MeshPacket invalid = makeSignedWirePacket(REMOTE_NODE, NODENUM_BROADCAST, id, 1, 2, 0, 0x32, false);
-    runPipelineIngress(invalid);
-    assertNoRejectedPipelineEffects(REMOTE_NODE, lastHeard);
-    TEST_ASSERT_TRUE(pipelineRouter->historyContains(&prior));
-}
-
-void test_C3_invalid_repeated_packet_cannot_ack_or_change_retry_state(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    preparePipelineSigner(LOCAL_NODE);
-    const PacketId id = 0xC3000003;
-    meshtastic_MeshPacket prior = makeDecoded(LOCAL_NODE, NODENUM_BROADCAST, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    prior.id = id;
-    prior.hop_limit = 2;
-    prior.hop_start = 2;
-    prior.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
-    pipelineRouter->remember(&prior);
-    // "Far future, so no retransmission is due." Must be a representable future time, not
-    // UINT32_MAX: doRetransmissions() compares with an unsigned half-range test, under which
-    // UINT32_MAX is ~1ms in the *past* and would fire a retransmit and rewrite nextTxMsec.
-    const uint32_t notDueTxMsec = Time::getMillis() + 3600000UL;
-    pipelineRouter->addPending(prior, notDueTxMsec);
-    const uint32_t lastHeard = mockNodeDB->getMeshNode(LOCAL_NODE)->last_heard;
-
-    meshtastic_MeshPacket invalid = makeSignedWirePacket(LOCAL_NODE, NODENUM_BROADCAST, id, 2, 2, 0, 0x34, false);
-    runPipelineIngress(invalid);
-    assertNoRejectedPipelineEffects(LOCAL_NODE, lastHeard);
-    TEST_ASSERT_EQUAL(1, pipelineRouter->pendingCount());
-    TEST_ASSERT_EQUAL_UINT32(notDueTxMsec, pipelineRouter->pendingNextTx(LOCAL_NODE, id));
-}
-
-void test_C4_invalid_fallback_packet_cannot_relay(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    preparePipelineSigner(REMOTE_NODE);
-    const PacketId id = 0xC4000004;
-    const uint8_t ourRelay = mockNodeDB->getLastByteOfNodeNum(LOCAL_NODE);
-    meshtastic_MeshPacket prior = makeDecoded(REMOTE_NODE, LOCAL_NODE, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    prior.id = id;
-    prior.next_hop = 0x22;
-    prior.relay_node = ourRelay;
-    prior.hop_limit = 1;
-    prior.hop_start = 2;
-    pipelineRouter->remember(&prior);
-    meshtastic_MeshPacket relayed = prior;
-    relayed.relay_node = 0x35;
-    pipelineRouter->remember(&relayed);
-    pipelineRouter->forgetRelayer(ourRelay, id, REMOTE_NODE);
-    const uint32_t lastHeard = mockNodeDB->getMeshNode(REMOTE_NODE)->last_heard;
-
-    meshtastic_MeshPacket invalid = makeSignedWirePacket(REMOTE_NODE, LOCAL_NODE, id, 1, 2, 0, 0x35, false);
-    runPipelineIngress(invalid);
-    assertNoRejectedPipelineEffects(REMOTE_NODE, lastHeard);
-}
-
-void test_C5_invalid_upgrade_cannot_remove_pending_valid_send(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    preparePipelineSigner(REMOTE_NODE);
-    const PacketId id = 0xC5000005;
-    meshtastic_MeshPacket prior = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    prior.id = id;
-    prior.hop_limit = 1;
-    prior.hop_start = 2;
-    pipelineRouter->remember(&prior);
-    const uint32_t lastHeard = mockNodeDB->getMeshNode(REMOTE_NODE)->last_heard;
-
-    meshtastic_MeshPacket directInvalid = makeSignedWirePacket(REMOTE_NODE, NODENUM_BROADCAST, id, 2, 2, 0, 0x36, false);
-    TEST_ASSERT_TRUE(pipelineRouter->handleUpgrade(&directInvalid));
-    TEST_ASSERT_EQUAL(0, pipelineRadio->removeCalls);
-
-    meshtastic_MeshPacket invalid = makeSignedWirePacket(REMOTE_NODE, NODENUM_BROADCAST, id, 2, 2, 0, 0x36, false);
-    runPipelineIngress(invalid);
-    assertNoRejectedPipelineEffects(REMOTE_NODE, lastHeard);
-
-    // The rejected upgrade did not raise the history watermark or remove the queued valid copy;
-    // a later authenticated replacement still performs the intended upgrade.
-    meshtastic_MeshPacket valid = makeSignedWirePacket(REMOTE_NODE, NODENUM_BROADCAST, id, 2, 2, 0, 0x36, true);
-    TEST_ASSERT_EQUAL(static_cast<int>(RoutingAuthVerdict::ACCEPT), static_cast<int>(passesRoutingAuthGate(&valid)));
-    TEST_ASSERT_TRUE(pipelineRouter->filter(&valid));
-    TEST_ASSERT_EQUAL(1, pipelineRadio->removeCalls);
-}
-
-void test_C6_opaque_unknown_channel_is_relay_only(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    meshtastic_MeshPacket opaque = meshtastic_MeshPacket_init_zero;
-    opaque.from = REMOTE_NODE;
-    opaque.to = NODENUM_BROADCAST;
-    opaque.id = 0xC6000006;
-    opaque.channel = 0xFE;
-    opaque.hop_limit = 1;
-    opaque.hop_start = 2;
-    opaque.which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
-    opaque.encrypted.size = 16;
-    memset(opaque.encrypted.bytes, 0xA5, opaque.encrypted.size);
-
-    TEST_ASSERT_EQUAL(static_cast<int>(RoutingAuthVerdict::OPAQUE_RELAY_ONLY), static_cast<int>(passesRoutingAuthGate(&opaque)));
-    moduleConfig.mqtt.enabled = true;
-    runPipelineIngress(opaque);
-    TEST_ASSERT_EQUAL_MESSAGE(1, pipelineRadio->sendCalls, "opaque broadcast should take only the safety-controlled relay path");
-    TEST_ASSERT_EQUAL(0, pipelineRouting->ackCalls);
-    TEST_ASSERT_EQUAL(0, pipelineModule->calls);
-    TEST_ASSERT_EQUAL(0, pipelineMqtt->queueSize());
-    TEST_ASSERT_NULL(pipelineService->getForPhone());
-    TEST_ASSERT_FALSE(pipelineRouter->historyContains(&opaque));
-    TEST_ASSERT_NULL(mockNodeDB->getMeshNode(REMOTE_NODE));
-
-    pipelineRadio->reset();
-    meshtastic_MeshPacket addressed = opaque;
-    addressed.to = LOCAL_NODE;
-    addressed.id++;
-    runPipelineIngress(addressed);
-    TEST_ASSERT_EQUAL_MESSAGE(0, pipelineRadio->sendCalls, "opaque packet addressed to us must not be relayed");
-    TEST_ASSERT_EQUAL(0, pipelineRouting->ackCalls);
-    TEST_ASSERT_EQUAL(0, pipelineModule->calls);
-    TEST_ASSERT_EQUAL(0, pipelineMqtt->queueSize());
-    TEST_ASSERT_NULL(pipelineService->getForPhone());
-    TEST_ASSERT_FALSE(pipelineRouter->historyContains(&addressed));
-
-    const meshtastic_Config_DeviceConfig_RebroadcastMode blockedModes[] = {
-        meshtastic_Config_DeviceConfig_RebroadcastMode_LOCAL_ONLY,
-        meshtastic_Config_DeviceConfig_RebroadcastMode_CORE_PORTNUMS_ONLY,
-        meshtastic_Config_DeviceConfig_RebroadcastMode_NONE,
-    };
-    for (const auto mode : blockedModes) {
-        pipelineRadio->reset();
-        config.device.rebroadcast_mode = mode;
-        meshtastic_MeshPacket blocked = opaque;
-        blocked.id++;
-        blocked.id += static_cast<uint32_t>(mode);
-        blocked.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MULTICAST_UDP;
-        runPipelineIngress(blocked);
-        TEST_ASSERT_EQUAL_MESSAGE(0, pipelineRadio->sendCalls, "restricted rebroadcast mode must suppress opaque relay");
-        TEST_ASSERT_EQUAL(0, pipelineRouting->ackCalls);
-        TEST_ASSERT_EQUAL(0, pipelineModule->calls);
-        TEST_ASSERT_EQUAL(0, pipelineMqtt->queueSize());
-        TEST_ASSERT_NULL(pipelineService->getForPhone());
-        TEST_ASSERT_FALSE(pipelineRouter->historyContains(&blocked));
-    }
-}
-
-void test_C7_strict_rejects_unsigned_decoded_simradio_ingress(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    mockNodeDB->addNode(REMOTE_NODE);
-    const uint32_t lastHeard = mockNodeDB->getMeshNode(REMOTE_NODE)->last_heard;
-    meshtastic_MeshPacket injected = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD);
-    injected.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
-    runPipelineIngress(injected);
-    assertNoRejectedPipelineEffects(REMOTE_NODE, lastHeard);
-    TEST_ASSERT_FALSE(pipelineRouter->historyContains(&injected));
-}
-
-void test_C8_trusted_local_decoded_delivery_is_not_filtered(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    meshtastic_MeshPacket *local =
-        packetPool.allocCopy(makeDecoded(0, LOCAL_NODE, meshtastic_PortNum_POSITION_APP, SMALL_PAYLOAD));
-    TEST_ASSERT_NOT_NULL(local);
-    TEST_ASSERT_EQUAL(ERRNO_SHOULD_RELEASE, pipelineRouter->sendLocal(local, RX_SRC_USER));
-    TEST_ASSERT_EQUAL_MESSAGE(1, pipelineModule->calls, "trusted phone-origin packet must reach local modules");
-    packetPool.release(local);
-}
-
-void test_C9_known_channel_malformed_plaintext_has_no_pipeline_effects(void)
-{
-    meshtastic_MeshPacket malformed = meshtastic_MeshPacket_init_zero;
-    malformed.from = REMOTE_NODE;
-    malformed.to = NODENUM_BROADCAST;
-    malformed.id = 0xC9000009;
-    malformed.which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
-    malformed.encrypted.size = 3;
-    malformed.encrypted.bytes[0] = 0xFF;
-    malformed.encrypted.bytes[1] = 0xFF;
-    malformed.encrypted.bytes[2] = 0xFF;
-    malformed.channel = channels.setActiveByIndex(0);
-    crypto->encryptPacket(malformed.from, malformed.id, malformed.encrypted.size, malformed.encrypted.bytes);
-
-    // Verdict is opaque-relay-eligible now (see test_C17); hop_limit 0 is what keeps this a no-op.
-    meshtastic_MeshPacket verdictCopy = malformed;
-    TEST_ASSERT_EQUAL(static_cast<int>(RoutingAuthVerdict::OPAQUE_RELAY_ONLY),
-                      static_cast<int>(passesRoutingAuthGate(&verdictCopy)));
-
-    mockNodeDB->addNode(REMOTE_NODE);
-    const uint32_t lastHeard = mockNodeDB->getMeshNode(REMOTE_NODE)->last_heard;
-    runPipelineIngress(malformed);
-    assertNoRejectedPipelineEffects(REMOTE_NODE, lastHeard);
-    TEST_ASSERT_FALSE(pipelineRouter->historyContains(&malformed));
-}
-
-void test_C10_legacy_channel_dm_failure_has_no_pipeline_effects(void)
-{
-    meshtastic_MeshPacket legacyDm = makeDecoded(REMOTE_NODE, LOCAL_NODE, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-    legacyDm = channelEncode(legacyDm);
-    mockNodeDB->addNode(REMOTE_NODE);
-    const uint32_t lastHeard = mockNodeDB->getMeshNode(REMOTE_NODE)->last_heard;
-    moduleConfig.mqtt.enabled = true;
-    runPipelineIngress(legacyDm);
-    assertNoRejectedPipelineEffects(REMOTE_NODE, lastHeard);
-    TEST_ASSERT_FALSE(pipelineRouter->historyContains(&legacyDm));
-}
-
-void test_C11_malformed_pki_plaintext_has_no_pipeline_effects(void)
-{
-    uint8_t localPub[32], localPriv[32], remotePub[32], remotePriv[32];
-    crypto->generateKeyPair(localPub, localPriv);
-    crypto->generateKeyPair(remotePub, remotePriv);
-    mockNodeDB->addNode(LOCAL_NODE);
-    mockNodeDB->setPublicKey(LOCAL_NODE, localPub);
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setPublicKey(REMOTE_NODE, remotePub);
-
-    const uint8_t malformedPlaintext[] = {0xFF, 0xFF, 0xFF};
-    meshtastic_NodeInfoLite_public_key_t localKey = {32, {0}};
-    memcpy(localKey.bytes, localPub, sizeof(localPub));
-    meshtastic_MeshPacket malformed = meshtastic_MeshPacket_init_zero;
-    malformed.from = REMOTE_NODE;
-    malformed.to = LOCAL_NODE;
-    malformed.id = 0xCB00000B;
-    malformed.channel = 0;
-    malformed.which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
-    crypto->setDHPrivateKey(remotePriv);
-    TEST_ASSERT_TRUE(crypto->encryptCurve25519(malformed.to, malformed.from, localKey, malformed.id, sizeof(malformedPlaintext),
-                                               malformedPlaintext, malformed.encrypted.bytes));
-    malformed.encrypted.size = sizeof(malformedPlaintext) + MESHTASTIC_PKC_OVERHEAD;
-    crypto->setDHPrivateKey(localPriv);
-
-    const uint32_t lastHeard = mockNodeDB->getMeshNode(REMOTE_NODE)->last_heard;
-    moduleConfig.mqtt.enabled = true;
-    runPipelineIngress(malformed);
-    assertNoRejectedPipelineEffects(REMOTE_NODE, lastHeard);
-    TEST_ASSERT_FALSE(pipelineRouter->historyContains(&malformed));
-}
-
-void test_C12_exact_authenticated_replay_reuses_verdict_without_collision_bypass(void)
-{
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    preparePipelineSigner(REMOTE_NODE);
-    meshtastic_MeshPacket valid = makeSignedWirePacket(REMOTE_NODE, NODENUM_BROADCAST, 0xCC00000C);
-    // Full ingress replaces this nonzero wire timestamp with the local arrival time. The exact
-    // authentication handoff must be consumed before that mutation, avoiding a second evaluation.
-    valid.rx_time = 0x12345678;
-    runPipelineIngress(valid);
-    TEST_ASSERT_EQUAL_MESSAGE(1, routingAuthEvaluationCount(), "full ingress must consume the primed verdict exactly once");
-    runPipelineIngress(valid);
-    TEST_ASSERT_EQUAL_MESSAGE(2, routingAuthEvaluationCount(), "consumed verdict must not authenticate a later replay");
-
-    // Broadcast, so isToUs() is false like any colliding-hash foreign broadcast (see test_C17);
-    // this still guards that the cache is reevaluated per exact bytes, not reused for a same-ID replay.
-    meshtastic_MeshPacket collision = valid;
-    collision.encrypted.bytes[0] ^= 0x80;
-    TEST_ASSERT_EQUAL(static_cast<int>(RoutingAuthVerdict::OPAQUE_RELAY_ONLY),
-                      static_cast<int>(passesRoutingAuthGate(&collision)));
-    TEST_ASSERT_EQUAL_MESSAGE(3, routingAuthEvaluationCount(), "same packet ID with different bytes must be reevaluated");
-}
-
-// A local reliable send that fails before reaching the radio must not outlive the error as a scheduled retransmission.
-void test_C13_failed_initial_reliable_send_does_not_retry(void)
-{
-    meshtastic_MeshPacket initial = makeDecoded(LOCAL_NODE, REMOTE_NODE, meshtastic_PortNum_ROUTING_APP, SMALL_PAYLOAD);
-    initial.id = 0xC13C13C1;
-    initial.want_ack = true;
-    initial.channel = MAX_NUM_CHANNELS; // Out of range, so encoding returns NO_CHANNEL.
-
-    auto *packet = packetPool.allocCopy(initial);
-    TEST_ASSERT_NOT_NULL(packet);
-
-    pipelineRouter->send(packet);
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(1, pipelineRouting->ackCalls,
-                                     "initial encoding failure must be reported to the originating client");
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, pipelineRouter->pendingCount(),
-                                     "failed initial send must not leave a retransmission pending");
-
-    pipelineRadio->failSend = true;
-    meshtastic_MeshPacket interfaceFailure = makeDecoded(LOCAL_NODE, REMOTE_NODE, meshtastic_PortNum_ROUTING_APP, SMALL_PAYLOAD);
-    interfaceFailure.id = 0xC13C13C2;
-    interfaceFailure.want_ack = true;
-    packet = packetPool.allocCopy(interfaceFailure);
-    TEST_ASSERT_NOT_NULL(packet);
-
-    pipelineService->sendToMesh(packet, RX_SRC_USER);
-    meshtastic_QueueStatus *status = pipelineService->getQueueStatusForPhone();
-    TEST_ASSERT_NOT_NULL(status);
-    TEST_ASSERT_EQUAL(ERRNO_DISABLED, status->res);
-    TEST_ASSERT_EQUAL_UINT32(interfaceFailure.id, status->mesh_packet_id);
-    pipelineService->releaseQueueStatusToPool(status);
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(1, pipelineRouting->ackCalls,
-                                     "interface errors are reported to the client through QueueStatus, not a routing NAK");
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, pipelineRouter->pendingCount(),
-                                     "failed interface enqueue must not leave a retransmission pending");
-}
-
-// C14 needs a node that has used its whole hourly duty-cycle allowance. Swaps in a separate AirTime
-// rather than poking the global's buckets, which are private now.
-//
-// Deliberately NOT a scoped guard: Unity's TEST_ABORT() is longjmp, which does not run destructors
-// of automatic objects, so a guard would leave `airTime` dangling into an abandoned stack frame on
-// any assertion failure - and later cases dereference it (NodeInfoModule::allocReply). tearDown()
-// restores the global unconditionally instead. The instance is a function-local static so it
-// outlives the longjmp.
-//
-// Note it also parks channel utilisation at ~6000%, because logAirtime() credits that for every
-// report type. C14 gates on utilizationTXPercent() alone; do not reuse this for an
-// isTxAllowedChannelUtil() path, which would then pass for the wrong reason.
-static void useDutyCycleSaturatedAirTime()
-{
-    static AirTime saturated;
-    c14SavedAirTime = airTime;
-    airTime = &saturated;
-    saturated.logAirtime(TX_LOG, MS_IN_HOUR); // utilizationTXPercent() sums every bucket -> 100%
-}
-
-void test_C14_duty_cycle_limited_reliable_send_remains_pending(void)
-{
-    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_EU_868;
-    config.lora.override_duty_cycle = false;
-    initRegion();
-    useDutyCycleSaturatedAirTime();
-
-    meshtastic_MeshPacket initial = makeDecoded(LOCAL_NODE, REMOTE_NODE, meshtastic_PortNum_ROUTING_APP, SMALL_PAYLOAD);
-    initial.id = 0xC14C14C1;
-    initial.want_ack = true;
-    auto *packet = packetPool.allocCopy(initial);
-    TEST_ASSERT_NOT_NULL(packet);
-
-    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_DUTY_CYCLE_LIMIT, pipelineRouter->send(packet));
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(1, pipelineRouting->ackCalls,
-                                     "duty-cycle rejection must still notify the originating client");
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(1, pipelineRouter->pendingCount(),
-                                     "duty-cycle rejection must retain the retry for when airtime is available");
-
-    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
-    initRegion();
-}
-
-void test_C15_reliable_unicast_tracks_five_total_attempts(void)
-{
-    meshtastic_MeshPacket p = makeDecoded(LOCAL_NODE, REMOTE_NODE, meshtastic_PortNum_ROUTING_APP, SMALL_PAYLOAD);
-    p.id = 0x51530001;
-    p.want_ack = true;
-
-    TEST_ASSERT_EQUAL(ERRNO_OK, pipelineRouter->send(packetPool.allocCopy(p)));
-    TEST_ASSERT_EQUAL_UINT8(5, pipelineRouter->pendingTotalAttempts(LOCAL_NODE, p.id));
-}
-
-void test_C16_reliable_broadcast_keeps_three_total_attempts(void)
-{
-    meshtastic_MeshPacket p = makeDecoded(LOCAL_NODE, NODENUM_BROADCAST, meshtastic_PortNum_ROUTING_APP, SMALL_PAYLOAD);
-    p.id = 0x51530002;
-    p.want_ack = true;
-
-    TEST_ASSERT_EQUAL(ERRNO_OK, pipelineRouter->send(packetPool.allocCopy(p)));
-    TEST_ASSERT_EQUAL_UINT8(3, pipelineRouter->pendingTotalAttempts(LOCAL_NODE, p.id));
-}
-
-void test_C17_colliding_channel_hash_foreign_broadcast_is_relay_only(void)
-{
-    // Foreign channel whose PSK collides with our channel 0's one-byte hash (see test_C9/test_C12
-    // for the paired tradeoff): indistinguishable from tampering, so it must relay opaquely.
-    setPolicy(meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_STRICT);
-    meshtastic_MeshPacket foreign = meshtastic_MeshPacket_init_zero;
-    foreign.from = REMOTE_NODE;
-    foreign.to = NODENUM_BROADCAST;
-    foreign.id = 0xC1700017;
-    foreign.hop_limit = 1;
-    foreign.hop_start = 2;
-    foreign.which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
-    const int16_t hash = channels.setActiveByIndex(0);
-    TEST_ASSERT_GREATER_OR_EQUAL_MESSAGE(0, hash, "no usable primary channel");
-    foreign.channel = (uint8_t)hash; // collides with our channel 0, but the ciphertext below is not ours
-    foreign.encrypted.size = 16;
-    memset(foreign.encrypted.bytes, 0xA5, foreign.encrypted.size);
-
-    TEST_ASSERT_EQUAL(static_cast<int>(RoutingAuthVerdict::OPAQUE_RELAY_ONLY), static_cast<int>(passesRoutingAuthGate(&foreign)));
-
-    // Same undecodable frame claiming to be from us must still be dropped: OPAQUE_RELAY_ONLY would
-    // reach perhapsGenerateImplicitAckForOwnOverheard, which acts on header bytes alone.
-    meshtastic_MeshPacket spoofed = foreign;
-    spoofed.from = LOCAL_NODE;
-    TEST_ASSERT_EQUAL(static_cast<int>(RoutingAuthVerdict::REJECT), static_cast<int>(passesRoutingAuthGate(&spoofed)));
-}
-
-// C5: the packet survives (C4) but the identity claim inside it must not land - the pubkey guard
-// can't tell a signer from an impersonator replaying its (public) key. Only the write is refused.
-void test_N5_unsigned_unicast_nodeinfo_from_signer_does_not_change_name(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-    mockNodeDB->setLongName(REMOTE_NODE, "Genuine");
-
-    NodeInfoTestShim shim;
-    meshtastic_MeshPacket mp = makeDecoded(REMOTE_NODE, LOCAL_NODE, meshtastic_PortNum_NODEINFO_APP, SMALL_PAYLOAD);
-    mp.xeddsa_signed = false;
-    meshtastic_User user = meshtastic_User_init_zero;
-    user.is_licensed = owner.is_licensed;
-    strcpy(user.long_name, "Spoofed");
-    strcpy(user.short_name, "SPF");
-
-    TEST_ASSERT_FALSE_MESSAGE(shim.handleReceivedProtobuf(mp, &user), "the packet itself must still be accepted");
-    TEST_ASSERT_EQUAL_STRING_MESSAGE("Genuine", mockNodeDB->longName(REMOTE_NODE),
-                                     "unsigned unicast NodeInfo from a signer must not rewrite its stored name");
-}
-
-// C6: the same exchange signed - the update is authenticated and must land, pinning C5 as a
-// targeted refusal rather than a blanket block on unicast NodeInfo from signers.
-void test_N6_signed_unicast_nodeinfo_from_signer_changes_name(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-    mockNodeDB->setLongName(REMOTE_NODE, "Genuine");
-
-    NodeInfoTestShim shim;
-    meshtastic_MeshPacket mp = makeDecoded(REMOTE_NODE, LOCAL_NODE, meshtastic_PortNum_NODEINFO_APP, SMALL_PAYLOAD);
-    mp.xeddsa_signed = true;
-    meshtastic_User user = meshtastic_User_init_zero;
-    user.is_licensed = owner.is_licensed;
-    strcpy(user.long_name, "Renamed");
-    strcpy(user.short_name, "RNM");
-
-    TEST_ASSERT_FALSE(shim.handleReceivedProtobuf(mp, &user));
-    TEST_ASSERT_EQUAL_STRING_MESSAGE("Renamed", mockNodeDB->longName(REMOTE_NODE),
-                                     "a signed update from a signer must still be learned");
-}
-
-// C7: a node that has never signed is unaffected - the ordinary case for most of the mesh.
-void test_N7_unsigned_unicast_nodeinfo_from_nonsigner_changes_name(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE); // signer bit clear
-    mockNodeDB->setLongName(REMOTE_NODE, "Genuine");
-
-    NodeInfoTestShim shim;
-    meshtastic_MeshPacket mp = makeDecoded(REMOTE_NODE, LOCAL_NODE, meshtastic_PortNum_NODEINFO_APP, SMALL_PAYLOAD);
-    mp.xeddsa_signed = false;
-    meshtastic_User user = meshtastic_User_init_zero;
-    user.is_licensed = owner.is_licensed;
-    strcpy(user.long_name, "Renamed");
-    strcpy(user.short_name, "RNM");
-
-    TEST_ASSERT_FALSE(shim.handleReceivedProtobuf(mp, &user));
-    TEST_ASSERT_EQUAL_STRING_MESSAGE("Renamed", mockNodeDB->longName(REMOTE_NODE),
-                                     "non-signer identity learning must be unaffected");
-}
-
-// ---------------------------------------------------------------------------
-// N8-N11: the 12h reply-suppression window.
-//
-// The stamp is uptime SECONDS, not milliseconds: entries live for as long as the node stays in the
-// DB, so a 32-bit millisecond stamp aliased back into the window once uptime passed 49.7 days and
-// suppressed a legitimate reply for up to 12h. Driven through Time::setTestMillis() rather than by
-// waiting.
-// ---------------------------------------------------------------------------
-
-static constexpr uint32_t kSuppressSecs = 12 * 60 * 60;
-
-// Deliver a NodeInfo request from `sender` and report whether we would reply to it.
-static bool wouldReplyToNodeInfoRequest(NodeInfoTestShim &shim, NodeNum sender)
-{
-    meshtastic_MeshPacket mp = makeDecoded(sender, NODENUM_BROADCAST, meshtastic_PortNum_NODEINFO_APP, SMALL_PAYLOAD);
-    mp.decoded.want_response = true;
-    meshtastic_User user = meshtastic_User_init_zero;
-    user.is_licensed = owner.is_licensed;
-
-    shim.handleReceivedProtobuf(mp, &user);
-
-    NodeInfoTestShim::currentRequest = &mp;
-    meshtastic_MeshPacket *reply = shim.allocReply();
-    NodeInfoTestShim::currentRequest = nullptr;
-
-    if (reply) {
-        packetPool.release(reply);
-        return true;
-    }
-    return false;
-}
-
-// Step the injected clock the way the main loop does - advance, then publish the wrap carry.
-static void advanceUptime(uint32_t deltaMs)
-{
-    Time::advanceTestMillis(deltaMs);
-    Time::serviceMonotonic();
-}
-
-void test_N8_second_request_inside_the_window_is_suppressed(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    Time::setTestMillis(60 * 1000);
-    Time::serviceMonotonic();
-
-    NodeInfoTestShim shim;
-    TEST_ASSERT_TRUE_MESSAGE(wouldReplyToNodeInfoRequest(shim, REMOTE_NODE), "first request must be answered");
-
-    advanceUptime(60 * 60 * 1000); // 1h later, well inside the 12h window
-    TEST_ASSERT_FALSE_MESSAGE(wouldReplyToNodeInfoRequest(shim, REMOTE_NODE), "repeat request inside 12h must be suppressed");
-}
-
-void test_N9_request_after_the_window_is_answered(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    Time::setTestMillis(60 * 1000);
-    Time::serviceMonotonic();
-
-    NodeInfoTestShim shim;
-    TEST_ASSERT_TRUE(wouldReplyToNodeInfoRequest(shim, REMOTE_NODE));
-
-    advanceUptime((kSuppressSecs + 60) * 1000); // 12h + a minute
-    TEST_ASSERT_TRUE_MESSAGE(wouldReplyToNodeInfoRequest(shim, REMOTE_NODE), "request after 12h must be answered");
-}
-
-// The regression. A stamp is only aliased by a counter that wraps underneath it, so the failure
-// needs a *full* 2^32 ms of uptime to elapse, not merely a crossing of the boundary: with 32-bit
-// millisecond stamps `now - stamp` then computes as 0 and the sender looks like it was answered
-// this instant. Uptime seconds do not wrap for 136 years, so the entry reads as ~49.7 days old.
-void test_N10_stale_stamp_does_not_alias_after_a_full_wrap(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    Time::setTestMillis(0x80000000u); // ~24.8 days of uptime
-    Time::serviceMonotonic();
-
-    NodeInfoTestShim shim;
-    TEST_ASSERT_TRUE(wouldReplyToNodeInfoRequest(shim, REMOTE_NODE));
-
-    // A whole millis() cycle, in two serviced halves - one publish per window is the contract.
-    advanceUptime(0x80000000u);
-    advanceUptime(0x80000000u);
-
-    TEST_ASSERT_TRUE_MESSAGE(wouldReplyToNodeInfoRequest(shim, REMOTE_NODE),
-                             "a stamp one full wrap old must read as ~49.7 days, not as this instant");
-}
-
-// Suppression must still behave normally either side of the boundary: still suppressing inside the
-// window, and answering again once 12h have passed, with the stamp and the reading on opposite
-// sides of the wrap.
-void test_N11_window_still_applies_across_the_wrap(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    Time::setTestMillis(0xFFFF0000u); // just short of the wrap
-    Time::serviceMonotonic();
-
-    NodeInfoTestShim shim;
-    TEST_ASSERT_TRUE(wouldReplyToNodeInfoRequest(shim, REMOTE_NODE));
-
-    advanceUptime(0x20000u); // ~131s later, and now past the wrap
-    TEST_ASSERT_FALSE_MESSAGE(wouldReplyToNodeInfoRequest(shim, REMOTE_NODE),
-                              "the window must still bite when the stamp sits the other side of the wrap");
-
-    advanceUptime((kSuppressSecs + 60) * 1000);
-    TEST_ASSERT_TRUE_MESSAGE(wouldReplyToNodeInfoRequest(shim, REMOTE_NODE),
-                             "and must still release once 12h have passed across the wrap");
-}
-
-void test_L1_licensed_nodeinfo_publishes_public_key(void)
-{
-    owner.is_licensed = true;
-    owner.public_key.size = 32;
-    memset(owner.public_key.bytes, 0x5A, owner.public_key.size);
-
-    NodeInfoTestShim shim;
-    meshtastic_MeshPacket *reply = shim.allocReply();
-    TEST_ASSERT_NOT_NULL(reply);
-    meshtastic_User published = meshtastic_User_init_zero;
-    TEST_ASSERT_TRUE(
-        pb_decode_from_bytes(reply->decoded.payload.bytes, reply->decoded.payload.size, &meshtastic_User_msg, &published));
-    TEST_ASSERT_TRUE(published.is_licensed);
-    TEST_ASSERT_EQUAL(32, published.public_key.size);
-    TEST_ASSERT_EQUAL_UINT8_ARRAY(owner.public_key.bytes, published.public_key.bytes, 32);
-    packetPool.release(reply);
-}
-
-void test_L2_licensed_identity_key_is_generated_and_preserved(void)
-{
-    owner.is_licensed = true;
-    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
-    config.security = meshtastic_Config_SecurityConfig_init_zero;
-
-    TEST_ASSERT_TRUE(mockNodeDB->generateCryptoKeyPair());
-    uint8_t privateKey[32], publicKey[32];
-    memcpy(privateKey, config.security.private_key.bytes, sizeof(privateKey));
-    memcpy(publicKey, config.security.public_key.bytes, sizeof(publicKey));
-    const NodeNum migratedNodeNum = myNodeInfo.my_node_num;
-    TEST_ASSERT_NOT_EQUAL(LOCAL_NODE, migratedNodeNum);
-    TEST_ASSERT_TRUE(mockNodeDB->licensedIdentityMigrationPending);
-
-    MockMeshService mockService;
-    service = &mockService;
-    TEST_ASSERT_TRUE(mockNodeDB->notifyPendingLicensedIdentityMigration());
-    TEST_ASSERT_EQUAL(1, mockService.notificationCount);
-    TEST_ASSERT_FALSE(mockNodeDB->licensedIdentityMigrationPending);
-    TEST_ASSERT_FALSE(mockNodeDB->notifyPendingLicensedIdentityMigration());
-    TEST_ASSERT_EQUAL(1, mockService.notificationCount);
-    service = pipelineService;
-
-    config.security.public_key.size = 0;
-    owner.public_key.size = 0;
-    TEST_ASSERT_TRUE(mockNodeDB->generateCryptoKeyPair());
-    TEST_ASSERT_EQUAL(migratedNodeNum, myNodeInfo.my_node_num);
-    TEST_ASSERT_EQUAL_UINT8_ARRAY(privateKey, config.security.private_key.bytes, sizeof(privateKey));
-    TEST_ASSERT_EQUAL_UINT8_ARRAY(publicKey, config.security.public_key.bytes, sizeof(publicKey));
-    TEST_ASSERT_EQUAL_UINT8_ARRAY(publicKey, owner.public_key.bytes, sizeof(publicKey));
-}
-
-void test_L3_factory_config_reset_preserves_valid_identity_private_key(void)
-{
-    uint8_t publicKey[32], privateKey[32];
-    crypto->generateKeyPair(publicKey, privateKey);
-    config.has_security = true;
-    config.security.private_key.size = 32;
-    memcpy(config.security.private_key.bytes, privateKey, sizeof(privateKey));
-
-    mockNodeDB->installDefaultsPreservingIdentity();
-    TEST_ASSERT_EQUAL(32, config.security.private_key.size);
-    TEST_ASSERT_EQUAL_UINT8_ARRAY(privateKey, config.security.private_key.bytes, sizeof(privateKey));
-    TEST_ASSERT_EQUAL(0, config.security.public_key.size);
-
-    owner.is_licensed = true;
-    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
-    TEST_ASSERT_TRUE(mockNodeDB->generateCryptoKeyPair());
-    TEST_ASSERT_EQUAL_UINT8_ARRAY(privateKey, config.security.private_key.bytes, sizeof(privateKey));
-    TEST_ASSERT_EQUAL_UINT8_ARRAY(publicKey, config.security.public_key.bytes, sizeof(publicKey));
-}
-
-void test_L4_licensed_low_entropy_identity_is_regenerated(void)
-{
-    static const uint8_t compromisedPublicKey[32] = {
-        0xac, 0xaf, 0x8c, 0x1c, 0x3c, 0x1c, 0x37, 0xac, 0x4f, 0x03, 0xa1, 0xe9, 0xfc, 0x37, 0x23, 0x29,
-        0xc8, 0xa3, 0x5d, 0x7f, 0x05, 0x26, 0xeb, 0x00, 0xbd, 0x26, 0xb8, 0x2e, 0xb1, 0x94, 0x7d, 0x24,
-    };
-    owner.is_licensed = true;
-    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
-    config.security.private_key.size = 32;
-    memset(config.security.private_key.bytes, 0xA5, 32);
-    config.security.public_key.size = 32;
-    memcpy(config.security.public_key.bytes, compromisedPublicKey, sizeof(compromisedPublicKey));
-    TEST_ASSERT_TRUE(mockNodeDB->checkLowEntropyPublicKey(config.security.public_key));
-
-    uint8_t oldPrivateKey[32];
-    memcpy(oldPrivateKey, config.security.private_key.bytes, sizeof(oldPrivateKey));
-    TEST_ASSERT_TRUE(mockNodeDB->generateCryptoKeyPair());
-    TEST_ASSERT_TRUE(mockNodeDB->keyIsLowEntropy);
-    TEST_ASSERT_FALSE(mockNodeDB->checkLowEntropyPublicKey(config.security.public_key));
-    TEST_ASSERT_FALSE(memcmp(oldPrivateKey, config.security.private_key.bytes, sizeof(oldPrivateKey)) == 0);
-}
-
-// ===========================================================================
-// Group D - encoding invariants the routing gates depend on
-// ===========================================================================
-
-// D1: the encoded overhead of the signature field must be exactly XEDDSA_SIGNATURE_FIELD_BYTES
-// (1 tag byte + 1 length byte + 64 signature bytes). The receiver downgrade predicate adds this
-// constant to the unsigned size; this test pins that it matches the real wire overhead the
-// sender's encoder produces, keeping the two sides symmetric. It drifts if the field number ever
-// moves to >= 16 or the signature grows past 127 bytes.
-void test_D1_signature_field_overhead_exact(void)
-{
-    meshtastic_Data d = meshtastic_Data_init_zero;
-    d.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
-    d.payload.size = 100;
-
-    const size_t without = encodedDataSize(&d);
-    d.xeddsa_signature.size = XEDDSA_SIGNATURE_SIZE;
-    const size_t with = encodedDataSize(&d);
-
-    TEST_ASSERT_EQUAL_MESSAGE(XEDDSA_SIGNATURE_FIELD_BYTES, with - without, "signature field wire overhead drifted");
-}
-
-// ===========================================================================
-// Group E - decoded-ingress policy (checkXeddsaReceivePolicy)
-// ===========================================================================
-// Already-decoded packets never reach perhapsDecode's crypto path (it early-returns), so
-// plaintext-MQTT downlink applies this policy function directly at ingress (MQTT.cpp). These
-// tests drive it the same way: decoded packets, sized from p->decoded exactly as the RF path is.
-// End-to-end MQTT wiring is covered in test_mqtt.
-
-// E1: unsigned small broadcast from a known signer -> dropped (downgrade protection holds on
-// the decoded-ingress path too - the F3 bypass).
-void test_E1_decoded_unsigned_broadcast_from_signer_dropped(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-
-    TEST_ASSERT_FALSE(checkXeddsaReceivePolicy(&p));
-}
-
-// E2: unsigned broadcast from a non-signer -> accepted.
-void test_E2_decoded_unsigned_broadcast_from_nonsigner_accepted(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE); // signer bit clear
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-
-    TEST_ASSERT_TRUE(checkXeddsaReceivePolicy(&p));
-    TEST_ASSERT_FALSE(p.xeddsa_signed);
-}
-
-// E3: valid signature with a known key -> accepted, marked verified, signer bit learned.
-void test_E3_decoded_valid_signature_verified_and_learns_signer(void)
-{
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setPublicKey(REMOTE_NODE, pub);
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-    signWithCurrentKey(&p);
-
-    TEST_ASSERT_TRUE(checkXeddsaReceivePolicy(&p));
-    TEST_ASSERT_TRUE(p.xeddsa_signed);
-    TEST_ASSERT_TRUE_MESSAGE(remoteSignerBit(), "verified signature must set the signer bit");
-}
-
-// E4: corrupted signature with a known key -> dropped.
-void test_E4_decoded_bad_signature_dropped(void)
-{
-    uint8_t pub[32], priv[32];
-    crypto->generateKeyPair(pub, priv);
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setPublicKey(REMOTE_NODE, pub);
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-    signWithCurrentKey(&p);
-    p.decoded.xeddsa_signature.bytes[0] ^= 0xFF;
-
-    TEST_ASSERT_FALSE(checkXeddsaReceivePolicy(&p));
-    TEST_ASSERT_FALSE(p.xeddsa_signed);
-}
-
-// E5: unsigned oversized broadcast from a signer -> accepted (packets whose signed encoding
-// wouldn't fit are exempt, identically to the RF path: both size p->decoded).
-void test_E5_decoded_unsigned_oversized_broadcast_from_signer_accepted(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, OVERSIZED_PAYLOAD);
-
-    TEST_ASSERT_TRUE(checkXeddsaReceivePolicy(&p));
-}
-
-// E6: Balanced accepts unsigned unicast from a signer for legacy compatibility.
-void test_E6_decoded_unsigned_unicast_from_signer_accepted(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, LOCAL_NODE, meshtastic_PortNum_PRIVATE_APP, SMALL_PAYLOAD);
-
-    TEST_ASSERT_TRUE(checkXeddsaReceivePolicy(&p));
-}
-
-// E8: a crafted partial (non-0, non-64) signature must not let a forged broadcast dodge the
-// downgrade drop. A 63-byte junk signature inflates the encoded size past the fit threshold, so
-// a size-only predicate would treat the packet as "too big to sign" and accept it as an
-// impersonation of signer REMOTE. The malformed-size reject drops it before that math runs.
-void test_E8_decoded_partial_signature_from_signer_dropped(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    // 146-byte payload sits in the band that WOULD fit a signature (so an honest unsigned one is a
-    // downgrade), but the 63 bogus signature bytes push the raw size over the frame limit.
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, 146);
-    p.decoded.xeddsa_signature.size = XEDDSA_SIGNATURE_SIZE - 1;
-    memset(p.decoded.xeddsa_signature.bytes, 0xCD, p.decoded.xeddsa_signature.size);
-
-    TEST_ASSERT_FALSE_MESSAGE(checkXeddsaReceivePolicy(&p), "partial signature from a signer must be dropped");
-    TEST_ASSERT_FALSE(p.xeddsa_signed);
-}
-
-// E9: the malformed-size reject is unconditional - a partial signature is dropped even from a
-// node we've never seen sign (an honest sender never emits a 1..63-byte signature field).
-void test_E9_decoded_partial_signature_from_nonsigner_dropped(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE); // signer bit clear
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TEXT_MESSAGE_APP, SMALL_PAYLOAD);
-    p.decoded.xeddsa_signature.size = 10;
-    memset(p.decoded.xeddsa_signature.bytes, 0x5A, p.decoded.xeddsa_signature.size);
-
-    TEST_ASSERT_FALSE_MESSAGE(checkXeddsaReceivePolicy(&p), "partial signature must be dropped as malformed");
-}
-
-// Build an unsigned broadcast whose inner message is padded with an unknown field, and pin that the
-// padding pushes the RAW size past the fit threshold - the exemption the attacker is buying - while
-// the frame stays sendable. Without canonical inner sizing these packets are wrongly accepted.
-static meshtastic_MeshPacket makePayloadPaddedBroadcast(meshtastic_PortNum port, const pb_msgdesc_t *fields, const void *inner,
-                                                        size_t padLen)
-{
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, port, 0);
-    const size_t innerLen = pb_encode_to_bytes(p.decoded.payload.bytes, sizeof(p.decoded.payload.bytes), fields, inner);
-    TEST_ASSERT_GREATER_THAN_MESSAGE(0, innerLen, "failed to encode the spoofed inner message");
-    p.decoded.payload.size =
-        innerLen + appendUnknownField(p.decoded.payload.bytes + innerLen, sizeof(p.decoded.payload.bytes) - innerLen, padLen);
-
-    TEST_ASSERT_FALSE_MESSAGE(signedEncodingFits(&p.decoded), "padding must push the raw size past the fit threshold");
-    TEST_ASSERT_LESS_OR_EQUAL_MESSAGE(MAX_LORA_PAYLOAD_LEN, encodedDataSize(&p.decoded) + MESHTASTIC_HEADER_LENGTH,
-                                      "padded frame must still be one a radio could send");
-    return p;
-}
-
-// E10: unknown fields buried inside Data.payload are discarded by the module's own pb_decode, so
-// they must not sway the downgrade decision the way A10 already pins for Data-level unknown fields.
-void test_E10_decoded_unsigned_position_padded_inside_payload_dropped(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    meshtastic_Position pos = meshtastic_Position_init_zero;
-    pos.has_latitude_i = pos.has_longitude_i = true;
-    pos.latitude_i = 371234567;
-    pos.longitude_i = -1221234567;
-
-    meshtastic_MeshPacket p = makePayloadPaddedBroadcast(meshtastic_PortNum_POSITION_APP, &meshtastic_Position_msg, &pos, 163);
-
-    TEST_ASSERT_FALSE_MESSAGE(checkXeddsaReceivePolicy(&p), "payload-padded unsigned Position from a signer must be dropped");
-    TEST_ASSERT_FALSE(p.xeddsa_signed);
-}
-
-// E11: over-correction guard. Telemetry (272 bytes max) and Waypoint (199) can legitimately exceed
-// the signable budget, so canonical sizing must not shrink an honest one into the drop range.
-void test_E11_decoded_unsigned_oversized_telemetry_from_signer_accepted(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    meshtastic_Telemetry t = meshtastic_Telemetry_init_zero;
-    t.which_variant = meshtastic_Telemetry_host_metrics_tag;
-    t.variant.host_metrics.uptime_seconds = 123456;
-    t.variant.host_metrics.has_user_string = true;
-    memset(t.variant.host_metrics.user_string, 'x', sizeof(t.variant.host_metrics.user_string) - 1);
-
-    meshtastic_MeshPacket p = makeDecoded(REMOTE_NODE, NODENUM_BROADCAST, meshtastic_PortNum_TELEMETRY_APP, 0);
-    p.decoded.payload.size =
-        pb_encode_to_bytes(p.decoded.payload.bytes, sizeof(p.decoded.payload.bytes), &meshtastic_Telemetry_msg, &t);
-    TEST_ASSERT_GREATER_THAN_MESSAGE(0, p.decoded.payload.size, "failed to encode the oversized Telemetry");
-
-    // Every byte here is a field this build understands, so canonical sizing must leave it alone.
-    TEST_ASSERT_FALSE_MESSAGE(signedEncodingFits(&p.decoded), "telemetry must be too big to sign, else the test is vacuous");
-
-    TEST_ASSERT_TRUE_MESSAGE(checkXeddsaReceivePolicy(&p), "honest oversized telemetry from a signer must not be dropped");
-}
-
-// E12: E10 for the Waypoint branch of the canonical-sizing switch.
-void test_E12_decoded_unsigned_waypoint_padded_inside_payload_dropped(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    meshtastic_Waypoint w = meshtastic_Waypoint_init_zero;
-    w.id = 42;
-    w.has_latitude_i = w.has_longitude_i = true;
-    w.latitude_i = 371234567;
-    w.longitude_i = -1221234567;
-    strcpy(w.name, "spoofed");
-
-    meshtastic_MeshPacket p = makePayloadPaddedBroadcast(meshtastic_PortNum_WAYPOINT_APP, &meshtastic_Waypoint_msg, &w, 150);
-
-    TEST_ASSERT_FALSE_MESSAGE(checkXeddsaReceivePolicy(&p), "payload-padded unsigned Waypoint from a signer must be dropped");
-    TEST_ASSERT_FALSE(p.xeddsa_signed);
-}
-
-// E13: E10 for the NodeInfo/User branch. Router drops it before rebroadcast; NodeInfoModule's own
-// check (Group C) is receiver-local and would not stop the packet propagating.
-void test_E13_decoded_unsigned_nodeinfo_padded_inside_payload_dropped(void)
-{
-    mockNodeDB->addNode(REMOTE_NODE);
-    mockNodeDB->setSignerBit(REMOTE_NODE, true);
-
-    meshtastic_User u = meshtastic_User_init_zero;
-    strcpy(u.id, "!0b0b0b0b");
-    strcpy(u.long_name, "spoofed node");
-    strcpy(u.short_name, "SPF");
-
-    meshtastic_MeshPacket p = makePayloadPaddedBroadcast(meshtastic_PortNum_NODEINFO_APP, &meshtastic_User_msg, &u, 150);
-
-    TEST_ASSERT_FALSE_MESSAGE(checkXeddsaReceivePolicy(&p), "payload-padded unsigned NodeInfo from a signer must be dropped");
-    TEST_ASSERT_FALSE(p.xeddsa_signed);
-}
-
-void setup()
-{
-    initializeTestEnvironment();
-    AirTime *savedAirTime = airTime;
-    meshtastic::NodeStatus *savedNodeStatus = nodeStatus;
-    AirTime testAirTime;
-    meshtastic::NodeStatus testNodeStatus;
-    airTime = &testAirTime;
-    nodeStatus = &testNodeStatus;
-
-    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
-    initRegion();
-    pipelineRouter = new AuthPipelineRouter();
-    auto pipelineRadioOwner = std::make_unique<AuthPipelineRadio>();
-    pipelineRadio = pipelineRadioOwner.get();
-    pipelineRouter->addInterface(std::move(pipelineRadioOwner));
-    router = pipelineRouter;
-    routingModule = pipelineRouting = new AuthPipelineRoutingModule();
-    pipelineModule = new AuthPipelineModule();
-    service = pipelineService = new MeshService();
-    mqtt = pipelineMqtt = new AuthPipelineMqtt();
-
-    UNITY_BEGIN();
-
-    printf("\n=== Group A: receive-side accept/reject ===\n");
-    RUN_TEST(test_A1_valid_signature_accepted_and_learns_signer);
-    RUN_TEST(test_A2_bad_signature_dropped);
-    RUN_TEST(test_A3_signed_no_pubkey_accepted_unverified);
-    RUN_TEST(test_A4_downgrade_unsigned_broadcast_from_signer_dropped);
-    RUN_TEST(test_A5_unsigned_broadcast_from_nonsigner_accepted);
-    RUN_TEST(test_A6_unsigned_unicast_from_signer_accepted);
-    RUN_TEST(test_A7_unsigned_oversized_broadcast_from_signer_accepted);
-    RUN_TEST(test_A8_unsigned_deadband_broadcast_from_signer_accepted);
-    RUN_TEST(test_A9_unsigned_boundary_broadcast_from_signer_still_dropped);
-    RUN_TEST(test_A10_compatible_accepts_unsigned_broadcast_from_signer);
-    RUN_TEST(test_A11_strict_rejects_unsigned_all_portnums_destinations_and_sizes);
-    RUN_TEST(test_A12_strict_rejects_signed_packet_without_key);
-    RUN_TEST(test_A13_strict_accepts_locally_authenticated_pki_packet);
-    RUN_TEST(test_A13b_strict_rejects_spoofed_pki_flag_on_encrypted_ingress);
-    RUN_TEST(test_A14_strict_bootstraps_identity_bound_signed_nodeinfo);
-    RUN_TEST(test_A15_strict_rejects_nodeinfo_key_without_identity_binding);
-    RUN_TEST(test_A16_compatible_rejects_invalid_first_contact_nodeinfo);
-#if WARM_NODE_COUNT > 0
-    RUN_TEST(test_A17_strict_verifies_signer_from_warm_key_store);
-#endif
-    RUN_TEST(test_A18_unsigned_broadcast_from_signer_with_unknown_fields_dropped);
-    RUN_TEST(test_A19_unsigned_broadcast_from_nonsigner_with_unknown_fields_accepted);
-
-    printf("\n=== Group B: send-side signing policy ===\n");
-    RUN_TEST(test_B1_local_broadcast_is_signed);
-    RUN_TEST(test_B2_local_unicast_not_signed);
-    RUN_TEST(test_B3_local_oversized_broadcast_not_signed);
-    RUN_TEST(test_B4_all_broadcast_sizes_deliverable_no_deadband);
-    RUN_TEST(test_B5_preset_signature_on_local_packet_cleared);
-    RUN_TEST(test_B6_rich_shape_sweep_no_deadband);
-    RUN_TEST(test_B7_infrastructure_port_signing_matrix);
-    RUN_TEST(test_B8_licensed_broadcast_and_unicast_are_signed);
-    RUN_TEST(test_B9_licensed_unicast_never_uses_pki_encryption);
-    RUN_TEST(test_B10_licensed_oversized_unicast_remains_unsigned);
-    RUN_TEST(test_B11_normal_unicast_still_uses_pki);
-    RUN_TEST(test_B12_licensed_receiver_does_not_decrypt_pki);
-    RUN_TEST(test_B13_licensed_port_and_destination_signing_matrix);
-
-    printf("\n=== Group C: routing pipeline authentication ordering ===\n");
-    RUN_TEST(test_C1_invalid_first_copy_does_not_poison_valid_same_id);
-    RUN_TEST(test_C2_invalid_ordinary_duplicate_has_no_cancel_or_delivery_effects);
-    RUN_TEST(test_C3_invalid_repeated_packet_cannot_ack_or_change_retry_state);
-    RUN_TEST(test_C4_invalid_fallback_packet_cannot_relay);
-    RUN_TEST(test_C5_invalid_upgrade_cannot_remove_pending_valid_send);
-    RUN_TEST(test_C6_opaque_unknown_channel_is_relay_only);
-    RUN_TEST(test_C7_strict_rejects_unsigned_decoded_simradio_ingress);
-    RUN_TEST(test_C8_trusted_local_decoded_delivery_is_not_filtered);
-    RUN_TEST(test_C9_known_channel_malformed_plaintext_has_no_pipeline_effects);
-    RUN_TEST(test_C10_legacy_channel_dm_failure_has_no_pipeline_effects);
-    RUN_TEST(test_C11_malformed_pki_plaintext_has_no_pipeline_effects);
-    RUN_TEST(test_C12_exact_authenticated_replay_reuses_verdict_without_collision_bypass);
-    RUN_TEST(test_C13_failed_initial_reliable_send_does_not_retry);
-    RUN_TEST(test_C14_duty_cycle_limited_reliable_send_remains_pending);
-    RUN_TEST(test_C15_reliable_unicast_tracks_five_total_attempts);
-    RUN_TEST(test_C16_reliable_broadcast_keeps_three_total_attempts);
-    RUN_TEST(test_C17_colliding_channel_hash_foreign_broadcast_is_relay_only);
-    printf("\n=== Group N: NodeInfoModule authentication ===\n");
-    RUN_TEST(test_N1_unsigned_nodeinfo_from_signer_dropped);
-    RUN_TEST(test_N2_signed_nodeinfo_from_signer_not_dropped);
-    RUN_TEST(test_N3_unsigned_nodeinfo_from_nonsigner_not_dropped);
-    RUN_TEST(test_N4_unsigned_unicast_nodeinfo_from_signer_accepted);
-    RUN_TEST(test_N5_unsigned_unicast_nodeinfo_from_signer_does_not_change_name);
-    RUN_TEST(test_N6_signed_unicast_nodeinfo_from_signer_changes_name);
-    RUN_TEST(test_N7_unsigned_unicast_nodeinfo_from_nonsigner_changes_name);
-    RUN_TEST(test_N8_second_request_inside_the_window_is_suppressed);
-    RUN_TEST(test_N9_request_after_the_window_is_answered);
-    RUN_TEST(test_N10_stale_stamp_does_not_alias_after_a_full_wrap);
-    RUN_TEST(test_N11_window_still_applies_across_the_wrap);
-
-    printf("\n=== Group L: licensed identity and plaintext signing ===\n");
-    RUN_TEST(test_L1_licensed_nodeinfo_publishes_public_key);
-    RUN_TEST(test_L2_licensed_identity_key_is_generated_and_preserved);
-    RUN_TEST(test_L3_factory_config_reset_preserves_valid_identity_private_key);
-    RUN_TEST(test_L4_licensed_low_entropy_identity_is_regenerated);
-
-    printf("\n=== Group D: encoding invariants ===\n");
-    RUN_TEST(test_D1_signature_field_overhead_exact);
-
-    printf("\n=== Group E: decoded-ingress policy ===\n");
-    RUN_TEST(test_E1_decoded_unsigned_broadcast_from_signer_dropped);
-    RUN_TEST(test_E2_decoded_unsigned_broadcast_from_nonsigner_accepted);
-    RUN_TEST(test_E3_decoded_valid_signature_verified_and_learns_signer);
-    RUN_TEST(test_E4_decoded_bad_signature_dropped);
-    RUN_TEST(test_E5_decoded_unsigned_oversized_broadcast_from_signer_accepted);
-    RUN_TEST(test_E6_decoded_unsigned_unicast_from_signer_accepted);
-    RUN_TEST(test_E8_decoded_partial_signature_from_signer_dropped);
-    RUN_TEST(test_E9_decoded_partial_signature_from_nonsigner_dropped);
-    RUN_TEST(test_E10_decoded_unsigned_position_padded_inside_payload_dropped);
-    RUN_TEST(test_E11_decoded_unsigned_oversized_telemetry_from_signer_accepted);
-    RUN_TEST(test_E12_decoded_unsigned_waypoint_padded_inside_payload_dropped);
-    RUN_TEST(test_E13_decoded_unsigned_nodeinfo_padded_inside_payload_dropped);
-
-    const int result = UNITY_END();
-    airTime = savedAirTime;
-    nodeStatus = savedNodeStatus;
-    exit(result);
-}
-
-void loop() {}
-
-#else // XEdDSA or PKI excluded
-
-void setUp(void) {}
-void tearDown(void) {}
-void setup()
-{
-    initializeTestEnvironment();
-    UNITY_BEGIN();
-    exit(UNITY_END());
-}
-void loop() {}
-
-#endif
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éíß9é:-jZ.¶›­–)Þ³RòòFW7G2f÷"„VDE46¶WB×6–væ–ær§öÆ–7’¢ÒF†R&V6V—fR×F‚66WB÷&V¦V7B&V†f–÷"æBF†P¢òò6VæB×F‚6–væ–æröÆ–7’Ò2÷÷6VBFòF†R&r6–vâ÷fW&–g’&–Ö—F—fR†6÷fW&VB–âFW7Eö7'—Fò’à¢òð¢òòF†RFV6—6–öâÆöv–2VæFW"FW7BÆ—fW2–â&÷WFW"æ7g&VRgVæ7F–öç2âw&÷W2ô"G&—fR&VÀ¢òòVæ6öFRÓâFV6öFR&÷VæB×G&—F‡&÷Vv‚F†RFVfVÇB6†ææVÂ‡W&†4Væ6öFR÷W&†4FV6öFRÂ&Æ6²Ö&÷‚À¢òòæò&öGV7F–öâ6†ævW2“²ÆFW"w&÷W2W†W&6—6R&÷WF–ær÷&FW"æBöÆ–7’†VÇW'2F—&V7FÇ’à¢òð¢òòw&÷W&V6V—fR×6–FR66WB÷&V¦V7BÖG&—‚‡fW&–g’ÂF÷væw&FR&÷FV7F–öâÂ6–væW"Ö&—BÆV&æ–ær¢òòw&÷W"6VæB×6–FR6–væ–æröÆ–7’‡v†–6‚÷WFvö–ær6¶WG2W&†4Væ6öFR6–vç2¢òòw&÷W2&÷WF–ær—VÆ–æR÷&FW&–ær†WF†VçF–6FR&Vf÷&RGWÆ–6FR÷&WG'’÷&VÆ’7FFR¢òòw&÷WBVæ6öF–ær–çf&–çG2F†R&÷WF–ærvFW2FWVæBöà¢òòw&÷WRFV6öFVBÖ–æw&W72öÆ–7’†6†V6µ†VFG6&V6V—fUöÆ–7’ÂF†RÆ–çFW‡BÔÕEBG'W7B&÷VæF'’ ¢6–æ6ÇVFR$ÖW6…G—W2æ‚"òò–æ6ÇVFR$Tdõ$RFW7EWF–Âæ€¢6–æ6ÇVFR$æöFU7FGW2æ‚ ¢6–æ6ÇVFR%FW7EWF–Âæ‚ ¢6–æ6ÇVFR&—'F–ÖRæ‚ ¢6–æ6ÇVFR'7W÷'BôÖö6´ÖW6…6W'f–6Ræ‚ ¢6–æ6ÇVFRÇVæ—G’æƒà ¢òòF†Rv†öÆR7V—FRW†W&6—6W2„VDE46–vâ÷fW&–g’æB6†V6µ†VFG6&V6V—fUöÆ–7’ÂÆÂöbv†–6‚&P¢òò6ö×–ÆVB÷WBVæÆW72&÷F‚´’æB„VDE4&RVæ&ÆVB†Rærâ7FÓ3"6WG2ÔU4…D5D”5ôU„4ÅTDUõ„TDE4’à¢6–b„ÔU4…D5D”5ôU„4ÅTDUõ´’’bb„ÔU4…D5D”5ôU„4ÅTDUõ„TDE4 ¢6–æ6ÇVFR%WF–ÖT6Æö6²æ‚ ¢6–æ6ÇVFR&ÖW6‚ô6†ææVÇ2æ‚ ¢6–æ6ÇVFR&ÖW6‚ô7'—FôVæv–æRæ‚ ¢6–æ6ÇVFR&ÖW6‚ôÖW6…&F–òæ‚ ¢6–æ6ÇVFR&ÖW6‚ôÖW6…6W'f–6Ræ‚ ¢6–æ6ÇVFR&ÖW6‚ôæöFTD"æ‚ ¢6–æ6ÇVFR&ÖW6‚õ&VÆ–&ÆU&÷WFW"æ‚ ¢6–æ6ÇVFR&ÖW6‚õ&÷WFW"æ‚ ¢6–æ6ÇVFR&ÖW6‚õ6–ævÆU÷'DÖöGVÆRæ‚ ¢6–æ6ÇVFR&ÖöGVÆW2ôæöFT–æfôÖöGVÆRæ‚ ¢6–æ6ÇVFR&ÖöGVÆW2õ&÷WF–ætÖöGVÆRæ‚ ¢6–æ6ÇVFR&×GBôÕEBæ‚ ¢6–æ6ÇVFRÄW'&–W¤5$33"æƒà¢6–æ6ÇVFRÆ77FF–óà¢6–æ6ÇVFRÆ77G&–æsà¢6–æ6ÇVFRÆÖVÖ÷'“à¢6–æ6ÇVFRÇ%öFV6öFRæƒà¢6–æ6ÇVFRÇ%öVæ6öFRæƒà¢6–æ6ÇVFRÇfV7F÷#à ¢òòÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢òòFW7Bf—‡GW&R–FVçF–f–W'0¢òòÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ§7FF–26öç7FW‡"æöFTçVÒÄô4ÅôäôDRÒƒ°§7FF–26öç7FW‡"æöFTçVÒ$TÔõDUôäôDRÒƒ####° ¢òò'6ÖÆÂ"'&öF67B–ÆöBv†÷6R6–væVBVæ6öF–ærV6–Ç’f—G2Æõ&g&ÖRÂæBâ&÷fW'6—¦VB ¢òòöæRv†÷6R6–væVBVæ6öF–ærFöW2æ÷BÂ–WB7F–ÆÂVæ6öFW2v—F†–âÆõ&g&ÖRVç6–væVBà§7FF–26öç7FW‡"6—¦U÷B4ÔÄÅõ”ÄôBÒc°§7FF–26öç7FW‡"6—¦U÷BõdU%4•¤TEõ”ÄôBÒƒ° ¢òòÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢òòÖö6´æöFTD"Ò–æ¦V7BæöFW2v—F‚6öçG&öÆÆVBV&Æ–2¶W—2ò6–væW"&—G2à¢òòÖ—'&÷'2F†RGFW&â–âFW7B÷FW7Eö†÷÷66Æ–ærâÖW6„æöFW2öçVÔÖW6„æöFW2&RV&Æ–2öâæöFTD"à¢òòÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¦6Æ72Öö6´æöFTD"¢V&Æ–2æöFTD §°¢V&Æ–3 ¢fö–B–ç7FÆÄFVfVÇG5&W6W'f–æt–FVçF—G’‚’²–ç7FÆÄFVfVÇD6öæf–r‡G'VR“²Ð ¢fö–B6ÆV%FW7DæöFW2‚¢°¢FW7DæöFW2æ6ÆV"‚“°¢ÖW6„æöFW2ÒgFW7DæöFW3°¢çVÔÖW6„æöFW2Ò°¢Ð ¢òòFB&&RæöFRæB&WGW&â7F&ÆR†æFÆR†fWF6‚f–vWDÖW6„æöFR6òF†Rö–çFW"7F—2fÆ–@¢òòWfVâ–bF†RfV7F÷"&VÆÆö6FW2gFW"ÆFW"FG2’à¢fö–BFDæöFR„æöFTçVÒçVÒ¢°¢ÖW6‡F7F–5ôæöFT–æfôÆ—FRæöFRÒÖW6‡F7F–5ôæöFT–æfôÆ—FUö–æ—E÷¦W&ó°¢æöFRæçVÒÒçVÓ°¢FW7DæöFW2çW6…ö&6²†æöFR“°¢ÖW6„æöFW2ÒgFW7DæöFW3°¢çVÔÖW6„æöFW2ÒFW7DæöFW2ç6—¦R‚“°¢Ð ¢fö–B6WEV&Æ–4¶W’„æöFTçVÒçVÒÂ6öç7BV–çC…÷B§V$¶W’¢°¢ÖW6‡F7F–5ôæöFT–æfôÆ—FR¦âÒvWDÖW6„æöFR†çVÒ“°¢DU5Eô54U%EôäõEôåTÄÂ†â“°¢âÓçV&Æ–5ö¶W’ç6—¦RÒ3#°¢ÖVÖ7’†âÓçV&Æ–5ö¶W’æ'—FW2ÂV$¶W’Â3"“°¢Ð ¢fö–B6WE6–væW$&—B„æöFTçVÒçVÒÂ&ööÂfÇVR¢°¢ÖW6‡F7F–5ôæöFT–æfôÆ—FR¦âÒvWDÖW6„æöFR†çVÒ“°¢DU5Eô54U%EôäõEôåTÄÂ†â“°¢æöFT–æfôÆ—FU6WD&—B†âÂäôDT”ädõô$•Dd”TÄEô„5õ„TDE4õ4”täTEôÔ4²ÂfÇVR“°¢Ð ¢fö–B6WDÆöætæÖR„æöFTçVÒçVÒÂ6öç7B6†"¦æÖR¢°¢ÖW6‡F7F–5ôæöFT–æfôÆ—FR¦âÒvWDÖW6„æöFR†çVÒ“°¢DU5Eô54U%EôäõEôåTÄÂ†â“°¢7G&æ7’†âÓæÆöæuöæÖRÂæÖRÂ6—¦Vöb†âÓæÆöæuöæÖR’Ò“°¢âÓæÆöæuöæÖU·6—¦Vöb†âÓæÆöæuöæÖR’ÒÒÒuÃs°¢Ð ¢6öç7B6†"¦ÆöætæÖR„æöFTçVÒçVÒ¢°¢ÖW6‡F7F–5ôæöFT–æfôÆ—FR¦âÒvWDÖW6„æöFR†çVÒ“°¢DU5Eô54U%EôäõEôåTÄÂ†â“°¢&WGW&ââÓæÆöæuöæÖS°¢Ð ¢7FC£§fV7F÷#ÆÖW6‡F7F–5ôæöFT–æfôÆ—FSâFW7DæöFW3°§Ó° §7FF–2Öö6´æöFTD"¦Öö6´æöFTD"ÒçVÆÇG#° ¦6Æ72WF…—VÆ–æU&F–ò¢V&Æ–2&F–ô–çFW&f6P§°¢V&Æ–3 ¢W'&÷$6öFR6VæB†ÖW6‡F7F–5ôÖW6…6¶WB§’÷fW'&–FP¢°¢6VæD6ÆÇ2²³°¢6¶WEööÂç&VÆV6R‡“°¢&WGW&âf–Å6VæBòU%$äõôD•4$ÄTB¢U%$äõôô³°¢Ð¢&ööÂ6æ6VÅ6VæF–ær„æöFTçVÒÂ6¶WD–B’÷fW'&–FP¢°¢6æ6VÄ6ÆÇ2²³°¢&WGW&âG'VS°¢Ð¢&ööÂf–æD–åG…VWVR„æöFTçVÒÂ6¶WD–B’÷fW'&–FP¢°¢f–æD6ÆÇ2²³°¢&WGW&âfÇ6S°¢Ð¢&ööÂ&VÖ÷fUVæF–æuE…6¶WB„æöFTçVÒÂ6¶WD–BÂV–çC3%÷B’÷fW'&–FP¢°¢&VÖ÷fT6ÆÇ2²³°¢&WGW&âG'VS°¢Ð¢V–çC3%÷BvWE6¶WEF–ÖR‡V–çC3%÷BÂ&ööÂÒfÇ6R’÷fW'&–FR²&WGW&âs²Ð¢fö–B&W6WB‚¢°¢6VæD6ÆÇ2Ò6æ6VÄ6ÆÇ2Òf–æD6ÆÇ2Ò&VÖ÷fT6ÆÇ2Ò°¢f–Å6VæBÒfÇ6S°¢Ð ¢&ööÂf–Å6VæBÒfÇ6S°¢V–çC3%÷B6VæD6ÆÇ2Ò°¢V–çC3%÷B6æ6VÄ6ÆÇ2Ò°¢V–çC3%÷Bf–æD6ÆÇ2Ò°¢V–çC3%÷B&VÖ÷fT6ÆÇ2Ò°§Ó° ¦6Æ72WF…—VÆ–æU&÷WFW"¢V&Æ–2&VÆ–&ÆU&÷WFW §°¢V&Æ–3 ¢&ööÂf–ÇFW"†ÖW6‡F7F–5ôÖW6…6¶WB§’²&WGW&â&VÆ–&ÆU&÷WFW#£§6†÷VÆDf–ÇFW%&V6V—fVB‡“²Ð¢&ööÂ†—7F÷'”6öçF–ç2†6öç7BÖW6‡F7F–5ôÖW6…6¶WB§’²&WGW&âv56VVå&V6VçFÇ’‡ÂfÇ6R“²Ð¢fö–B&VÖVÖ&W"†6öç7BÖW6‡F7F–5ôÖW6…6¶WB§’²v56VVå&V6VçFÇ’‡ÂG'VR“²Ð¢fö–Bf÷&vWE&VÆ–W"‡V–çC…÷B&VÆ’Â6¶WD–B–BÂæöFTçVÒg&öÒ’²&VÖ÷fU&VÆ–W"‡&VÆ’Â–BÂg&öÒ“²Ð¢&ööÂ†æFÆUWw&FR†ÖW6‡F7F–5ôÖW6…6¶WB§’²&WGW&âW&†4†æFÆUWw&FVE6¶WB‡“²Ð¢fö–BFEVæF–ær†6öç7BÖW6‡F7F–5ôÖW6…6¶WBgÂV–çC3%÷BæW‡EG‚¢°¢WFò¦6÷’Ò6¶WEööÂæÆÆö46÷’‡“°¢DU5Eô54U%EôäõEôåTÄÂ†6÷’“°¢6öç7BvÆö&Å6¶WD–B¶W’†6÷’“°¢VæF–æræV×Æ6R†¶W’ÂVæF–æu6¶WB†6÷’ÂåTÕô”åDU$ÔTD”DUõ$UE‚’“°¢VæF–æræB†¶W’’ææW‡EG„×6V2ÒæW‡EGƒ°¢Ð¢V–çC3%÷BVæF–ætæW‡EG‚„æöFTçVÒg&öÒÂ6¶WD–B–B¢°¢VæF–æu6¶WB¦VçG'’Òf–æEVæF–æu6¶WB†g&öÒÂ–B“°¢&WGW&âVçG'’òVçG'’ÓææW‡EG„×6V2¢°¢Ð¢V–çC…÷BVæF–æuF÷FÄGFV×G2„æöFTçVÒg&öÒÂ6¶WD–B–B¢°¢VæF–æu6¶WB¦VçG'’Òf–æEVæF–æu6¶WB†g&öÒÂ–B“°¢&WGW&âVçG'’òVçG'’Óæ–æ—F–ÄçVÕ&WG&ç6Ö—76–öç2²¢°¢Ð¢6—¦U÷BVæF–æt6÷VçB‚’6öç7B²&WGW&âVæF–ærç6—¦R‚“²Ð¢fö–B6ÆV%VæF–ær‚¢°¢f÷"†WFòfVçG'’¢VæF–ær¢6¶WEööÂç&VÆV6R†VçG'’ç6V6öæBç6¶WB“°¢VæF–æræ6ÆV"‚“°¢Ð§Ó° ¦6Æ72WF…—VÆ–æU&÷WF–ætÖöGVÆR¢V&Æ–2&÷WF–ætÖöGVÆP§°¢V&Æ–3 ¢fö–B6VæD6´æ²†ÖW6‡F7F–5õ&÷WF–æuôW'&÷"ÂæöFTçVÒÂ6¶WD–BÂ6†ææVÄ–æFW‚ÂV–çC…÷BÒÂ&ööÂÒfÇ6RÀ¢6öç7BÖW6‡F7F–5ôÖW6…6¶WB¢ÒçVÆÇG"’÷fW'&–FP¢°¢6´6ÆÇ2²³°¢Ð¢V–çC3%÷B6´6ÆÇ2Ò°§Ó° ¦6Æ72WF…—VÆ–æTÖöGVÆR¢V&Æ–26–ævÆU÷'DÖöGVÆP§°¢V&Æ–3 ¢WF…—VÆ–æTÖöGVÆR‚’¢6–ævÆU÷'DÖöGVÆR‚&WF…—VÆ–æR"ÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåô’·Ð¢&ö6W74ÖW76vR†æFÆU&V6V—fVB†6öç7BÖW6‡F7F–5ôÖW6…6¶WBb’÷fW'&–FP¢°¢6ÆÇ2²³°¢&WGW&â&ö6W74ÖW76vS£¤4ôåD”åTS°¢Ð¢V–çC3%÷B6ÆÇ2Ò°§Ó° ¦6Æ72WF…—VÆ–æT×GB¢V&Æ–2ÕE@§°¢V&Æ–3 ¢–çBVWVU6—¦R‚’²&WGW&â×GEVWVRæçVÕW6VB‚“²Ð¢fö–B6ÆV%VWVR‚¢°¢v†–ÆR…VWVTVçG'’¦VçG'’Ò×GEVWVRæFWVWVUG"ƒ’¢FVÆWFRVçG'“°¢Ð§Ó° §7FF–2WF…—VÆ–æU&÷WFW"§—VÆ–æU&÷WFW"ÒçVÆÇG#°§7FF–2WF…—VÆ–æU&F–ò§—VÆ–æU&F–òÒçVÆÇG#°§7FF–2WF…—VÆ–æU&÷WF–ætÖöGVÆR§—VÆ–æU&÷WF–ærÒçVÆÇG#°§7FF–2WF…—VÆ–æTÖöGVÆR§—VÆ–æTÖöGVÆRÒçVÆÇG#°§7FF–2WF…—VÆ–æT×GB§—VÆ–æT×GBÒçVÆÇG#°§7FF–2ÖW6…6W'f–6R§—VÆ–æU6W'f–6RÒçVÆÇG#° ¢òòÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢òò†VÇW'0¢òòÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¢òò'V–ÆBFV6öFVB6¶WBv—F‚FWFW&Ö–æ—7F–2–ÆöBöbF†R&WVW7FVB6—¦Rà§7FF–2ÖW6‡F7F–5ôÖW6…6¶WBÖ¶TFV6öFVB„æöFTçVÒg&öÒÂæöFTçVÒFòÂÖW6‡F7F–5õ÷'DçVÒ÷'BÂ6—¦U÷B–ÆöDÆVâ§°¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖW6‡F7F–5ôÖW6…6¶WEö–æ—E÷¦W&ó°¢æg&öÒÒg&öÓ°¢çFòÒFó°¢æ–BÒƒ#3CScsƒ°¢æ6†ææVÂÒ²òò&–Ö'’6†ææVÂ–æFW‚‡W&†4Væ6öFR&Ww&—FW2F†—2FòF†R6†ææVÂ†6‚¢çv†–6…÷–ÆöE÷f&–çBÒÖW6‡F7F–5ôÖW6…6¶WEöFV6öFVE÷Fs°¢æFV6öFVBç÷'FçVÒÒ÷'C°¢æFV6öFVBç–ÆöBç6—¦RÒ–ÆöDÆVã°¢f÷"‡6—¦U÷B’Ò²’Â–ÆöDÆVã²’²²¢æFV6öFVBç–ÆöBæ'—FW5¶•ÒÒ‡V–çC…÷B’†’b†fb“°¢&WGW&â°§Ð ¢òò6–vâFV6öFVB6¶WBv—F‚F†R7'—FôVæv–æRw27W'&VçB¶W’ÒW6VBFò6–×VÆFR§&VÖ÷FR¢6–væW"À¢òò&V6W6RW&†4Væ6öFRöæÇ’WFò×6–vç26¶WG2F†B÷&–v–æFRg&öÒW2à§7FF–2fö–B6–våv—F„7W'&VçD¶W’†ÖW6‡F7F–5ôÖW6…6¶WB§§°¢&ööÂö²Ò7'—FòÓç†VFG6÷6–vâ‡Óæg&öÒÂÓæ–BÂÓæFV6öFVBç÷'FçVÒÂÓæFV6öFVBç–ÆöBæ'—FW2ÂÓæFV6öFVBç–ÆöBç6—¦RÀ¢ÓæFV6öFVBç†VFG6÷6–væGW&Ræ'—FW2“°¢DU5Eô54U%EõE%TUôÔU54tR†ö²Â'†VFG6÷6–vâf–ÆVB–âFW7B6WGW"“°¢ÓæFV6öFVBç†VFG6÷6–væGW&Rç6—¦RÒ„TDE4õ4”täEU$Uõ4•¤S°§Ð ¢òòVæ7'—B‡W&†4Væ6öFR’F†VâFV7'—B¶WfÇVFR‡W&†4FV6öFR’F†R6ÖR6¶WB–âÆ6Rà§7FF–2FV6öFU7FFR&÷VæEG&—†ÖW6‡F7F–5ôÖW6…6¶WB§§°¢ÖW6‡F7F–5õ&÷WF–æuôW'&÷"Væ2ÒW&†4Væ6öFR‡“°¢DU5Eô54U%EôUTÅôÔU54tR†ÖW6‡F7F–5õ&÷WF–æuôW'&÷%ôäôäRÂVæ2Â'W&†4Væ6öFRF–Bæ÷B7V66VVB"“°¢DU5Eô54U%EôUTÅôÔU54tR†ÖW6‡F7F–5ôÖW6…6¶WEöVæ7'—FVE÷FrÂÓçv†–6…÷–ÆöE÷f&–çBÀ¢'W&†4Væ6öFRÆVgB6¶WBVæVæ7'—FVB"“°¢&WGW&âW&†4FV6öFR‡“°§Ð §7FF–2ÖW6‡F7F–5ôÖW6…6¶WB6†ææVÄVæ6öFR†ÖW6‡F7F–5ôÖW6…6¶WB§°¢V–çC…÷BVæ6öFVE´Ô…ôÄõ$õ”ÄôEôÄTâ²ÒÒ·Ó°¢6öç7B6—¦U÷BVæ6öFVE6—¦RÒ%öVæ6öFU÷Fõö'—FW2†Væ6öFVBÂ6—¦Vöb†Væ6öFVB’ÂfÖW6‡F7F–5ôFFö×6rÂgæFV6öFVB“°¢DU5Eô54U%Eôu$TDU%õD„âƒÂVæ6öFVE6—¦R“°¢6öç7B–çCe÷B†6‚Ò6†ææVÇ2ç6WD7F—fT'”–æFW‚‡æ6†ææVÂ“°¢DU5Eô54U%Eôu$TDU%ôõ%ôUTÂƒÂ†6‚“°¢7'—FòÓæVæ7'—E6¶WB‡æg&öÒÂæ–BÂVæ6öFVE6—¦RÂVæ6öFVB“°¢ÖVÖ7’‡æVæ7'—FVBæ'—FW2ÂVæ6öFVBÂVæ6öFVE6—¦R“°¢æVæ7'—FVBç6—¦RÒVæ6öFVE6—¦S°¢æ6†ææVÂÒ†6ƒ°¢çv†–6…÷–ÆöE÷f&–çBÒÖW6‡F7F–5ôÖW6…6¶WEöVæ7'—FVE÷Fs°¢&WGW&â°§Ð §7FF–2ÖW6‡F7F–5ôÖW6…6¶WBÖ¶U6–væVEv—&U6¶WB„æöFTçVÒg&öÒÂæöFTçVÒFòÂ6¶WD–B–BÂV–çC…÷B†÷Æ–Ö—BÒÀ¢V–çC…÷B†÷7F'BÒ"ÂV–çC…÷BæW‡D†÷ÒäõôäU…Eô„õõ$TdU$Tä4RÀ¢V–çC…÷B&VÆ”æöFRÒƒ32Â&ööÂfÆ–BÒG'VR§°¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB†g&öÒÂFòÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂ4ÔÄÅõ”ÄôB“°¢æ–BÒ–C°¢æ†÷öÆ–Ö—BÒ†÷Æ–Ö—C°¢æ†÷÷7F'BÒ†÷7F'C°¢ææW‡Eö†÷ÒæW‡D†÷°¢ç&VÆ•öæöFRÒ&VÆ”æöFS°¢çG&ç7÷'EöÖV6†æ—6ÒÒÖW6‡F7F–5ôÖW6…6¶WEõG&ç7÷'DÖV6†æ—6ÕõE$å5õ%EôÄõ$°¢6–våv—F„7W'&VçD¶W’‚g“°¢–b‚fÆ–B¢æFV6öFVBç†VFG6÷6–væGW&Ræ'—FW5³ÒãÒƒƒ°¢&WGW&â6†ææVÄVæ6öFR‡“°§Ð §7FF–2&ööÂ&VÖ÷FU6–væW$&—B‚§°¢&WGW&âæöFT–æfôÆ—FT†5†VFG66–væVB†Öö6´æöFTD"ÓævWDÖW6„æöFR…$TÔõDUôäôDR’“°§Ð §7FF–2fö–B6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7’öÆ–7’§°¢6öæf–rç6V7W&—G’ç6¶WE÷6–væGW&U÷öÆ–7’ÒöÆ–7“°§Ð ¢òò6—¦RFFÖW76vRW†7FÇ’2F†Rv—&RVæ6öFW"v÷VÆBà§7FF–26—¦U÷BVæ6öFVDFF6—¦R†6öç7BÖW6‡F7F–5ôFF¦B§°¢6—¦U÷B2Ò°¢DU5Eô54U%EõE%TUôÔU54tR‡%övWEöVæ6öFVE÷6—¦R‚g2ÂfÖW6‡F7F–5ôFFö×6rÂB’Â'%övWEöVæ6öFVE÷6—¦Rf–ÆVB"“°¢&WGW&â3°§Ð ¢òòv÷VÆBF†—2FF7F–ÆÂf—BÆõ&g&ÖRv—F‚cBÖ'—FR6–væGW&RGF6†VCòÖ—'&÷"öbF†P¢òò&öGV7F–öâvFR–â&÷WFW"æ7‡6–væVDFFf—G2òF†RW&†4FV6öFRF÷væw&FR&VF–6FR’à§7FF–2&ööÂ6–væVDVæ6öF–ætf—G2†6öç7BÖW6‡F7F–5ôFF¦B§°¢ÖW6‡F7F–5ôFF6÷’Ò¦C°¢6÷’ç†VFG6÷6–væGW&Rç6—¦RÒ„TDE4õ4”täEU$Uõ4•¤S°¢&WGW&âVæ6öFVDFF6—¦R‚f6÷’’²ÔU4…D5D”5ô„TDU%ôÄTäuD‚ÃÒÔ…ôÄõ$õ”ÄôEôÄTã°§Ð ¢òòVæBÆVæwF‚ÖFVÆ–Ö—FVBf–VÆBv†÷6RFrF†—2'V–ÆBw2FF66†VÖFöW2æ÷BFVf–æRÂ26VæFW ¢òòöâæWvW"66†VÖv÷VÆBVÖ—Bâææ÷"6¶—2Væ¶æ÷vâf–VÆG2BFV6öFRÂ6òF†W6R'—FW26÷VçBF÷v&@¢òòF†R&rv—&R6—¦R'WBæ÷BF†RFV6öFVB7G'V7Bâ&WGW&ç2F†RçVÖ&W"öb'—FW2VæFVBà§7FF–26—¦U÷BVæEVæ¶æ÷väf–VÆB‡V–çC…÷B¦G7BÂ6—¦U÷BG7DÆVâÂ6—¦U÷B6öçFVçDÆVâ§°¢6öç7FW‡"V–çC3%÷BTä´äõtåôd”TÄEôåTÔ$U"Ò²òòæ÷Bf–VÆBöbÖW6‡F7F–5ôFF¢7FC£§fV7F÷#ÇV–çC…÷Câ6öçFVçB†6öçFVçDÆVâÂƒsr“°¢%ö÷7G&VÕ÷B7G&VÒÒ%ö÷7G&VÕög&öÕö'VffW"†G7BÂG7DÆVâ“°¢DU5Eô54U%EõE%TR‡%öVæ6öFU÷Fr‚g7G&VÒÂ%õuEõ5E$”ärÂTä´äõtåôd”TÄEôåTÔ$U"’“°¢DU5Eô54U%EõE%TR‡%öVæ6öFU÷7G&–ær‚g7G&VÒÂ6öçFVçBæFF‚’Â6öçFVçBç6—¦R‚’’“°¢&WGW&â7G&VÒæ'—FW5÷w&—GFVã°§Ð ¢òò6†ææVÂÖVæ7'—B&rFF'—FW2–çFò6¶WBÂW†7FÇ’2W&†4Væ6öFRw2æöâÕ´’F‚FöW2à¢òòW6VBFò–æ¦V7Bv—&R'—FW2W&†4Væ6öFRv÷VÆBæWfW"&öGV6R†—BöæÇ’Væ6öFW2ÓæFV6öFVB’à§7FF–2fö–BVæ7'—D46†ææVÅ6¶WB†ÖW6‡F7F–5ôÖW6…6¶WB§ÂV–çC…÷B§v—&RÂ6—¦U÷B6—¦R§°¢6öç7B–çCe÷B†6‚Ò6†ææVÇ2ç6WD7F—fT'”–æFW‚ƒ“°¢DU5Eô54U%Eôu$TDU%ôõ%ôUTÅôÔU54tRƒÂ†6‚Â&æòW6&ÆR&–Ö'’6†ææVÂ"“°¢7'—FòÓæVæ7'—E6¶WB†vWDg&öÒ‡’ÂÓæ–BÂ6—¦RÂv—&R“°¢ÖVÖ7’‡ÓæVæ7'—FVBæ'—FW2Âv—&RÂ6—¦R“°¢ÓæVæ7'—FVBç6—¦RÒ6—¦S°¢Óæ6†ææVÂÒ†6ƒ²òòöâF†Rv—&RF†R6†ææVÂf–VÆB6'&–W2F†R†6‚Âæ÷BF†R–æFW€¢Óçv†–6…÷–ÆöE÷f&–çBÒÖW6‡F7F–5ôÖW6…6¶WEöVæ7'—FVE÷Fs°§Ð ¢òò'V–ÆBw2g&ÖS¢âVç6–væVB'&öF67B6''––ærõ4•D”ôâ–ÆöBÇW2Væ¶æ÷vâf–VÆG2Â6—¦V@¢òò6òF†R&rv—&RÆVæwF‚W†6VVG2F†R6–væGW&RÖf—BF‡&W6†öÆBv†–ÆRF†RFV6öFVBf–VÆG27F’VæFW ¢òò—Bâ6†ææVÂÖVæ7'—FVBÆ–¶Ræ÷&ÖÂ6VæFW"âF†R76W'G2–âF†B7Æ—BÂv†–6‚—2v†BÖ¶W2 ¢òòæBÖVæ–ævgVÂà§7FF–2ÖW6‡F7F–5ôÖW6…6¶WBÖ¶T'&öF67Ev—F…Væ¶æ÷väf–VÆG2‚§°¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂ4ÔÄÅõ”ÄôB“° ¢V–çC…÷Bv—&U´Ô…ôÄõ$õ”ÄôEôÄTâ²Ó°¢6öç7B6—¦U÷B&6RÒ%öVæ6öFU÷Fõö'—FW2‡v—&RÂ6—¦Vöb‡v—&R’ÂfÖW6‡F7F–5ôFFö×6rÂgæFV6öFVB“°¢DU5Eô54U%Eôu$TDU%õD„åôÔU54tRƒÂ&6RÂ&f–ÆVBFòVæ6öFRF†R&6RFF"“°¢6öç7B6—¦U÷B&rÒ&6R²VæEVæ¶æ÷väf–VÆB‡v—&R²&6RÂ6—¦Vöb‡v—&R’Ò&6RÂc“° ¢òòF†RFV6öFVBf–VÆG2f—B6–væGW&RÂ6ò6VæFW"F†B6–vç2v÷VÆB†fR6–væVBF†—2FFà¢DU5Eô54U%EôÄU55ôõ%ôUTÅôÔU54tR„Ô…ôÄõ$õ”ÄôEôÄTâÂ&6R²„TDE4õ4”täEU$Uôd”TÄEô%•DU2²ÔU4…D5D”5ô„TDU%ôÄTäuD‚À¢&FV6öFVBf–VÆG2×W7Bf—B6–væGW&RÂVÇ6RF†RFW7B—2f7V÷W2"“°¢òòF†RVæ¶æ÷vâf–VÆG2WBF†R&r6—¦R÷fW"F†BF‡&W6†öÆBÂ6òF†RGvò6—¦–æw2F—6w&VR†W&Rà¢DU5Eô54U%Eôu$TDU%õD„åôÔU54tR„Ô…ôÄõ$õ”ÄôEôÄTâÂ&r²„TDE4õ4”täEU$Uôd”TÄEô%•DU2²ÔU4…D5D”5ô„TDU%ôÄTäuD‚À¢'Væ¶æ÷vâf–VÆG2×W7BW6‚F†R&r6—¦R7BF†Rf—BF‡&W6†öÆB"“°¢òòF†Rg&ÖR—27F–ÆÂöæR&F–ò6÷VÆB7GVÆÇ’6VæBà¢DU5Eô54U%EôÄU55ôõ%ôUTÅôÔU54tR„Ô…ôÄõ$õ”ÄôEôÄTâÂ&r²ÔU4…D5D”5ô„TDU%ôÄTäuD‚Â&g&ÖR×W7B7F–ÆÂf—BÆõ&g&ÖR"“° ¢Væ7'—D46†ææVÅ6¶WB‚gÂv—&RÂ&r“°¢&WGW&â°§Ð ¢òòÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢òòVæ—G’Æ–fV7–6ÆP¢òòÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ§fö–B6WEW‡fö–B§°¢6W'f–6RÒ—VÆ–æU6W'f–6S° ¢òò6öç7G'V7BF†RÖö6²d•%5C¢F†RæöFTD"6öç7G'V7F÷"6â&VÆöBW'6—7FVB7FFRg&öÒF†P¢òò†÷7Bf–ÆW7—7FVÒ‡÷'FGV–æòde2’æB&W÷VÆFRF†RvÆö&Ç2Ò6fVB&—fFR¶W¢òò&RÖVæ&ÆW2F†R´’Væ7'—BF‚æBf–Ç2F†RVæ–67BFW7G2öâ†÷7G2v—F‚ÆVgF÷fW"&Vg2à¢Öö6´æöFTD"ÒæWrÖö6´æöFTD"‚“°¢Öö6´æöFTD"Óæ6ÆV%FW7DæöFW2‚“°¢6–bt$ÕôäôDUô4õTåBâ ¢Öö6´æöFTD"Óçv&Õ7F÷&Ræ6ÆV"‚“°¢6VæF–`¢æöFTD"ÒÖö6´æöFTD#° ¢òò6ÆVâvÆö&Â6öæf–rö÷væW"eDU"F†R7F÷#²¦W&öVB6öæf–rÓâ&V'&öF67BÄÂ†æò´äõtåôôäÅ¢òòG&÷’æB6V7W&—G’ç&—fFUö¶W’ç6—¦RÓÒ…´’Væ7'—BF‚6¶—VBÓâ6–×ÆR6†ææVÂ7'—Fò’à¢6öæf–rÒÖW6‡F7F–5ôÆö6Ä6öæf–uö–æ—E÷¦W&ó°¢ÖöGVÆT6öæf–rÒÖW6‡F7F–5ôÆö6ÄÖöGVÆT6öæf–uö–æ—E÷¦W&ó°¢÷væW"ÒÖW6‡F7F–5õW6W%ö–æ—E÷¦W&ó°¢òòW†W&6—6RF†RF÷væw&FR×&÷FV7F–öâÖG&—‚'’FVfVÇBâ&öGV7F–öâFVfVÇG2Fð¢òò4ôÕD”$ÄR6òW†—7F–ærÖW6†W2&VÖ–â–çFW&÷W&&ÆS²FW7G2F†B6÷fW"F†@¢òòÖöFR÷B–âW‡Æ–6—FÇ’à¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•ô$Ää4TB“°¢×”æöFT–æfòæ×•öæöFUöçVÒÒÄô4ÅôäôDS²òòG&—fW2—4g&öÕW2‚’övWDg&öÒ‚’ö—5FõW2‚ ¢òòv÷&¶–ær&–Ö'’6†ææVÂv—F‚F†RFVfVÇB4²6òVæ7'—BöFV7'—B&÷VæB×G&—2à¢6†ææVÇ2æ–æ—DFVfVÇG2‚“°¢6†ææVÇ2æöä6öæf–t6†ævVB‚“° ¢—VÆ–æU&÷WFW"Óæ6ÆV%VæF–ær‚“°¢—VÆ–æU&÷WFW"Óç'„GWRÒ°¢—VÆ–æU&÷WFW"ÓçG…&VÆ”6æ6VÆVBÒ°¢—VÆ–æU&F–òÓç&W6WB‚“°¢—VÆ–æU&÷WF–ærÓæ6´6ÆÇ2Ò°¢—VÆ–æTÖöGVÆRÓæ6ÆÇ2Ò°¢—VÆ–æT×GBÓæ6ÆV%VWVR‚“°¢v†–ÆR†ÖW6‡F7F–5ôÖW6…6¶WB§VWVVBÒ—VÆ–æU6W'f–6RÓævWDf÷%†öæR‚’¢6¶WEööÂç&VÆV6R‡VWVVB“°¢v†–ÆR†ÖW6‡F7F–5õVWVU7FGW2§VWVVBÒ—VÆ–æU6W'f–6RÓævWEVWVU7FGW4f÷%†öæR‚’¢—VÆ–æU6W'f–6RÓç&VÆV6UVWVU7FGW5FõööÂ‡VWVVB“°¢&W6WE&÷WF–ætWF„WfÇVF–öä6÷VçB‚“°§Ð ¢òò6WBv†–ÆR3Bw26GW&FVB—%F–ÖR—2–ç7FÆÆVC²6VRW6TGWG”7–6ÆU6GW&FVD—%F–ÖR‚’&VÆ÷rà§7FF–2—%F–ÖR¦3E6fVD—%F–ÖRÒçVÆÇG#° §fö–BFV$F÷vâ‡fö–B§°¢FVÆWFRÖö6´æöFTD#°¢Öö6´æöFTD"ÒçVÆÇG#°¢æöFTD"ÒçVÆÇG#° ¢òò&W7F÷&RvÆö&Ç2†W&RÂæ÷BBF†RVæBöbFW7B&öG“¢â76W'F–öâ&÷'G2F†R&öG’ÂæBF†W6P¢òòv÷VÆB÷F†W'v—6RÆV²–çFòWfW'’ÆFW"66RâF†R–æ¦V7FVB6Æö6²—2F†RöæRF†Rã‚Ôã¢òò7W&W76–öâ×v–æF÷r66W2G&—fS²F†R&Vv–öâæBF†R—%F–ÖR7v&R3Bw2GWG’Ö7–6ÆR6WGWà¢F–ÖS£§W6U&VÄ6Æö6²‚“°¢F–ÖS£§&W6WDÖöæ÷Föæ–4f÷%FW7G2‚“°¢6öæf–ræÆ÷&ç&Vv–öâÒÖW6‡F7F–5ô6öæf–uôÆõ&6öæf–uõ&Vv–öä6öFUõU3°¢–æ—E&Vv–öâ‚“°¢–b†3E6fVD—%F–ÖR’°¢—%F–ÖRÒ3E6fVD—%F–ÖS°¢3E6fVD—%F–ÖRÒçVÆÇG#°¢Ð§Ð ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢òòw&÷WÒ&V6V—fR×6–FR66WB÷&V¦V7BÖG&—€¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ ¢òò¢fÆ–B6–væGW&Rg&öÒæöFRv†÷6R¶W’vR¶æ÷rÓâ66WFVBÂÖ&¶VB6–væVBÂ6–væW"&—BÆV&æVBà§fö–BFW7Eô÷fÆ–E÷6–væGW&Uö66WFVEöæEöÆV&ç5÷6–væW"‡fö–B§°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•õ5E$”5B“°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“²òòVæv–æRæ÷r†öÆG2$TÔõDRw2¶W¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“°¢Öö6´æöFTD"Óç6WEV&Æ–4¶W’…$TÔõDUôäôDRÂV"“° ¢DU5Eô54U%EôdÅ4R‡&VÖ÷FU6–væW$&—B‚’“²òòæ÷B¶æ÷vâ26–væW"–W@ ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂ4ÔÄÅõ”ÄôB“°¢6–våv—F„7W'&VçD¶W’‚g“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°¢DU5Eô54U%EõE%TR‡ç†VFG6÷6–væVB“°¢DU5Eô54U%EõE%TUôÔU54tR‡&VÖ÷FU6–væW$&—B‚’Â'fW&–f–VB6–væGW&R×W7B6WBF†R6–væW"&—B"“°§Ð ¢òò#¢F×W&VB6–væGW&Rg&öÒ¶æ÷vâ¶W’ÓâG&÷VBà§fö–BFW7Eô%ö&E÷6–væGW&UöG&÷VB‡fö–B§°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•ô4ôÕD”$ÄR“°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“°¢Öö6´æöFTD"Óç6WEV&Æ–4¶W’…$TÔõDUôäôDRÂV"“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂ4ÔÄÅõ”ÄôB“°¢6–våv—F„7W'&VçD¶W’‚g“°¢æFV6öFVBç†VFG6÷6–væGW&Ræ'—FW5³ÒãÒ„dc²òò6÷''WBF†R6–væGW&P ¢DU5Eô54U%EôUTÂ„DT4ôDUõôÄ”5•õ$T¤T5BÂ&÷VæEG&—‚g’“°§Ð ¢òò3¢6–væVB6¶WB'WBvR†fRæò¶W’f÷"F†R6VæFW"Óâ66WFVBVçfW&–f–VBÂ6–væW"&—BäõB6WBà§fö–BFW7Eô5÷6–væVEöæõ÷V&¶W•ö66WFVE÷VçfW&–f–VB‡fö–B§°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•ô$Ää4TB“°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“²òòæöFRW†—7G2Â'WBæòV&Æ–2¶W’7F÷&V@ ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂ4ÔÄÅõ”ÄôB“°¢6–våv—F„7W'&VçD¶W’‚g“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°¢DU5Eô54U%EôdÅ4UôÔU54tR‡ç†VFG6÷6–væVBÂ&6ææ÷B&RÖ&¶VBfW&–f–VBv—F†÷WB¶W’"“°¢DU5Eô54U%EôdÅ4UôÔU54tR‡&VÖ÷FU6–væW$&—B‚’Â&×W7Bæ÷BÆV&â6–væW"v—F†÷WBfW&–g––ær"“°§Ð ¢òòC¢F÷væw&FR&÷FV7F–öâÒVç6–væVB6ÖÆÂ'&öF67Bg&öÒ¶æ÷vâ6–væW"ÓâG&÷VBà§fö–BFW7EôEöF÷væw&FU÷Vç6–væVEö'&öF67Eög&öÕ÷6–væW%öG&÷VB‡fö–B§°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“°¢Öö6´æöFTD"Óç6WE6–væW$&—B…$TÔõDUôäôDRÂG'VR“²òòvRwfR6VVâF†—2æöFR6–vâ&Vf÷&P ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂ4ÔÄÅõ”ÄôB“°¢òòg&öÒÒW2Â6òW&†4Væ6öFRÆVfW2—BVç6–væVBà ¢DU5Eô54U%EôUTÂ„DT4ôDUõôÄ”5•õ$T¤T5BÂ&÷VæEG&—‚g’“°§Ð ¢òòS¢æò&–÷"¶æ÷vÆVFvRÒVç6–væVB6ÖÆÂ'&öF67Bg&öÒæöâ×6–væW"Óâ66WFVBà§fö–BFW7EôU÷Vç6–væVEö'&öF67Eög&öÕöæöç6–væW%ö66WFVB‡fö–B§°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“²òò6–væW"&—B6ÆV  ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂ4ÔÄÅõ”ÄôB“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°¢DU5Eô54U%EôdÅ4R‡ç†VFG6÷6–væVB“°§Ð ¢òòc¢Vç6–væVBTä”45Bg&öÒ¶æ÷vâ6–væW"Óâ66WFVB‡Væ–67G2&RæWfW"6–væVB’à§fö–BFW7Eôe÷Vç6–væVE÷Væ–67Eög&öÕ÷6–væW%ö66WFVB‡fö–B§°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“°¢Öö6´æöFTD"Óç6WE6–væW$&—B…$TÔõDUôäôDRÂG'VR“° ¢òòVæ–67BFòW3²$•dDUôfö–G2F†RVç&VÆFVBÆVv7’ÔDÒ&V¦V7F–öâf÷"DU…EôÔU54tUôà¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂÄô4ÅôäôDRÂÖW6‡F7F–5õ÷'DçVÕõ$•dDUôÂ4ÔÄÅõ”ÄôB“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°§Ð ¢òòs¢Vç6–væVBõdU%4•¤TB'&öF67Bg&öÒ¶æ÷vâ6–væW"Óâ66WFVB†6÷VÆFâwB†fR6'&–VB6–r’à§fö–BFW7Eôu÷Vç6–væVEö÷fW'6—¦VEö'&öF67Eög&öÕ÷6–væW%ö66WFVB‡fö–B§°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“°¢Öö6´æöFTD"Óç6WE6–væW$&—B…$TÔõDUôäôDRÂG'VR“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂõdU%4•¤TEõ”ÄôB“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°§Ð ¢òòƒ¢c"&Vw&W76–öâÒVç6–væVB'&öF67Bg&öÒ6–væW"–âF†RöÆB&FVB&æB#¢—G2¦Væ6öFVB¢FF¢òò6âwBF¶RcBÖ'—FR6–væGW&RæB7F–ÆÂf—BÆõ&g&ÖRÂ'WBF†RöÆB–ÆöB×6—¦R†WW&—7F–0¢òò‡–ÆöB²cBÂDDõ”ÄôEôÄTâ’§VFvVB—B6–væ&ÆRæBG&÷VB—B2F÷væw&FRâ×W7B&P¢òò66WFVC¢â†öæW7B6–væW"‡—6–6ÆÇ’6ææ÷B6–vâF†—26¶WBà§fö–BFW7Eô…÷Vç6–væVEöFVF&æEö'&öF67Eög&öÕ÷6–væW%ö66WFVB‡fö–B§°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“°¢Öö6´æöFTD"Óç6WE6–væW$&—B…$TÔõDUôäôDRÂG'VR“° ¢òò6†R—BÆ–¶R&VÂ6VæFW"w2FF¢W&†4Væ6öFRFG2F†R&—Ff–VÆBFò6¶WG2æöFP¢òò÷&–v–æFW2Â6ò&VÖ÷FR'&öF67BG&ff–26'&–W2—BFöòà¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂcr“°¢æFV6öFVBæ†5ö&—Ff–VÆBÒG'VS°¢æFV6öFVBæ&—Ff–VÆBÒ° ¢òò–âF†R–ÆöB–ç6–FRF†RFVB&æC²–bFFw2Væ6öF–ærWfW"6†–gG2Â&WGVæRF†R–Æö@¢òò6—¦R&÷fR–ç7FVBöbÆWGF–ærF†—2FW7B72f7V÷W6Ç’à¢DU5Eô54U%EõE%TUôÔU54tR‡æFV6öFVBç–ÆöBç6—¦R²„TDE4õ4”täEU$Uõ4•¤RÂÖW6‡F7F–5ô6öç7FçG5ôDDõ”ÄôEôÄTâÀ¢'–ÆöB×W7B6—B–âF†RöÆB†WW&—7F–2w2G&÷&ævR"“°¢DU5Eô54U%EôdÅ4UôÔU54tR‡6–væVDVæ6öF–ætf—G2‚gæFV6öFVB’Â'6–væVBVæ6öF–ær×W7BäõBf—BÆõ&g&ÖR"“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°¢DU5Eô54U%EôdÅ4R‡ç†VFG6÷6–væVB“°§Ð ¢òò“¢F†R&÷VæF'’†öÆG2ÒF†RÆ&vW7B'&öF67Bv†÷6R6–væVBVæ6öF–ær7F–ÆÂf—G2—27F–ÆÀ¢òò7V&¦V7BFòF†RF÷væw&FRG&÷v†Vâ—B'&—fW2Vç6–væVBg&öÒ¶æ÷vâ6–væW"à¢òò„FVÆ–&W&FVÇ’æöâÖF—67&–Ö–æF–æs¢F†RöÆB†WW&—7F–2G&÷VBF†—26¶WBFöòâ’–ç2F†P¢òò&÷VæF'’v–ç7B÷fW"Ö6÷'&V7F–öã²‚æB#B&RF†Rc"&Vw&W76–öâF—67&–Ö–æF÷'2â§fö–BFW7Eô•÷Vç6–væVEö&÷VæF'•ö'&öF67Eög&öÕ÷6–væW%÷7F–ÆÅöG&÷VB‡fö–B§°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“°¢Öö6´æöFTD"Óç6WE6–væW$&—B…$TÔõDUôäôDRÂG'VR“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂcb“°¢æFV6öFVBæ†5ö&—Ff–VÆBÒG'VS°¢æFV6öFVBæ&—Ff–VÆBÒ° ¢òòW†7FÇ’BF†RÆ–Ö—C¢6–væVBVæ6öF–ærf–ÆÇ2F†Rg&ÖRFòF†RÆ7B'—FRâ–ææVB6òF†P¢òò&÷VæF'’6âwB6–ÆVçFÇ’G&–gBà¢ÖW6‡F7F–5ôFF6–væVD6÷’ÒæFV6öFVC°¢6–væVD6÷’ç†VFG6÷6–væGW&Rç6—¦RÒ„TDE4õ4”täEU$Uõ4•¤S°¢DU5Eô54U%EôUTÅôÔU54tR„Ô…ôÄõ$õ”ÄôEôÄTâÂVæ6öFVDFF6—¦R‚g6–væVD6÷’’²ÔU4…D5D”5ô„TDU%ôÄTäuD‚À¢'–ÆöBæòÆöævW"6—G2W†7FÇ’öâF†Rf—B&÷VæF'’Ò&WGVæR—B"“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõôÄ”5•õ$T¤T5BÂ&÷VæEG&—‚g’“°§Ð §fö–BFW7Eôö6ö×F–&ÆUö66WG5÷Vç6–væVEö'&öF67Eög&öÕ÷6–væW"‡fö–B§°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•ô4ôÕD”$ÄR“°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“°¢Öö6´æöFTD"Óç6WE6–væW$&—B…$TÔõDUôäôDRÂG'VR“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂ4ÔÄÅõ”ÄôB“°¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°§Ð §fö–BFW7Eô÷7G&–7E÷&V¦V7G5÷Vç6–væVEöÆÅ÷÷'FçV×5öFW7F–æF–öç5öæE÷6—¦W2‡fö–B§°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•õ5E$”5B“°¢6öç7BÖW6‡F7F–5õ÷'DçVÒ÷'G5µÒÒ°¢ÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂÖW6‡F7F–5õ÷'DçVÕõDTÄTÔUE%•ôÀ¢ÖW6‡F7F–5õ÷'DçVÕôäôDT”ädõôÂÖW6‡F7F–5õ÷'DçVÕõt•ô”åEôÀ¢Ó°¢f÷"†6öç7BWFò÷'B¢÷'G2’°¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂ÷'BÂ4ÔÄÅõ”ÄôB“°¢DU5Eô54U%EôUTÂ„DT4ôDUõôÄ”5•õ$T¤T5BÂ&÷VæEG&—‚g’“°¢Ð ¢ÖW6‡F7F–5ôÖW6…6¶WBVæ–67BÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂÄô4ÅôäôDRÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂ4ÔÄÅõ”ÄôB“°¢DU5Eô54U%EôUTÂ„DT4ôDUõôÄ”5•õ$T¤T5BÂ&÷VæEG&—‚gVæ–67B’“° ¢ÖW6‡F7F–5ôÖW6…6¶WB÷fW'6—¦VBÐ¢Ö¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂõdU%4•¤TEõ”ÄôB“°¢DU5Eô54U%EôUTÂ„DT4ôDUõôÄ”5•õ$T¤T5BÂ&÷VæEG&—‚f÷fW'6—¦VB’“°§Ð §fö–BFW7Eô%÷7G&–7E÷&V¦V7G5÷6–væVE÷6¶WE÷v—F†÷WEö¶W’‡fö–B§°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•õ5E$”5B“°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂ4ÔÄÅõ”ÄôB“°¢6–våv—F„7W'&VçD¶W’‚g“°¢DU5Eô54U%EôUTÂ„DT4ôDUõôÄ”5•õ$T¤T5BÂ&÷VæEG&—‚g’“°§Ð §fö–BFW7Eô5÷7G&–7Eö66WG5öÆö6ÆÇ•öWF†VçF–6FVE÷¶•÷6¶WB‡fö–B§°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•õ5E$”5B“°¢V–çC…÷BÆö6ÅV%³3%ÒÂÆö6Å&—e³3%ÒÂ&VÖ÷FUV%³3%ÒÂ&VÖ÷FU&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"†Æö6ÅV"ÂÆö6Å&—b“°¢7'—FòÓævVæW&FT¶W•—"‡&VÖ÷FUV"Â&VÖ÷FU&—b“°¢Öö6´æöFTD"ÓæFDæöFR„Äô4ÅôäôDR“°¢Öö6´æöFTD"Óç6WEV&Æ–4¶W’„Äô4ÅôäôDRÂÆö6ÅV"“°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“°¢Öö6´æöFTD"Óç6WEV&Æ–4¶W’…$TÔõDUôäôDRÂ&VÖ÷FUV"“° ¢ÖW6‡F7F–5ôFFFFÒÖW6‡F7F–5ôFFö–æ—E÷¦W&ó°¢FFç÷'FçVÒÒÖW6‡F7F–5õ÷'DçVÕõ$•dDUô°¢FFç–ÆöBç6—¦RÒ4ÔÄÅõ”ÄôC°¢ÖV×6WB†FFç–ÆöBæ'—FW2ÂƒTÂFFç–ÆöBç6—¦R“°¢V–çC…÷BÆ–çFW‡E´Ô…ôÄõ$õ”ÄôEôÄTâ²ÒÒ·Ó°¢6öç7B6—¦U÷BÆ–çFW‡E6—¦RÒ%öVæ6öFU÷Fõö'—FW2‡Æ–çFW‡BÂ6—¦Vöb‡Æ–çFW‡B’ÂfÖW6‡F7F–5ôFFö×6rÂfFF“°¢DU5Eô54U%Eôu$TDU%õD„âƒÂÆ–çFW‡E6—¦R“° ¢ÖW6‡F7F–5ôæöFT–æfôÆ—FU÷V&Æ–5ö¶W•÷BÆö6Ä¶W’Ò³3"Â³×Ó°¢ÖVÖ7’†Æö6Ä¶W’æ'—FW2ÂÆö6ÅV"Â6—¦Vöb†Æö6ÅV"’“°¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖW6‡F7F–5ôÖW6…6¶WEö–æ—E÷¦W&ó°¢æg&öÒÒ$TÔõDUôäôDS°¢çFòÒÄô4ÅôäôDS°¢æ–BÒƒ43#3C°¢æ6†ææVÂÒ°¢çv†–6…÷–ÆöE÷f&–çBÒÖW6‡F7F–5ôÖW6…6¶WEöVæ7'—FVE÷Fs°¢7'—FòÓç6WDD…&—fFT¶W’‡&VÖ÷FU&—b“°¢DU5Eô54U%EõE%TR†7'—FòÓæVæ7'—D7W'fS#SS’‡çFòÂæg&öÒÂÆö6Ä¶W’Âæ–BÂÆ–çFW‡E6—¦RÂÆ–çFW‡BÂæVæ7'—FVBæ'—FW2’“°¢æVæ7'—FVBç6—¦RÒÆ–çFW‡E6—¦R²ÔU4…D5D”5õ´5ôõdU$„TC° ¢òòöæÇ’F†R&V6V—fW"w2&—fFR¶W’6âW7F&Æ—6‚F†RÆö6Â¶•öVæ7'—FVBWF†VçF–6F–öâÖ&¶W"à¢7'—FòÓç6WDD…&—fFT¶W’†Æö6Å&—b“°¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52ÂW&†4FV6öFR‚g’“°¢DU5Eô54U%EõE%TR‡ç¶•öVæ7'—FVB“°¢DU5Eô54U%EôUTÂ†ÖW6‡F7F–5õ÷'DçVÕõ$•dDUôÂæFV6öFVBç÷'FçVÒ“°§Ð §fö–BFW7Eô6%÷7G&–7E÷&V¦V7G5÷7ööfVE÷¶•öfÆuööåöVæ7'—FVEö–æw&W72‡fö–B§°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•õ5E$”5B“°¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂÄô4ÅôäôDRÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂ4ÔÄÅõ”ÄôB“°¢DU5Eô54U%EôUTÂ†ÖW6‡F7F–5õ&÷WF–æuôW'&÷%ôäôäRÂW&†4Væ6öFR‚g’“°¢ç¶•öVæ7'—FVBÒG'VS°¢çV&Æ–5ö¶W’ç6—¦RÒ3#°¢ÖV×6WB‡çV&Æ–5ö¶W’æ'—FW2Â„"ÂçV&Æ–5ö¶W’ç6—¦R“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõôÄ”5•õ$T¤T5BÂW&†4FV6öFR‚g’“°¢DU5Eô54U%EôdÅ4R‡ç¶•öVæ7'—FVB“°¢DU5Eô54U%EôUTÂƒÂçV&Æ–5ö¶W’ç6—¦R“°§Ð §fö–BFW7EôE÷7G&–7Eö&ö÷G7G&5ö–FVçF—G•ö&÷VæE÷6–væVEöæöFV–æfò‡fö–B§°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•õ5E$”5B“°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“°¢6öç7BæöFTçVÒ6–væW"Ò7&33$'VffW"‡V"Â6—¦Vöb‡V"’“° ¢ÖW6‡F7F–5õW6W"W6W"ÒÖW6‡F7F–5õW6W%ö–æ—E÷¦W&ó°¢W6W"çV&Æ–5ö¶W’ç6—¦RÒ6—¦Vöb‡V"“°¢ÖVÖ7’‡W6W"çV&Æ–5ö¶W’æ'—FW2ÂV"Â6—¦Vöb‡V"’“°¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB‡6–væW"ÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕôäôDT”ädõôÂ“°¢æFV6öFVBç–ÆöBç6—¦RÐ¢%öVæ6öFU÷Fõö'—FW2‡æFV6öFVBç–ÆöBæ'—FW2Â6—¦Vöb‡æFV6öFVBç–ÆöBæ'—FW2’ÂfÖW6‡F7F–5õW6W%ö×6rÂgW6W"“°¢6–våv—F„7W'&VçD¶W’‚g“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°¢6öç7BÖW6‡F7F–5ôæöFT–æfôÆ—FR¦æöFRÒÖö6´æöFTD"ÓævWDÖW6„æöFR‡6–væW"“°¢DU5Eô54U%EôäõEôåTÄÂ†æöFR“°¢DU5Eô54U%EôUTÅõT”åC…ô%$’‡V"ÂæöFRÓçV&Æ–5ö¶W’æ'—FW2Â6—¦Vöb‡V"’“°¢DU5Eô54U%EõE%TR‡ç†VFG6÷6–væVB“°§Ð §fö–BFW7EôU÷7G&–7E÷&V¦V7G5öæöFV–æfõö¶W•÷v—F†÷WEö–FVçF—G•ö&–æF–ær‡fö–B§°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•õ5E$”5B“°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“° ¢ÖW6‡F7F–5õW6W"W6W"ÒÖW6‡F7F–5õW6W%ö–æ—E÷¦W&ó°¢W6W"çV&Æ–5ö¶W’ç6—¦RÒ6—¦Vöb‡V"“°¢ÖVÖ7’‡W6W"çV&Æ–5ö¶W’æ'—FW2ÂV"Â6—¦Vöb‡V"’“°¢ÖW6‡F7F–5ôÖW6…6¶WBÐ¢Ö¶TFV6öFVB†7&33$'VffW"‡V"Â6—¦Vöb‡V"’’âÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕôäôDT”ädõôÂ“°¢æFV6öFVBç–ÆöBç6—¦RÐ¢%öVæ6öFU÷Fõö'—FW2‡æFV6öFVBç–ÆöBæ'—FW2Â6—¦Vöb‡æFV6öFVBç–ÆöBæ'—FW2’ÂfÖW6‡F7F–5õW6W%ö×6rÂgW6W"“°¢6–våv—F„7W'&VçD¶W’‚g“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõôÄ”5•õ$T¤T5BÂ&÷VæEG&—‚g’“°¢DU5Eô54U%EôåTÄÂ†Öö6´æöFTD"ÓævWDÖW6„æöFR‡æg&öÒ’“°§Ð §fö–BFW7Eôeö6ö×F–&ÆU÷&V¦V7G5ö–çfÆ–Eöf—'7Eö6öçF7EöæöFV–æfò‡fö–B§°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•ô4ôÕD”$ÄR“°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“° ¢ÖW6‡F7F–5õW6W"W6W"ÒÖW6‡F7F–5õW6W%ö–æ—E÷¦W&ó°¢W6W"çV&Æ–5ö¶W’ç6—¦RÒ6—¦Vöb‡V"“°¢ÖVÖ7’‡W6W"çV&Æ–5ö¶W’æ'—FW2ÂV"Â6—¦Vöb‡V"’“°¢ÖW6‡F7F–5ôÖW6…6¶WBÐ¢Ö¶TFV6öFVB†7&33$'VffW"‡V"Â6—¦Vöb‡V"’’âÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕôäôDT”ädõôÂ“°¢æFV6öFVBç–ÆöBç6—¦RÐ¢%öVæ6öFU÷Fõö'—FW2‡æFV6öFVBç–ÆöBæ'—FW2Â6—¦Vöb‡æFV6öFVBç–ÆöBæ'—FW2’ÂfÖW6‡F7F–5õW6W%ö×6rÂgW6W"“°¢6–våv—F„7W'&VçD¶W’‚g“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõôÄ”5•õ$T¤T5BÂ&÷VæEG&—‚g’“°§Ð ¢6–bt$ÕôäôDUô4õTåBâ §fö–BFW7Eôu÷7G&–7E÷fW&–f–W5÷6–væW%ög&öÕ÷v&Õö¶W•÷7F÷&R‡fö–B§°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•õ5E$”5B“°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“°¢DU5Eô54U%EõE%TR†Öö6´æöFTD"Óçv&Õ7F÷&Ræ'6÷&"…$TÔõDUôäôDRÂÂV"’“°¢DU5Eô54U%EôåTÄÂ†Öö6´æöFTD"ÓævWDÖW6„æöFR…$TÔõDUôäôDR’“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂ4ÔÄÅõ”ÄôB“°¢6–våv—F„7W'&VçD¶W’‚g“°¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°¢DU5Eô54U%EõE%TR‡ç†VFG6÷6–væVB“°¢6öç7BÖW6‡F7F–5ôæöFT–æfôÆ—FR§&V‡–G&FVBÒÖö6´æöFTD"ÓævWDÖW6„æöFR…$TÔõDUôäôDR“°¢DU5Eô54U%EôäõEôåTÄÅôÔU54tR‡&V‡–G&FVBÂ'fW&–f–VBv&Ò6–væW"×W7B&R&RÖFÖ—GFVBFòF†R†÷B7F÷&R"“°¢DU5Eô54U%EôUTÅõT”åC…ô%$’‡V"Â&V‡–G&FVBÓçV&Æ–5ö¶W’æ'—FW2Â6—¦Vöb‡V"’“°¢DU5Eô54U%EõE%TUôÔU54tR†æöFT–æfôÆ—FT†5†VFG66–væVB‡&V‡–G&FVB’Â'&RÖFÖ—GFVB6–væW"×W7B&WF–â&Ææ6VBF÷væw&FRÖVÖ÷'’"“° ¢òòÖöFVÂ—G2æW‡B†÷B×7F÷&RWf–7F–öâæB&÷fR&Ææ6VB7F–ÆÂ&VÖVÖ&W'2F†R6–væW"v—F†÷W@¢òòÆÆö6F–ær†÷BæöFRÖW&VÇ’FòWfÇVFRâVç6–væVB6¶WBà¢òòÖ—'&÷"v†BæöFTD"Wf–7F–öâ7GVÆÇ’7F÷&W2f÷"6–væW#¢v&Õ&÷FV7FVD6FVv÷'’‚’––VÆG0¢òò†VFG66–væW"¦æB¢F†RFVF–6FVBv&Ò6–væW"&—B—26WBg&öÒæöFT–æfôÆ—FT†5†VFG66–væVB‚’à¢òò—4¶æ÷vå†VFG66–væW"‚’&VG2F†B6–væW"&—BÂæ÷BF†R&÷FV7FVB6FVv÷'’à¢DU5Eô54U%EõE%TR†Öö6´æöFTD"Óçv&Õ7F÷&Ræ'6÷&"…$TÔõDUôäôDRÂ"ÂV"ÂÖW6‡F7F–5ô6öæf–uôFWf–6T6öæf–uõ&öÆUô4Ä”TåBÀ¢7FF–5ö67CÇV–çC…÷Câ…v&Õ&÷FV7FVC£¥†VFG66–væW"’Âò§6–væW#Ò¢÷G'VR’“°¢Öö6´æöFTD"Óæ6ÆV%FW7DæöFW2‚“°¢6WEöÆ–7’†ÖW6‡F7F–5ô6öæf–uõ6V7W&—G”6öæf–uõ6¶WE6–væGW&UöÆ–7•õ4´UEõ4”täEU$UõôÄ”5•ô$Ää4TB“°¢ÖW6‡F7F–5ôÖW6…6¶WBVç6–væVE6¶WBÐ¢Ö¶TFV6öFVB…$TÔõDUôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂ4ÔÄÅõ”ÄôB“°¢DU5Eô54U%EôdÅ4UôÔU54tR†6†V6µ†VFG6&V6V—fUöÆ–7’‚gVç6–væVE6¶WB’À¢$&Ææ6VBF÷væw&FRÖVÖ÷'’×W7B7W'f—fR&WVFVB†÷B×7F÷&RWf–7F–öâ"“°§Ð¢6VæF–` §fö–BFW7Eô…÷Vç6–væVEö'&öF67Eög&öÕ÷6–væW%÷v—F…÷Væ¶æ÷våöf–VÆG5öG&÷VB‡fö–B§°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“°¢Öö6´æöFTD"Óç6WE6–væW$&—B…$TÔõDUôäôDRÂG'VR“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶T'&öF67Ev—F…Væ¶æ÷väf–VÆG2‚“° ¢DU5Eô54U%EôUTÅôÔU54tR„DT4ôDUõôÄ”5•õ$T¤T5BÂW&†4FV6öFR‚g’À¢'Vç6–væVB'&öF67Bg&öÒ6–væW"×W7B&RG&÷VBFW7—FRVæ¶æ÷vâf–VÆG2"“°§Ð §fö–BFW7Eô•÷Vç6–væVEö'&öF67Eög&öÕöæöç6–væW%÷v—F…÷Væ¶æ÷våöf–VÆG5ö66WFVB‡fö–B§°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶T'&öF67Ev—F…Væ¶æ÷väf–VÆG2‚“°¢6öç7B6—¦U÷B&u6—¦RÒæVæ7'—FVBç6—¦S° ¢DU5Eô54U%EôUTÅôÔU54tR„DT4ôDUõ5T44U52ÂW&†4FV6öFR‚g’Â&g&ÖRg&öÒæöâ×6–væW"×W7B7F–ÆÂFV6öFR"“°¢DU5Eô54U%EôUTÅôÔU54tR†ÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂæFV6öFVBç÷'FçVÒÂ'Væ¶æ÷vâf–VÆG2×W7Bæ÷BF—7GW&"F†R÷'FçVÒ"“°¢DU5Eô54U%EôUTÅôÔU54tR…4ÔÄÅõ”ÄôBÂæFV6öFVBç–ÆöBç6—¦RÂ'–ÆöB×W7B7W'f—fRF†RVæ¶æ÷vâf–VÆG2"“°¢DU5Eô54U%EôdÅ4R‡ç†VFG6÷6–væVB“°¢DU5Eô54U%EôÄU55õD„åôÔU54tR‡&u6—¦RÂVæ6öFVDFF6—¦R‚gæFV6öFVB’À¢'Væ¶æ÷vâf–VÆG2×W7BG&÷BFV6öFRÂÆVf–ærFV6öFVB6—¦RÂ&r"“°§Ð ¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢òòw&÷W"Ò6VæB×6–FR6–væ–æröÆ–7’‡W&†4Væ6öFR¢òòÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ ¢òò#¢÷W"÷vâ6ÖÆÂ'&öF67B—2WFò×6–væVB†æBfW&–f–W2öâF†Rv’&6²–â’à§fö–BFW7Eô#öÆö6Åö'&öF67Eö—5÷6–væVB‡fö–B§°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“²òòVæv–æR6–vç2v—F‚F†—3²7F÷&RF†RÖF6†–ærV&¶W’f÷"W0¢Öö6´æöFTD"ÓæFDæöFR„Äô4ÅôäôDR“°¢Öö6´æöFTD"Óç6WEV&Æ–4¶W’„Äô4ÅôäôDRÂV"“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB„Äô4ÅôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂ4ÔÄÅõ”ÄôB“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°¢DU5Eô54U%EôUTÅôÔU54tR…„TDE4õ4”täEU$Uõ4•¤RÂæFV6öFVBç†VFG6÷6–væGW&Rç6—¦RÂ&'&öF67B6†÷VÆB&RWFò×6–væVB"“°¢DU5Eô54U%EõE%TR‡ç†VFG6÷6–væVB“°§Ð ¢òò##¢&W6W'fRF†RW†—7F–ærv—&R&V†f–÷#¢æöâÕ´’Væ–67B—2æ÷B6–væVBà§fö–BFW7Eô#%öÆö6Å÷Væ–67Eöæ÷E÷6–væVB‡fö–B§°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB„Äô4ÅôäôDRÂ$TÔõDUôäôDRÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂ4ÔÄÅõ”ÄôB“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°¢DU5Eô54U%EôUTÅôÔU54tRƒÂæFV6öFVBç†VFG6÷6–væGW&Rç6—¦RÂ'Væ–67B×W7B&VÖ–âVç6–væVB"“°§Ð ¢òò#3¢÷W"÷vâ÷fW'6—¦VB'&öF67B—2äõB6–væVB‡6–væGW&Rv÷VÆFâwBf—B’à§fö–BFW7Eô#5öÆö6Åö÷fW'6—¦VEö'&öF67Eöæ÷E÷6–væVB‡fö–B§°¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB„Äô4ÅôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂõdU%4•¤TEõ”ÄôB“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°¢DU5Eô54U%EôUTÅôÔU54tRƒÂæFV6öFVBç†VFG6÷6–væGW&Rç6—¦RÂ&÷fW'6—¦VB'&öF67B×W7Bæ÷B&R6–væVB"“°§Ð ¢òò#C¢c"&Vw&W76–öâ7vVWÒWfW'’'&öF67B–ÆöB6—¦RF†Bf—G2Æõ&g&ÖRVç6–væVB×W7@¢òò7F–ÆÂ&RFVÆ—fW&&ÆS¢6–væ–ær7FW26–FRW†7FÇ’v†VâF†R6–væVBVæ6öF–ær7F÷2f—GF–ærÀ¢òòæWfW"&öGV6–ærDôõôÄ$tR‡F†RöÆB†WW&—7F–2FVBÖ&æFVB–ÆöG2crÓc‚’â&V6W6RF†Rf—'7@¢òòfW&–f–VB6¶WB6WG2÷W"6–væW"&—B–âF†RÖö6²D"ÂF†RÆFW"Vç6–væVB6—¦W2Ç6ò&÷fRF†P¢òò&V6V—fW"w2F÷væw&FR&VF–6FR7F—2W†7FÇ’7–ÖÖWG&–2v—F‚F†R6VæFW"w26–vâvFRà§fö–BFW7Eô#EöÆÅö'&öF67E÷6—¦W5öFVÆ—fW&&ÆUöæõöFVF&æB‡fö–B§°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“°¢Öö6´æöFTD"ÓæFDæöFR„Äô4ÅôäôDR“°¢Öö6´æöFTD"Óç6WEV&Æ–4¶W’„Äô4ÅôäôDRÂV"“° ¢&ööÂ6u6–væVBÒfÇ6RÂ6uVç6–væVBÒfÇ6S°¢f÷"‡6—¦U÷BâÒ²âÃÒ#3#²â²²’°¢6†"×6u³3%Ó°¢6ç&–çFb†×6rÂ6—¦Vöb†×6r’Â'–ÆöB6—¦RWR"Â‡Vç6–væVB–â“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB„Äô4ÅôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂâ“°¢DU5Eô54U%EôUTÅôÔU54tR„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’Â×6r“° ¢òòW†7B÷&6ÆS¢6–væVB–fbF†R6–væVBVæ6öF–ærf—G2F†Rg&ÖRâ6–væVDVæ6öF–ætf—G2‚’f÷&6W0¢òòF†R6–væGW&R6—¦R—G6VÆbÂ6ò—B&VG2F†R6ÖRv†WF†W"÷"æ÷BæFV6öFVB6ÖR&6²6–væVBà¢6öç7B&ööÂ—56–væVBÒæFV6öFVBç†VFG6÷6–væGW&Rç6—¦RÓÒ„TDE4õ4”täEU$Uõ4•¤S°¢DU5Eô54U%EôUTÅôÔU54tR‡6–væVDVæ6öF–ætf—G2‚gæFV6öFVB’Â—56–væVBÂ×6r“° ¢–b†—56–væVB’°¢DU5Eô54U%EôdÅ4UôÔU54tR‡6uVç6–væVBÂ×6r“²òòÖöæ÷Föæ–3¢öæ6RFöò&–rÂæWfW"6–væVBv–à¢DU5Eô54U%EõE%TUôÔU54tR‡ç†VFG6÷6–væVBÂ×6r“²òòæB—BfW&–f–VBöâF†Rv’&6²–à¢6u6–væVBÒG'VS°¢ÒVÇ6R°¢6uVç6–væVBÒG'VS°¢Ð¢Ð¢DU5Eô54U%EõE%TUôÔU54tR‡6u6–væVBÂ'7vVWæWfW"&öGV6VB6–væVB6¶WB"“°¢DU5Eô54U%EõE%TUôÔU54tR‡6uVç6–væVBÂ'7vVWæWfW"7&÷76VBF†Rf—B&÷VæF'’"“°§Ð ¢òò#S¢6Æ–VçB×&W6WB6–væGW&Röâ6¶WB÷WG6–FRF†RW†—7F–ær'&öF67B6–vâ6Æ72—2F—66&FVBà§fö–BFW7Eô#U÷&W6WE÷6–væGW&UööåöÆö6Å÷6¶WEö6ÆV&VB‡fö–B§°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB„Äô4ÅôäôDRÂ$TÔõDUôäôDRÂÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÂ4ÔÄÅõ”ÄôB“°¢æFV6öFVBç†VFG6÷6–væGW&Rç6—¦RÒ„TDE4õ4”täEU$Uõ4•¤S°¢ÖV×6WB‡æFV6öFVBç†VFG6÷6–væGW&Ræ'—FW2Â„"Â„TDE4õ4”täEU$Uõ4•¤R“° ¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’“°¢DU5Eô54U%EôUTÅôÔU54tRƒÂæFV6öFVBç†VFG6÷6–væGW&Rç6—¦RÂ'&W6WB6–væGW&R×W7B&RF—66&FVBöâVæ–67B"“°§Ð ¢òò#c¢F†RW†7BÖf—BvFRG&6·2FF§6†R¢Âæ÷B§W7B–ÆöB6—¦RâF&6²×7G–ÆR'&öF67@¢òò‡vçE÷&W7öç6R²&WÇ•ö–B²VÖö¦’’6'&–W2W‡G&v—&R'—FW2F†B6†–gBF†Rf—B&÷VæF'“²F†P¢òò7vVW&÷fW2æòFVB&æBW†—7G2f÷"F†B6†RV—F†W"ÂæBÒöæ6RF†R6–væW"&—B—2ÆV&æVBÐ¢òòF†BF†R&V6V—fW"w2F÷væw&FR&VF–6FR7F—27–ÖÖWG&–2f÷"—BFöòâv–æF÷p¢òò7G&FFÆW2F†—26†Rw2&÷VæF'“²6VBB#6òWfVâF†RVç6–væVB&–6‚Væ6öF–ær7F—2vVÆÀ¢òò–ç6–FRF†Rg&ÖR†BãÓ##—Bf—'7B†—G2F†R&RÖW†—7F–ærÂ6–væ–ær×Vç&VÆFVBDôõôÄ$tR’à§fö–BFW7Eô#e÷&–6…÷6†U÷7vVWöæõöFVF&æB‡fö–B§°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“°¢Öö6´æöFTD"ÓæFDæöFR„Äô4ÅôäôDR“°¢Öö6´æöFTD"Óç6WEV&Æ–4¶W’„Äô4ÅôäôDRÂV"“° ¢&ööÂ6u6–væVBÒfÇ6RÂ6uVç6–væVBÒfÇ6S°¢f÷"‡6—¦U÷BâÒ²âÃÒ#²â²²’°¢6†"×6u³3%Ó°¢6ç&–çFb†×6rÂ6—¦Vöb†×6r’Â'–ÆöB6—¦RWR"Â‡Vç6–væVB–â“° ¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB„Äô4ÅôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂâ“°¢æFV6öFVBçvçE÷&W7öç6RÒG'VS°¢æFV6öFVBç&WÇ•ö–BÒƒ##33CC°¢æFV6öFVBæVÖö¦’Ò°¢DU5Eô54U%EôUTÅôÔU54tR„DT4ôDUõ5T44U52Â&÷VæEG&—‚g’Â×6r“° ¢6öç7B&ööÂ—56–væVBÒæFV6öFVBç†VFG6÷6–væGW&Rç6—¦RÓÒ„TDE4õ4”täEU$Uõ4•¤S°¢DU5Eô54U%EôUTÅôÔU54tR‡6–væVDVæ6öF–ætf—G2‚gæFV6öFVB’Â—56–væVBÂ×6r“° ¢–b†—56–væVB’°¢DU5Eô54U%EôdÅ4UôÔU54tR‡6uVç6–væVBÂ×6r“°¢DU5Eô54U%EõE%TUôÔU54tR‡ç†VFG6÷6–væVBÂ×6r“°¢6u6–væVBÒG'VS°¢ÒVÇ6R°¢6uVç6–væVBÒG'VS°¢Ð¢Ð¢DU5Eô54U%EõE%TUôÔU54tR‡6u6–væVBÂ'&–6‚7vVWæWfW"&öGV6VB6–væVB6¶WB"“°¢DU5Eô54U%EõE%TUôÔU54tR‡6uVç6–væVBÂ'&–6‚7vVWæWfW"7&÷76VBF†Rf—B&÷VæF'’"“°§Ð §fö–BFW7Eô#uö–æg&7G'V7GW&U÷÷'E÷6–væ–æuöÖG&—‚‡fö–B§°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“°¢Öö6´æöFTD"ÓæFDæöFR„Äô4ÅôäôDR“°¢Öö6´æöFTD"Óç6WEV&Æ–4¶W’„Äô4ÅôäôDRÂV"“° ¢6öç7BÖW6‡F7F–5õ÷'DçVÒ÷'G5µÒÒ°¢ÖW6‡F7F–5õ÷'DçVÕôäôDT”ädõôÀ¢ÖW6‡F7F–5õ÷'DçVÕõ$õUD”äuôÀ¢ÖW6‡F7F–5õ÷'DçVÕõE$4U$õUDUôÀ¢ÖW6‡F7F–5õ÷'DçVÕõõ4•D”ôåôÀ¢Ó°¢f÷"†6öç7BWFò÷'B¢÷'G2’°¢ÖW6‡F7F–5ôÖW6…6¶WB'&öF67BÒÖ¶TFV6öFVB„Äô4ÅôäôDRÂäôDTåTÕô%$ôD45BÂ÷'BÂ4ÔÄÅõ”ÄôB“°¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚f'&öF67B’“°¢DU5Eô54U%EôUTÅôÔU54tR…„TDE4õ4”täEU$Uõ4•¤RÂ'&öF67BæFV6öFVBç†VFG6÷6–væGW&Rç6—¦RÀ¢'6–væ&ÆR–æg&7G'V7GW&R'&öF67B×W7B&R6–væVB"“° ¢ÖW6‡F7F–5ôÖW6…6¶WBVæ–67BÒÖ¶TFV6öFVB„Äô4ÅôäôDRÂ$TÔõDUôäôDRÂ÷'BÂ4ÔÄÅõ”ÄôB“°¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚gVæ–67B’“°¢DU5Eô54U%EôUTÅôÔU54tRƒÂVæ–67BæFV6öFVBç†VFG6÷6–væGW&Rç6—¦RÀ¢&–æg&7G'V7GW&RVæ–67B×W7B&W6W'fRW†—7F–ærVç6–væVB&V†f–÷""“°¢Ð§Ð §fö–BFW7Eô#…öÆ–6Vç6VEö'&öF67EöæE÷Væ–67Eö&U÷6–væVB‡fö–B§°¢V–çC…÷BV%³3%ÒÂ&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"‡V"Â&—b“°¢Öö6´æöFTD"ÓæFDæöFR„Äô4ÅôäôDR“°¢Öö6´æöFTD"Óç6WEV&Æ–4¶W’„Äô4ÅôäôDRÂV"“°¢÷væW"æ—5öÆ–6Vç6VBÒG'VS°¢6†ææVÇ2æVç7W&TÆ–6Vç6VD÷W&F–öâ‚“° ¢ÖW6‡F7F–5ôÖW6…6¶WB'&öF67BÐ¢Ö¶TFV6öFVB„Äô4ÅôäôDRÂäôDTåTÕô%$ôD45BÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂ4ÔÄÅõ”ÄôB“°¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚f'&öF67B’“°¢DU5Eô54U%EôUTÂ…„TDE4õ4”täEU$Uõ4•¤RÂ'&öF67BæFV6öFVBç†VFG6÷6–væGW&Rç6—¦R“°¢DU5Eô54U%EõE%TR†'&öF67Bç†VFG6÷6–væVB“° ¢ÖW6‡F7F–5ôÖW6…6¶WBF—&V7BÒÖ¶TFV6öFVB„Äô4ÅôäôDRÂ$TÔõDUôäôDRÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂ4ÔÄÅõ”ÄôB“°¢DU5Eô54U%EôUTÂ„DT4ôDUõ5T44U52Â&÷VæEG&—‚fF—&V7B’“°¢DU5Eô54U%EôUTÂ…„TDE4õ4”täEU$Uõ4•¤RÂF—&V7BæFV6öFVBç†VFG6÷6–væGW&Rç6—¦R“°¢DU5Eô54U%EõE%TR†F—&V7Bç†VFG6÷6–væVB“°§Ð §fö–BFW7Eô#•öÆ–6Vç6VE÷Væ–67EöæWfW%÷W6W5÷¶•öVæ7'—F–öâ‡fö–B§°¢V–çC…÷BÆö6ÅV%³3%ÒÂÆö6Å&—e³3%ÒÂ&VÖ÷FUV%³3%ÒÂ&VÖ÷FU&—e³3%Ó°¢7'—FòÓævVæW&FT¶W•—"†Æö6ÅV"ÂÆö6Å&—b“°¢ÖVÖ7’†6öæf–rç6V7W&—G’ç&—fFUö¶W’æ'—FW2ÂÆö6Å&—bÂ6—¦Vöb†Æö6Å&—b’“°¢6öæf–rç6V7W&—G’ç&—fFUö¶W’ç6—¦RÒ6—¦Vöb†Æö6Å&—b“°¢Öö6´æöFTD"ÓæFDæöFR„Äô4ÅôäôDR“°¢Öö6´æöFTD"Óç6WEV&Æ–4¶W’„Äô4ÅôäôDRÂÆö6ÅV"“°¢Öö6´æöFTD"ÓæFDæöFR…$TÔõDUôäôDR“°¢7'—FòÓævVæW&FT¶W•—"‡&VÖ÷FUV"Â&VÖ÷FU&—b“°¢Öö6´æöFTD"Óç6WEV&Æ–4¶W’…$TÔõDUôäôDRÂ&VÖ÷FUV"“°¢7'—FòÓç6WDD…&—fFT¶W’†Æö6Å&—b“° ¢÷væW"æ—5öÆ–6Vç6VBÒG'VS°¢6†ææVÇ2æVç7W&TÆ–6Vç6VD÷W&F–öâ‚“°¢ÖW6‡F7F–5ôÖW6…6¶WBÒÖ¶TFV6öFVB„Äô4ÅôäôDRÂ$TÔõDUôäôDRÂÖW6‡F7F–5õ÷'DçVÕõDU…EôÔU54tUôÂ4ÔÄÅõ”ÄôB“° ¢DU5Eô54U%EôUTÂ†ÖW6‡F7F–5õ&÷WF–æuôW'&÷%ôäôäRÂW&†4Væ6öFR‚g’“°¢DU5Eô54U%EôdÅ4R‡ç¶•öVæ7'—FVB“°¢ÖW6‡F7F–5ôFFÆ–çFW‡BÒÖW6‡F7F–5ôFFö–æ—E÷¦W&ó°¢DU5Eô54U%EõE%TR‡%öFV6öFUög&öÕö'—FW2‡æVæ7'—FVBæ'—FW2ÂæVæ7'—FVBç6—¦RÂfÖW6‡F7F–5ôFFö×6rÂgÆ–çFW‡B’“°¢DU5Eô><ç«h‘éì¶»§q«^uEU0 À°Á¥Á•±¥¹•5ÅÑÐ´ùÅÕ•Õ•M¥é” ¤¤ì(€€€QMQ}MMIQ}9U10¡Á¥Á•±¥¹•M•ÉÙ¥”´ù•Ñ½ÉA¡½¹” ¤¤ì(€€€QMQ}MMIQ}1M¡Á¥Á•±¥¹•I½ÕÑ•È´ù¡¥ÍÑ½Éå½¹Ñ…¥¹Ì ™½Á…ÅÕ”¤¤ì(€€€QMQ}MMIQ}9U10¡µ½­9½‘•´ù•Ñ5•Í¡9½‘”¡I5=Q}9=¤¤ì((€€€Á¥Á•±¥¹•I…‘¥¼´ùÉ•Í•Ð ¤ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ð…‘‘É•ÍÍ•€ô½Á…ÅÕ”ì(€€€…‘‘É•ÍÍ•¹Ñ¼€ô1=1}9=ì(€€€…‘‘É•ÍÍ•¹¥¬¬ì(€€€ÉÕ¹A¥Á•±¥¹•%¹É•ÍÌ¡…‘‘É•ÍÍ•¤ì(€€€QMQ}MMIQ}EU1}5MM À°Á¥Á•±¥¹•I…‘¥¼´ùÍ•¹‘…±±Ì°€‰½Á…ÅÕ”Á…­•Ð…‘‘É•ÍÍ•Ñ¼ÕÌµÕÍÐ¹½Ð‰”É•±…å•ˆ¤ì(€€€QMQ}MMIQ}EU0 À°Á¥Á•±¥¹•I½ÕÑ¥¹œ´ù…­…±±Ì¤ì(€€€QMQ}MMIQ}EU0 À°Á¥Á•±¥¹•5½‘Õ±”´ù…±±Ì¤ì(€€€QMQ}MMIQ}EU0 À°Á¥Á•±¥¹•5ÅÑÐ´ùÅÕ•Õ•M¥é” ¤¤ì(€€€QMQ}MMIQ}9U10¡Á¥Á•±¥¹•M•ÉÙ¥”´ù•Ñ½ÉA¡½¹” ¤¤ì(€€€QMQ}MMIQ}1M¡Á¥Á•±¥¹•I½ÕÑ•È´ù¡¥ÍÑ½Éå½¹Ñ…¥¹Ì ™…‘‘É•ÍÍ•¤¤ì((€€€½¹ÍÐµ•Í¡Ñ…ÍÑ¥}½¹™¥}•Ù¥•½¹™¥}I•‰É½…‘…ÍÑ5½‘”‰±½­•‘5½‘•Ímt€ôì(€€€€€€€µ•Í¡Ñ…ÍÑ¥}½¹™¥}•Ù¥•½¹™¥}I•‰É½…‘…ÍÑ5½‘•}1=1}=91d°(€€€€€€€µ•Í¡Ñ…ÍÑ¥}½¹™¥}•Ù¥•½¹™¥}I•‰É½…‘…ÍÑ5½‘•}=I}A=IQ9U5M}=91d°(€€€€€€€µ•Í¡Ñ…ÍÑ¥}½¹™¥}•Ù¥•½¹™¥}I•‰É½…‘…ÍÑ5½‘•}9=9°(€€€ôì(€€€™½È€¡½¹ÍÐ…ÕÑ¼µ½‘”€è‰±½­•‘5½‘•Ì¤ì(€€€€€€€Á¥Á•±¥¹•I…‘¥¼´ùÉ•Í•Ð ¤ì(€€€€€€€½¹™¥œ¹‘•Ù¥”¹É•‰É½…‘…ÍÑ}µ½‘”€ôµ½‘”ì(€€€€€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ð‰±½­•€ô½Á…ÅÕ”ì(€€€€€€€‰±½­•¹¥¬¬ì(€€€€€€€‰±½­•¹¥€¬ôÍÑ…Ñ¥}…ÍÐñÕ¥¹ÐÌÉ}Ðø¡µ½‘”¤ì(€€€€€€€‰±½­•¹ÑÉ…¹ÍÁ½ÉÑ}µ•¡…¹¥Í´€ôµ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ñ}QÉ…¹ÍÁ½ÉÑ5•¡…¹¥Íµ}QI9MA=IQ}5U1Q%MQ}U@ì(€€€€€€€ÉÕ¹A¥Á•±¥¹•%¹É•ÍÌ¡‰±½­•¤ì(€€€€€€€QMQ}MMIQ}EU1}5MM À°Á¥Á•±¥¹•I…‘¥¼´ùÍ•¹‘…±±Ì°€‰É•ÍÑÉ¥Ñ•É•‰É½…‘…ÍÐµ½‘”µÕÍÐÍÕÁÁÉ•ÍÌ½Á…ÅÕ”É•±…äˆ¤ì(€€€€€€€QMQ}MMIQ}EU0 À°Á¥Á•±¥¹•I½ÕÑ¥¹œ´ù…­…±±Ì¤ì(€€€€€€€QMQ}MMIQ}EU0 À°Á¥Á•±¥¹•5½‘Õ±”´ù…±±Ì¤ì(€€€€€€€QMQ}MMIQ}EU0 À°Á¥Á•±¥¹•5ÅÑÐ´ùÅÕ•Õ•M¥é” ¤¤ì(€€€€€€€QMQ}MMIQ}9U10¡Á¥Á•±¥¹•M•ÉÙ¥”´ù•Ñ½ÉA¡½¹” ¤¤ì(€€€€€€€QMQ}MMIQ}1M¡Á¥Á•±¥¹•I½ÕÑ•È´ù¡¥ÍÑ½Éå½¹Ñ…¥¹Ì ™‰±½­•¤¤ì(€€€ô)ô()Ù½¥Ñ•ÍÑ}Ý}ÍÑÉ¥Ñ}É•©•ÑÍ}Õ¹Í¥¹•‘}‘•½‘•‘}Í¥µÉ…‘¥½}¥¹É•ÍÌ¡Ù½¥¤)ì(€€€Í•ÑA½±¥ä¡µ•Í¡Ñ…ÍÑ¥}½¹™¥}M•ÕÉ¥Ñå½¹™¥}A…­•ÑM¥¹…ÑÕÉ•A½±¥å}A-Q}M%9QUI}A=1%e}MQI%P¤ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€½¹ÍÐÕ¥¹ÐÌÉ}Ð±…ÍÑ!•…É€ôµ½­9½‘•´ù•Ñ5•Í¡9½‘”¡I5=Q}9=¤´ù±…ÍÑ}¡•…Éì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ð¥¹©•Ñ•€ôµ…­••½‘•¡I5=Q}9=°9=9U5}	I=MP°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}A=M%Q%=9}A@°M511}Ae1=¤ì(€€€¥¹©•Ñ•¹ÑÉ…¹ÍÁ½ÉÑ}µ•¡…¹¥Í´€ôµ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ñ}QÉ…¹ÍÁ½ÉÑ5•¡…¹¥Íµ}QI9MA=IQ}1=Iì(€€€ÉÕ¹A¥Á•±¥¹•%¹É•ÍÌ¡¥¹©•Ñ•¤ì(€€€…ÍÍ•ÉÑ9½I•©•Ñ•‘A¥Á•±¥¹•™™•ÑÌ¡I5=Q}9=°±…ÍÑ!•…É¤ì(€€€QMQ}MMIQ}1M¡Á¥Á•±¥¹•I½ÕÑ•È´ù¡¥ÍÑ½Éå½¹Ñ…¥¹Ì ™¥¹©•Ñ•¤¤ì)ô()Ù½¥Ñ•ÍÑ}á}ÑÉÕÍÑ•‘}±½…±}‘•½‘•‘}‘•±¥Ù•Éå}¥Í}¹½Ñ}™¥±Ñ•É•¡Ù½¥¤)ì(€€€Í•ÑA½±¥ä¡µ•Í¡Ñ…ÍÑ¥}½¹™¥}M•ÕÉ¥Ñå½¹™¥}A…­•ÑM¥¹…ÑÕÉ•A½±¥å}A-Q}M%9QUI}A=1%e}MQI%P¤ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ð€©±½…°€ô(€€€€€€€Á…­•ÑA½½°¹…±±½½Áä¡µ…­••½‘• À°1=1}9=°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}A=M%Q%=9}A@°M511}Ae1=¤¤ì(€€€QMQ}MMIQ}9=Q}9U10¡±½…°¤ì(€€€QMQ}MMIQ}EU0¡II9=}M!=U1}I1M°Á¥Á•±¥¹•I½ÕÑ•È´ùÍ•¹‘1½…°¡±½…°°Ia}MI}UMH¤¤ì(€€€QMQ}MMIQ}EU1}5MM Ä°Á¥Á•±¥¹•5½‘Õ±”´ù…±±Ì°€‰ÑÉÕÍÑ•Á¡½¹”µ½É¥¥¸Á…­•ÐµÕÍÐÉ•… ±½…°µ½‘Õ±•Ìˆ¤ì(€€€Á…­•ÑA½½°¹É•±•…Í”¡±½…°¤ì)ô()Ù½¥Ñ•ÍÑ}å}­¹½Ý¹}¡…¹¹•±}µ…±™½Éµ•‘}Á±…¥¹Ñ•áÑ}¡…Í}¹½}Á¥Á•±¥¹•}•™™•ÑÌ¡Ù½¥¤)ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ðµ…±™½Éµ•€ôµ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ñ}¥¹¥Ñ}é•É¼ì(€€€µ…±™½Éµ•¹™É½´€ôI5=Q}9=ì(€€€µ…±™½Éµ•¹Ñ¼€ô9=9U5}	I=MPì(€€€µ…±™½Éµ•¹¥€ô€ÁáäÀÀÀÀÀäì(€€€µ…±™½Éµ•¹Ý¡¥¡}Á…å±½…‘}Ù…É¥…¹Ð€ôµ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ñ}•¹ÉåÁÑ•‘}Ñ…œì(€€€µ…±™½Éµ•¹•¹ÉåÁÑ•¹Í¥é”€ô€Ìì(€€€µ…±™½Éµ•¹•¹ÉåÁÑ•¹‰åÑ•ÍlÁt€ô€Ááì(€€€µ…±™½Éµ•¹•¹ÉåÁÑ•¹‰åÑ•ÍlÅt€ô€Ááì(€€€µ…±™½Éµ•¹•¹ÉåÁÑ•¹‰åÑ•ÍlÉt€ô€Ááì(€€€µ…±™½Éµ•¹¡…¹¹•°€ô¡…¹¹•±Ì¹Í•ÑÑ¥Ù•	å%¹‘•à À¤ì(€€€ÉåÁÑ¼´ù•¹ÉåÁÑA…­•Ð¡µ…±™½Éµ•¹™É½´°µ…±™½Éµ•¹¥°µ…±™½Éµ•¹•¹ÉåÁÑ•¹Í¥é”°µ…±™½Éµ•¹•¹ÉåÁÑ•¹‰åÑ•Ì¤ì((€€€€¼¼Y•É‘¥Ð¥Ì½Á…ÅÕ”µÉ•±…äµ•±¥¥‰±”¹½Ü€¡Í•”Ñ•ÍÑ}ÄÜ¤ì¡½Á}±¥µ¥Ð€À¥ÌÝ¡…Ð­••ÁÌÑ¡¥Ì„¹¼µ½À¸(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÙ•É‘¥Ñ½Áä€ôµ…±™½Éµ•ì(€€€QMQ}MMIQ}EU0¡ÍÑ…Ñ¥}…ÍÐñ¥¹Ðø¡I½ÕÑ¥¹ÕÑ¡Y•É‘¥Ðèé=AEU}I1e}=91d¤°(€€€€€€€€€€€€€€€€€€€€€ÍÑ…Ñ¥}…ÍÐñ¥¹Ðø¡Á…ÍÍ•ÍI½ÕÑ¥¹ÕÑ¡…Ñ” ™Ù•É‘¥Ñ½Áä¤¤¤ì((€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€½¹ÍÐÕ¥¹ÐÌÉ}Ð±…ÍÑ!•…É€ôµ½­9½‘•´ù•Ñ5•Í¡9½‘”¡I5=Q}9=¤´ù±…ÍÑ}¡•…Éì(€€€ÉÕ¹A¥Á•±¥¹•%¹É•ÍÌ¡µ…±™½Éµ•¤ì(€€€…ÍÍ•ÉÑ9½I•©•Ñ•‘A¥Á•±¥¹•™™•ÑÌ¡I5=Q}9=°±…ÍÑ!•…É¤ì(€€€QMQ}MMIQ}1M¡Á¥Á•±¥¹•I½ÕÑ•È´ù¡¥ÍÑ½Éå½¹Ñ…¥¹Ì ™µ…±™½Éµ•¤¤ì)ô()Ù½¥Ñ•ÍÑ}ÄÁ}±•…å}¡…¹¹•±}‘µ}™…¥±ÕÉ•}¡…Í}¹½}Á¥Á•±¥¹•}•™™•ÑÌ¡Ù½¥¤)ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ð±•…å´€ôµ…­••½‘•¡I5=Q}9=°1=1}9=°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}QaQ}5MM}A@°M511}Ae1=¤ì(€€€±•…å´€ô¡…¹¹•±¹½‘”¡±•…å´¤ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€½¹ÍÐÕ¥¹ÐÌÉ}Ð±…ÍÑ!•…É€ôµ½­9½‘•´ù•Ñ5•Í¡9½‘”¡I5=Q}9=¤´ù±…ÍÑ}¡•…Éì(€€€µ½‘Õ±•½¹™¥œ¹µÅÑÐ¹•¹…‰±•€ôÑÉÕ”ì(€€€ÉÕ¹A¥Á•±¥¹•%¹É•ÍÌ¡±•…å´¤ì(€€€…ÍÍ•ÉÑ9½I•©•Ñ•‘A¥Á•±¥¹•™™•ÑÌ¡I5=Q}9=°±…ÍÑ!•…É¤ì(€€€QMQ}MMIQ}1M¡Á¥Á•±¥¹•I½ÕÑ•È´ù¡¥ÍÑ½Éå½¹Ñ…¥¹Ì ™±•…å´¤¤ì)ô()Ù½¥Ñ•ÍÑ}ÄÅ}µ…±™½Éµ•‘}Á­¥}Á±…¥¹Ñ•áÑ}¡…Í}¹½}Á¥Á•±¥¹•}•™™•ÑÌ¡Ù½¥¤)ì(€€€Õ¥¹Ðá}Ð±½…±AÕ‰lÌÉt°±½…±AÉ¥ÙlÌÉt°É•µ½Ñ•AÕ‰lÌÉt°É•µ½Ñ•AÉ¥ÙlÌÉtì(€€€ÉåÁÑ¼´ù•¹•É…Ñ•-•åA…¥È¡±½…±AÕˆ°±½…±AÉ¥Ø¤ì(€€€ÉåÁÑ¼´ù•¹•É…Ñ•-•åA…¥È¡É•µ½Ñ•AÕˆ°É•µ½Ñ•AÉ¥Ø¤ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡1=1}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑAÕ‰±¥-•ä¡1=1}9=°±½…±AÕˆ¤ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑAÕ‰±¥-•ä¡I5=Q}9=°É•µ½Ñ•AÕˆ¤ì((€€€½¹ÍÐÕ¥¹Ðá}Ðµ…±™½Éµ•‘A±…¥¹Ñ•áÑmt€ôìÁá°€Áá°€Ááôì(€€€µ•Í¡Ñ…ÍÑ¥}9½‘•%¹™½1¥Ñ•}ÁÕ‰±¥}­•å}Ð±½…±-•ä€ôìÌÈ°ìÁõôì(€€€µ•µÁä¡±½…±-•ä¹‰åÑ•Ì°±½…±AÕˆ°Í¥é•½˜¡±½…±AÕˆ¤¤ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ðµ…±™½Éµ•€ôµ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ñ}¥¹¥Ñ}é•É¼ì(€€€µ…±™½Éµ•¹™É½´€ôI5=Q}9=ì(€€€µ…±™½Éµ•¹Ñ¼€ô1=1}9=ì(€€€µ…±™½Éµ•¹¥€ô€ÁáÀÀÀÀÁì(€€€µ…±™½Éµ•¹¡…¹¹•°€ô€Àì(€€€µ…±™½Éµ•¹Ý¡¥¡}Á…å±½…‘}Ù…É¥…¹Ð€ôµ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ñ}•¹ÉåÁÑ•‘}Ñ…œì(€€€ÉåÁÑ¼´ùÍ•Ñ!AÉ¥Ù…Ñ•-•ä¡É•µ½Ñ•AÉ¥Ø¤ì(€€€QMQ}MMIQ}QIU¡ÉåÁÑ¼´ù•¹ÉåÁÑÕÉÙ”ÈÔÔÄä¡µ…±™½Éµ•¹Ñ¼°µ…±™½Éµ•¹™É½´°±½…±-•ä°µ…±™½Éµ•¹¥°Í¥é•½˜¡µ…±™½Éµ•‘A±…¥¹Ñ•áÐ¤°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€µ…±™½Éµ•‘A±…¥¹Ñ•áÐ°µ…±™½Éµ•¹•¹ÉåÁÑ•¹‰åÑ•Ì¤¤ì(€€€µ…±™½Éµ•¹•¹ÉåÁÑ•¹Í¥é”€ôÍ¥é•½˜¡µ…±™½Éµ•‘A±…¥¹Ñ•áÐ¤€¬5M!QMQ%}A-}=YI!ì(€€€ÉåÁÑ¼´ùÍ•Ñ!AÉ¥Ù…Ñ•-•ä¡±½…±AÉ¥Ø¤ì((€€€½¹ÍÐÕ¥¹ÐÌÉ}Ð±…ÍÑ!•…É€ôµ½­9½‘•´ù•Ñ5•Í¡9½‘”¡I5=Q}9=¤´ù±…ÍÑ}¡•…Éì(€€€µ½‘Õ±•½¹™¥œ¹µÅÑÐ¹•¹…‰±•€ôÑÉÕ”ì(€€€ÉÕ¹A¥Á•±¥¹•%¹É•ÍÌ¡µ…±™½Éµ•¤ì(€€€…ÍÍ•ÉÑ9½I•©•Ñ•‘A¥Á•±¥¹•™™•ÑÌ¡I5=Q}9=°±…ÍÑ!•…É¤ì(€€€QMQ}MMIQ}1M¡Á¥Á•±¥¹•I½ÕÑ•È´ù¡¥ÍÑ½Éå½¹Ñ…¥¹Ì ™µ…±™½Éµ•¤¤ì)ô()Ù½¥Ñ•ÍÑ}ÄÉ}•á…Ñ}…ÕÑ¡•¹Ñ¥…Ñ•‘}É•Á±…å}É•ÕÍ•Í}Ù•É‘¥Ñ}Ý¥Ñ¡½ÕÑ}½±±¥Í¥½¹}‰åÁ…ÍÌ¡Ù½¥¤)ì(€€€Í•ÑA½±¥ä¡µ•Í¡Ñ…ÍÑ¥}½¹™¥}M•ÕÉ¥Ñå½¹™¥}A…­•ÑM¥¹…ÑÕÉ•A½±¥å}A-Q}M%9QUI}A=1%e}MQI%P¤ì(€€€ÁÉ•Á…É•A¥Á•±¥¹•M¥¹•È¡I5=Q}9=¤ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÙ…±¥€ôµ…­•M¥¹•‘]¥É•A…­•Ð¡I5=Q}9=°9=9U5}	I=MP°€ÁáÀÀÀÀÁ¤ì(€€€€¼¼Õ±°¥¹É•ÍÌÉ•Á±…•ÌÑ¡¥Ì¹½¹é•É¼Ý¥É”Ñ¥µ•ÍÑ…µÀÝ¥Ñ Ñ¡”±½…°…ÉÉ¥Ù…°Ñ¥µ”¸Q¡”•á…Ð(€€€€¼¼…ÕÑ¡•¹Ñ¥…Ñ¥½¸¡…¹‘½™˜µÕÍÐ‰”½¹ÍÕµ•‰•™½É”Ñ¡…ÐµÕÑ…Ñ¥½¸°…Ù½¥‘¥¹œ„Í•½¹•Ù…±Õ…Ñ¥½¸¸(€€€Ù…±¥¹Éá}Ñ¥µ”€ô€ÁàÄÈÌÐÔØÜàì(€€€ÉÕ¹A¥Á•±¥¹•%¹É•ÍÌ¡Ù…±¥¤ì(€€€QMQ}MMIQ}EU1}5MM Ä°É½ÕÑ¥¹ÕÑ¡Ù…±Õ…Ñ¥½¹½Õ¹Ð ¤°€‰™Õ±°¥¹É•ÍÌµÕÍÐ½¹ÍÕµ”Ñ¡”ÁÉ¥µ•Ù•É‘¥Ð•á…Ñ±ä½¹”ˆ¤ì(€€€ÉÕ¹A¥Á•±¥¹•%¹É•ÍÌ¡Ù…±¥¤ì(€€€QMQ}MMIQ}EU1}5MM È°É½ÕÑ¥¹ÕÑ¡Ù…±Õ…Ñ¥½¹½Õ¹Ð ¤°€‰½¹ÍÕµ•Ù•É‘¥ÐµÕÍÐ¹½Ð…ÕÑ¡•¹Ñ¥…Ñ”„±…Ñ•ÈÉ•Á±…äˆ¤ì((€€€€¼¼	É½…‘…ÍÐ°Í¼¥ÍQ½UÌ ¤¥Ì™…±Í”±¥­”…¹ä½±±¥‘¥¹œµ¡…Í ™½É•¥¸‰É½…‘…ÍÐ€¡Í•”Ñ•ÍÑ}ÄÜ¤ì(€€€€¼¼Ñ¡¥ÌÍÑ¥±°Õ…É‘ÌÑ¡…ÐÑ¡”…¡”¥ÌÉ••Ù…±Õ…Ñ•Á•È•á…Ð‰åÑ•Ì°¹½ÐÉ•ÕÍ•™½È„Í…µ”µ%É•Á±…ä¸(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ð½±±¥Í¥½¸€ôÙ…±¥ì(€€€½±±¥Í¥½¸¹•¹ÉåÁÑ•¹‰åÑ•ÍlÁtxô€ÁààÀì(€€€QMQ}MMIQ}EU0¡ÍÑ…Ñ¥}…ÍÐñ¥¹Ðø¡I½ÕÑ¥¹ÕÑ¡Y•É‘¥Ðèé=AEU}I1e}=91d¤°(€€€€€€€€€€€€€€€€€€€€€ÍÑ…Ñ¥}…ÍÐñ¥¹Ðø¡Á…ÍÍ•ÍI½ÕÑ¥¹ÕÑ¡…Ñ” ™½±±¥Í¥½¸¤¤¤ì(€€€QMQ}MMIQ}EU1}5MM Ì°É½ÕÑ¥¹ÕÑ¡Ù…±Õ…Ñ¥½¹½Õ¹Ð ¤°€‰Í…µ”Á…­•Ð%Ý¥Ñ ‘¥™™•É•¹Ð‰åÑ•ÌµÕÍÐ‰”É••Ù…±Õ…Ñ•ˆ¤ì)ô((¼¼±½…°É•±¥…‰±”Í•¹Ñ¡…Ð™…¥±Ì‰•™½É”É•…¡¥¹œÑ¡”É…‘¥¼µÕÍÐ¹½Ð½ÕÑ±¥Ù”Ñ¡”•ÉÉ½È…Ì„Í¡•‘Õ±•É•ÑÉ…¹Íµ¥ÍÍ¥½¸¸)Ù½¥Ñ•ÍÑ}ÄÍ}™…¥±•‘}¥¹¥Ñ¥…±}É•±¥…‰±•}Í•¹‘}‘½•Í}¹½Ñ}É•ÑÉä¡Ù½¥¤)ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ð¥¹¥Ñ¥…°€ôµ…­••½‘•¡1=1}9=°I5=Q}9=°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}I=UQ%9}A@°M511}Ae1=¤ì(€€€¥¹¥Ñ¥…°¹¥€ô€ÁáÄÍÄÍÄì(€€€¥¹¥Ñ¥…°¹Ý…¹Ñ}…¬€ôÑÉÕ”ì(€€€¥¹¥Ñ¥…°¹¡…¹¹•°€ô5a}9U5}!991Lì€¼¼=ÕÐ½˜É…¹”°Í¼•¹½‘¥¹œÉ•ÑÕÉ¹Ì9=}!990¸((€€€…ÕÑ¼€©Á…­•Ð€ôÁ…­•ÑA½½°¹…±±½½Áä¡¥¹¥Ñ¥…°¤ì(€€€QMQ}MMIQ}9=Q}9U10¡Á…­•Ð¤ì((€€€Á¥Á•±¥¹•I½ÕÑ•È´ùÍ•¹¡Á…­•Ð¤ì(€€€QMQ}MMIQ}EU1}U%9PÌÉ}5MM Ä°Á¥Á•±¥¹•I½ÕÑ¥¹œ´ù…­…±±Ì°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰¥¹¥Ñ¥…°•¹½‘¥¹œ™…¥±ÕÉ”µÕÍÐ‰”É•Á½ÉÑ•Ñ¼Ñ¡”½É¥¥¹…Ñ¥¹œ±¥•¹Ðˆ¤ì(€€€QMQ}MMIQ}EU1}U%9PÌÉ}5MM À°Á¥Á•±¥¹•I½ÕÑ•È´ùÁ•¹‘¥¹½Õ¹Ð ¤°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰™…¥±•¥¹¥Ñ¥…°Í•¹µÕÍÐ¹½Ð±•…Ù”„É•ÑÉ…¹Íµ¥ÍÍ¥½¸Á•¹‘¥¹œˆ¤ì((€€€Á¥Á•±¥¹•I…‘¥¼´ù™…¥±M•¹€ôÑÉÕ”ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ð¥¹Ñ•É™…•…¥±ÕÉ”€ôµ…­••½‘•¡1=1}9=°I5=Q}9=°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}I=UQ%9}A@°M511}Ae1=¤ì(€€€¥¹Ñ•É™…•…¥±ÕÉ”¹¥€ô€ÁáÄÍÄÍÈì(€€€¥¹Ñ•É™…•…¥±ÕÉ”¹Ý…¹Ñ}…¬€ôÑÉÕ”ì(€€€Á…­•Ð€ôÁ…­•ÑA½½°¹…±±½½Áä¡¥¹Ñ•É™…•…¥±ÕÉ”¤ì(€€€QMQ}MMIQ}9=Q}9U10¡Á…­•Ð¤ì((€€€Á¥Á•±¥¹•M•ÉÙ¥”´ùÍ•¹‘Q½5•Í ¡Á…­•Ð°Ia}MI}UMH¤ì(€€€µ•Í¡Ñ…ÍÑ¥}EÕ•Õ•MÑ…ÑÕÌ€©ÍÑ…ÑÕÌ€ôÁ¥Á•±¥¹•M•ÉÙ¥”´ù•ÑEÕ•Õ•MÑ…ÑÕÍ½ÉA¡½¹” ¤ì(€€€QMQ}MMIQ}9=Q}9U10¡ÍÑ…ÑÕÌ¤ì(€€€QMQ}MMIQ}EU0¡II9=}%M	1°ÍÑ…ÑÕÌ´ùÉ•Ì¤ì(€€€QMQ}MMIQ}EU1}U%9PÌÈ¡¥¹Ñ•É™…•…¥±ÕÉ”¹¥°ÍÑ…ÑÕÌ´ùµ•Í¡}Á…­•Ñ}¥¤ì(€€€Á¥Á•±¥¹•M•ÉÙ¥”´ùÉ•±•…Í•EÕ•Õ•MÑ…ÑÕÍQ½A½½°¡ÍÑ…ÑÕÌ¤ì(€€€QMQ}MMIQ}EU1}U%9PÌÉ}5MM Ä°Á¥Á•±¥¹•I½ÕÑ¥¹œ´ù…­…±±Ì°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰¥¹Ñ•É™…”•ÉÉ½ÉÌ…É”É•Á½ÉÑ•Ñ¼Ñ¡”±¥•¹ÐÑ¡É½Õ EÕ•Õ•MÑ…ÑÕÌ°¹½Ð„É½ÕÑ¥¹œ9,ˆ¤ì(€€€QMQ}MMIQ}EU1}U%9PÌÉ}5MM À°Á¥Á•±¥¹•I½ÕÑ•È´ùÁ•¹‘¥¹½Õ¹Ð ¤°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰™…¥±•¥¹Ñ•É™…”•¹ÅÕ•Õ”µÕÍÐ¹½Ð±•…Ù”„É•ÑÉ…¹Íµ¥ÍÍ¥½¸Á•¹‘¥¹œˆ¤ì)ô((¼¼ÄÐ¹••‘Ì„¹½‘”Ñ¡…Ð¡…ÌÕÍ•¥ÑÌÝ¡½±”¡½ÕÉ±ä‘ÕÑäµå±”…±±½Ý…¹”¸MÝ…ÁÌ¥¸„Í•Á…É…Ñ”¥ÉQ¥µ”(¼¼É…Ñ¡•ÈÑ¡…¸Á½­¥¹œÑ¡”±½‰…°Ì‰Õ­•ÑÌ°Ý¡¥ …É”ÁÉ¥Ù…Ñ”¹½Ü¸(¼¼(¼¼•±¥‰•É…Ñ•±ä9=P„Í½Á•Õ…ÉèU¹¥ÑäÌQMQ}	=IP ¤¥Ì±½¹©µÀ°Ý¡¥ ‘½•Ì¹½ÐÉÕ¸‘•ÍÑÉÕÑ½ÉÌ(¼¼½˜…ÕÑ½µ…Ñ¥Œ½‰©•ÑÌ°Í¼„Õ…ÉÝ½Õ±±•…Ù”…¥ÉQ¥µ•€‘…¹±¥¹œ¥¹Ñ¼…¸…‰…¹‘½¹•ÍÑ…¬™É…µ”½¸(¼¼…¹ä…ÍÍ•ÉÑ¥½¸™…¥±ÕÉ”€´…¹±…Ñ•È…Í•Ì‘•É•™•É•¹”¥Ð€¡9½‘•%¹™½5½‘Õ±”èé…±±½I•Á±ä¤¸Ñ•…É½Ý¸ ¤(¼¼É•ÍÑ½É•ÌÑ¡”±½‰…°Õ¹½¹‘¥Ñ¥½¹…±±ä¥¹ÍÑ•…¸Q¡”¥¹ÍÑ…¹”¥Ì„™Õ¹Ñ¥½¸µ±½…°ÍÑ…Ñ¥ŒÍ¼¥Ð(¼¼½ÕÑ±¥Ù•ÌÑ¡”±½¹©µÀ¸(¼¼(¼¼9½Ñ”¥Ð…±Í¼Á…É­Ì¡…¹¹•°ÕÑ¥±¥Í…Ñ¥½¸…ÐøØÀÀÀ”°‰•…ÕÍ”±½¥ÉÑ¥µ” ¤É•‘¥ÑÌÑ¡…Ð™½È•Ù•Éä(¼¼É•Á½ÉÐÑåÁ”¸ÄÐ…Ñ•Ì½¸ÕÑ¥±¥é…Ñ¥½¹QaA•É•¹Ð ¤…±½¹”ì‘¼¹½ÐÉ•ÕÍ”Ñ¡¥Ì™½È…¸(¼¼¥ÍQá±±½Ý•‘¡…¹¹•±UÑ¥° ¤Á…Ñ °Ý¡¥ Ý½Õ±Ñ¡•¸Á…ÍÌ™½ÈÑ¡”ÝÉ½¹œÉ•…Í½¸¸)ÍÑ…Ñ¥ŒÙ½¥ÕÍ•ÕÑåå±•M…ÑÕÉ…Ñ•‘¥ÉQ¥µ” ¤)ì(€€€ÍÑ…Ñ¥Œ¥ÉQ¥µ”Í…ÑÕÉ…Ñ•ì(€€€ŒÄÑM…Ù•‘¥ÉQ¥µ”€ô…¥ÉQ¥µ”ì(€€€…¥ÉQ¥µ”€ô€™Í…ÑÕÉ…Ñ•ì(€€€Í…ÑÕÉ…Ñ•¹±½¥ÉÑ¥µ”¡Qa}1=°5M}%9}!=UH¤ì€¼¼ÕÑ¥±¥é…Ñ¥½¹QaA•É•¹Ð ¤ÍÕµÌ•Ù•Éä‰Õ­•Ð€´ø€ÄÀÀ”)ô()Ù½¥Ñ•ÍÑ}ÄÑ}‘ÕÑå}å±•}±¥µ¥Ñ•‘}É•±¥…‰±•}Í•¹‘}É•µ…¥¹Í}Á•¹‘¥¹œ¡Ù½¥¤)ì(€€€½¹™¥œ¹±½É„¹É•¥½¸€ôµ•Í¡Ñ…ÍÑ¥}½¹™¥}1½I…½¹™¥}I•¥½¹½‘•}U|àØàì(€€€½¹™¥œ¹±½É„¹½Ù•ÉÉ¥‘•}‘ÕÑå}å±”€ô™…±Í”ì(€€€¥¹¥ÑI•¥½¸ ¤ì(€€€ÕÍ•ÕÑåå±•M…ÑÕÉ…Ñ•‘¥ÉQ¥µ” ¤ì((€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ð¥¹¥Ñ¥…°€ôµ…­••½‘•¡1=1}9=°I5=Q}9=°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}I=UQ%9}A@°M511}Ae1=¤ì(€€€¥¹¥Ñ¥…°¹¥€ô€ÁáÄÑÄÑÄì(€€€¥¹¥Ñ¥…°¹Ý…¹Ñ}…¬€ôÑÉÕ”ì(€€€…ÕÑ¼€©Á…­•Ð€ôÁ…­•ÑA½½°¹…±±½½Áä¡¥¹¥Ñ¥…°¤ì(€€€QMQ}MMIQ}9=Q}9U10¡Á…­•Ð¤ì((€€€QMQ}MMIQ}EU0¡µ•Í¡Ñ…ÍÑ¥}I½ÕÑ¥¹}ÉÉ½É}UQe}e1}1%5%P°Á¥Á•±¥¹•I½ÕÑ•È´ùÍ•¹¡Á…­•Ð¤¤ì(€€€QMQ}MMIQ}EU1}U%9PÌÉ}5MM Ä°Á¥Á•±¥¹•I½ÕÑ¥¹œ´ù…­…±±Ì°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰‘ÕÑäµå±”É•©•Ñ¥½¸µÕÍÐÍÑ¥±°¹½Ñ¥™äÑ¡”½É¥¥¹…Ñ¥¹œ±¥•¹Ðˆ¤ì(€€€QMQ}MMIQ}EU1}U%9PÌÉ}5MM Ä°Á¥Á•±¥¹•I½ÕÑ•È´ùÁ•¹‘¥¹½Õ¹Ð ¤°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰‘ÕÑäµå±”É•©•Ñ¥½¸µÕÍÐÉ•Ñ…¥¸Ñ¡”É•ÑÉä™½ÈÝ¡•¸…¥ÉÑ¥µ”¥Ì…Ù…¥±…‰±”ˆ¤ì((€€€½¹™¥œ¹±½É„¹É•¥½¸€ôµ•Í¡Ñ…ÍÑ¥}½¹™¥}1½I…½¹™¥}I•¥½¹½‘•}ULì(€€€¥¹¥ÑI•¥½¸ ¤ì)ô()Ù½¥Ñ•ÍÑ}ÄÕ}É•±¥…‰±•}Õ¹¥…ÍÑ}ÑÉ…­Í}™¥Ù•}Ñ½Ñ…±}…ÑÑ•µÁÑÌ¡Ù½¥¤)ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­••½‘•¡1=1}9=°I5=Q}9=°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}I=UQ%9}A@°M511}Ae1=¤ì(€€€À¹¥€ô€ÁàÔÄÔÌÀÀÀÄì(€€€À¹Ý…¹Ñ}…¬€ôÑÉÕ”ì((€€€QMQ}MMIQ}EU0¡II9=}=,°Á¥Á•±¥¹•I½ÕÑ•È´ùÍ•¹¡Á…­•ÑA½½°¹…±±½½Áä¡À¤¤¤ì(€€€QMQ}MMIQ}EU1}U%9Pà Ô°Á¥Á•±¥¹•I½ÕÑ•È´ùÁ•¹‘¥¹Q½Ñ…±ÑÑ•µÁÑÌ¡1=1}9=°À¹¥¤¤ì)ô()Ù½¥Ñ•ÍÑ}ÄÙ}É•±¥…‰±•}‰É½…‘…ÍÑ}­••ÁÍ}Ñ¡É••}Ñ½Ñ…±}…ÑÑ•µÁÑÌ¡Ù½¥¤)ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­••½‘•¡1=1}9=°9=9U5}	I=MP°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}I=UQ%9}A@°M511}Ae1=¤ì(€€€À¹¥€ô€ÁàÔÄÔÌÀÀÀÈì(€€€À¹Ý…¹Ñ}…¬€ôÑÉÕ”ì((€€€QMQ}MMIQ}EU0¡II9=}=,°Á¥Á•±¥¹•I½ÕÑ•È´ùÍ•¹¡Á…­•ÑA½½°¹…±±½½Áä¡À¤¤¤ì(€€€QMQ}MMIQ}EU1}U%9Pà Ì°Á¥Á•±¥¹•I½ÕÑ•È´ùÁ•¹‘¥¹Q½Ñ…±ÑÑ•µÁÑÌ¡1=1}9=°À¹¥¤¤ì)ô()Ù½¥Ñ•ÍÑ}ÄÝ}½±±¥‘¥¹}¡…¹¹•±}¡…Í¡}™½É•¥¹}‰É½…‘…ÍÑ}¥Í}É•±…å}½¹±ä¡Ù½¥¤)ì(€€€€¼¼½É•¥¸¡…¹¹•°Ý¡½Í”AM,½±±¥‘•ÌÝ¥Ñ ½ÕÈ¡…¹¹•°€ÀÌ½¹”µ‰åÑ”¡…Í €¡Í•”Ñ•ÍÑ}ä½Ñ•ÍÑ}ÄÈ(€€€€¼¼™½ÈÑ¡”Á…¥É•ÑÉ…‘•½™˜¤è¥¹‘¥ÍÑ¥¹Õ¥Í¡…‰±”™É½´Ñ…µÁ•É¥¹œ°Í¼¥ÐµÕÍÐÉ•±…ä½Á…ÅÕ•±ä¸(€€€Í•ÑA½±¥ä¡µ•Í¡Ñ…ÍÑ¥}½¹™¥}M•ÕÉ¥Ñå½¹™¥}A…­•ÑM¥¹…ÑÕÉ•A½±¥å}A-Q}M%9QUI}A=1%e}MQI%P¤ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ð™½É•¥¸€ôµ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ñ}¥¹¥Ñ}é•É¼ì(€€€™½É•¥¸¹™É½´€ôI5=Q}9=ì(€€€™½É•¥¸¹Ñ¼€ô9=9U5}	I=MPì(€€€™½É•¥¸¹¥€ô€ÁáÄÜÀÀÀÄÜì(€€€™½É•¥¸¹¡½Á}±¥µ¥Ð€ô€Äì(€€€™½É•¥¸¹¡½Á}ÍÑ…ÉÐ€ô€Èì(€€€™½É•¥¸¹Ý¡¥¡}Á…å±½…‘}Ù…É¥…¹Ð€ôµ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ñ}•¹ÉåÁÑ•‘}Ñ…œì(€€€½¹ÍÐ¥¹ÐÄÙ}Ð¡…Í €ô¡…¹¹•±Ì¹Í•ÑÑ¥Ù•	å%¹‘•à À¤ì(€€€QMQ}MMIQ}IQI}=I}EU1}5MM À°¡…Í °€‰¹¼ÕÍ…‰±”ÁÉ¥µ…Éä¡…¹¹•°ˆ¤ì(€€€™½É•¥¸¹¡…¹¹•°€ô€¡Õ¥¹Ðá}Ð¥¡…Í ì€¼¼½±±¥‘•ÌÝ¥Ñ ½ÕÈ¡…¹¹•°€À°‰ÕÐÑ¡”¥Á¡•ÉÑ•áÐ‰•±½Ü¥Ì¹½Ð½ÕÉÌ(€€€™½É•¥¸¹•¹ÉåÁÑ•¹Í¥é”€ô€ÄØì(€€€µ•µÍ•Ð¡™½É•¥¸¹•¹ÉåÁÑ•¹‰åÑ•Ì°€ÁáÔ°™½É•¥¸¹•¹ÉåÁÑ•¹Í¥é”¤ì((€€€QMQ}MMIQ}EU0¡ÍÑ…Ñ¥}…ÍÐñ¥¹Ðø¡I½ÕÑ¥¹ÕÑ¡Y•É‘¥Ðèé=AEU}I1e}=91d¤°ÍÑ…Ñ¥}…ÍÐñ¥¹Ðø¡Á…ÍÍ•ÍI½ÕÑ¥¹ÕÑ¡…Ñ” ™™½É•¥¸¤¤¤ì((€€€€¼¼M…µ”Õ¹‘•½‘…‰±”™É…µ”±…¥µ¥¹œÑ¼‰”™É½´ÕÌµÕÍÐÍÑ¥±°‰”‘É½ÁÁ•è=AEU}I1e}=91dÝ½Õ±(€€€€¼¼É•… Á•É¡…ÁÍ•¹•É…Ñ•%µÁ±¥¥Ñ­½É=Ý¹=Ù•É¡•…É°Ý¡¥ …ÑÌ½¸¡•…‘•È‰åÑ•Ì…±½¹”¸(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÍÁ½½™•€ô™½É•¥¸ì(€€€ÍÁ½½™•¹™É½´€ô1=1}9=ì(€€€QMQ}MMIQ}EU0¡ÍÑ…Ñ¥}…ÍÐñ¥¹Ðø¡I½ÕÑ¥¹ÕÑ¡Y•É‘¥ÐèéI)P¤°ÍÑ…Ñ¥}…ÍÐñ¥¹Ðø¡Á…ÍÍ•ÍI½ÕÑ¥¹ÕÑ¡…Ñ” ™ÍÁ½½™•¤¤¤ì)ô((¼¼ÔèÑ¡”Á…­•ÐÍÕÉÙ¥Ù•Ì€¡Ð¤‰ÕÐÑ¡”¥‘•¹Ñ¥Ñä±…¥´¥¹Í¥‘”¥ÐµÕÍÐ¹½Ð±…¹€´Ñ¡”ÁÕ‰­•äÕ…É(¼¼…¸ÐÑ•±°„Í¥¹•È™É½´…¸¥µÁ•ÉÍ½¹…Ñ½ÈÉ•Á±…å¥¹œ¥ÑÌ€¡ÁÕ‰±¥Œ¤­•ä¸=¹±äÑ¡”ÝÉ¥Ñ”¥ÌÉ•™ÕÍ•¸)Ù½¥Ñ•ÍÑ}8Õ}Õ¹Í¥¹•‘}Õ¹¥…ÍÑ}¹½‘•¥¹™½}™É½µ}Í¥¹•É}‘½•Í}¹½Ñ}¡…¹•}¹…µ”¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑM¥¹•É	¥Ð¡I5=Q}9=°ÑÉÕ”¤ì(€€€µ½­9½‘•´ùÍ•Ñ1½¹9…µ”¡I5=Q}9=°€‰•¹Õ¥¹”ˆ¤ì((€€€9½‘•%¹™½Q•ÍÑM¡¥´Í¡¥´ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐµÀ€ôµ…­••½‘•¡I5=Q}9=°1=1}9=°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}9=%9=}A@°M511}Ae1=¤ì(€€€µÀ¹á•‘‘Í…}Í¥¹•€ô™…±Í”ì(€€€µ•Í¡Ñ…ÍÑ¥}UÍ•ÈÕÍ•È€ôµ•Í¡Ñ…ÍÑ¥}UÍ•É}¥¹¥Ñ}é•É¼ì(€€€ÕÍ•È¹¥Í}±¥•¹Í•€ô½Ý¹•È¹¥Í}±¥•¹Í•ì(€€€ÍÑÉÁä¡ÕÍ•È¹±½¹}¹…µ”°€‰MÁ½½™•ˆ¤ì(€€€ÍÑÉÁä¡ÕÍ•È¹Í¡½ÉÑ}¹…µ”°€‰MAˆ¤ì((€€€QMQ}MMIQ}1M}5MM¡Í¡¥´¹¡…¹‘±•I••¥Ù•‘AÉ½Ñ½‰Õ˜¡µÀ°€™ÕÍ•È¤°€‰Ñ¡”Á…­•Ð¥ÑÍ•±˜µÕÍÐÍÑ¥±°‰”…•ÁÑ•ˆ¤ì(€€€QMQ}MMIQ}EU1}MQI%9}5MM ‰•¹Õ¥¹”ˆ°µ½­9½‘•´ù±½¹9…µ”¡I5=Q}9=¤°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰Õ¹Í¥¹•Õ¹¥…ÍÐ9½‘•%¹™¼™É½´„Í¥¹•ÈµÕÍÐ¹½ÐÉ•ÝÉ¥Ñ”¥ÑÌÍÑ½É•¹…µ”ˆ¤ì)ô((¼¼ØèÑ¡”Í…µ”•á¡…¹”Í¥¹•€´Ñ¡”ÕÁ‘…Ñ”¥Ì…ÕÑ¡•¹Ñ¥…Ñ•…¹µÕÍÐ±…¹°Á¥¹¹¥¹œÔ…Ì„(¼¼Ñ…É•Ñ•É•™ÕÍ…°É…Ñ¡•ÈÑ¡…¸„‰±…¹­•Ð‰±½¬½¸Õ¹¥…ÍÐ9½‘•%¹™¼™É½´Í¥¹•ÉÌ¸)Ù½¥Ñ•ÍÑ}8Ù}Í¥¹•‘}Õ¹¥…ÍÑ}¹½‘•¥¹™½}™É½µ}Í¥¹•É}¡…¹•Í}¹…µ”¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑM¥¹•É	¥Ð¡I5=Q}9=°ÑÉÕ”¤ì(€€€µ½­9½‘•´ùÍ•Ñ1½¹9…µ”¡I5=Q}9=°€‰•¹Õ¥¹”ˆ¤ì((€€€9½‘•%¹™½Q•ÍÑM¡¥´Í¡¥´ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐµÀ€ôµ…­••½‘•¡I5=Q}9=°1=1}9=°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}9=%9=}A@°M511}Ae1=¤ì(€€€µÀ¹á•‘‘Í…}Í¥¹•€ôÑÉÕ”ì(€€€µ•Í¡Ñ…ÍÑ¥}UÍ•ÈÕÍ•È€ôµ•Í¡Ñ…ÍÑ¥}UÍ•É}¥¹¥Ñ}é•É¼ì(€€€ÕÍ•È¹¥Í}±¥•¹Í•€ô½Ý¹•È¹¥Í}±¥•¹Í•ì(€€€ÍÑÉÁä¡ÕÍ•È¹±½¹}¹…µ”°€‰I•¹…µ•ˆ¤ì(€€€ÍÑÉÁä¡ÕÍ•È¹Í¡½ÉÑ}¹…µ”°€‰I94ˆ¤ì((€€€QMQ}MMIQ}1M¡Í¡¥´¹¡…¹‘±•I••¥Ù•‘AÉ½Ñ½‰Õ˜¡µÀ°€™ÕÍ•È¤¤ì(€€€QMQ}MMIQ}EU1}MQI%9}5MM ‰I•¹…µ•ˆ°µ½­9½‘•´ù±½¹9…µ”¡I5=Q}9=¤°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰„Í¥¹•ÕÁ‘…Ñ”™É½´„Í¥¹•ÈµÕÍÐÍÑ¥±°‰”±•…É¹•ˆ¤ì)ô((¼¼Üè„¹½‘”Ñ¡…Ð¡…Ì¹•Ù•ÈÍ¥¹•¥ÌÕ¹…™™•Ñ•€´Ñ¡”½É‘¥¹…Éä…Í”™½Èµ½ÍÐ½˜Ñ¡”µ•Í ¸)Ù½¥Ñ•ÍÑ}8Ý}Õ¹Í¥¹•‘}Õ¹¥…ÍÑ}¹½‘•¥¹™½}™É½µ}¹½¹Í¥¹•É}¡…¹•Í}¹…µ”¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì€¼¼Í¥¹•È‰¥Ð±•…È(€€€µ½­9½‘•´ùÍ•Ñ1½¹9…µ”¡I5=Q}9=°€‰•¹Õ¥¹”ˆ¤ì((€€€9½‘•%¹™½Q•ÍÑM¡¥´Í¡¥´ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐµÀ€ôµ…­••½‘•¡I5=Q}9=°1=1}9=°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}9=%9=}A@°M511}Ae1=¤ì(€€€µÀ¹á•‘‘Í…}Í¥¹•€ô™…±Í”ì(€€€µ•Í¡Ñ…ÍÑ¥}UÍ•ÈÕÍ•È€ôµ•Í¡Ñ…ÍÑ¥}UÍ•É}¥¹¥Ñ}é•É¼ì(€€€ÕÍ•È¹¥Í}±¥•¹Í•€ô½Ý¹•È¹¥Í}±¥•¹Í•ì(€€€ÍÑÉÁä¡ÕÍ•È¹±½¹}¹…µ”°€‰I•¹…µ•ˆ¤ì(€€€ÍÑÉÁä¡ÕÍ•È¹Í¡½ÉÑ}¹…µ”°€‰I94ˆ¤ì((€€€QMQ}MMIQ}1M¡Í¡¥´¹¡…¹‘±•I••¥Ù•‘AÉ½Ñ½‰Õ˜¡µÀ°€™ÕÍ•È¤¤ì(€€€QMQ}MMIQ}EU1}MQI%9}5MM ‰I•¹…µ•ˆ°µ½­9½‘•´ù±½¹9…µ”¡I5=Q}9=¤°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰¹½¸µÍ¥¹•È¥‘•¹Ñ¥Ñä±•…É¹¥¹œµÕÍÐ‰”Õ¹…™™•Ñ•ˆ¤ì)ô((¼¼€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´(¼¼8àµ8ÄÄèÑ¡”€ÄÉ É•Á±äµÍÕÁÁÉ•ÍÍ¥½¸Ý¥¹‘½Ü¸(¼¼(¼¼Q¡”ÍÑ…µÀ¥ÌÕÁÑ¥µ”M=9L°¹½Ðµ¥±±¥Í•½¹‘Ìè•¹ÑÉ¥•Ì±¥Ù”™½È…Ì±½¹œ…ÌÑ¡”¹½‘”ÍÑ…åÌ¥¸Ñ¡”(¼¼°Í¼„€ÌÈµ‰¥Ðµ¥±±¥Í•½¹ÍÑ…µÀ…±¥…Í•‰…¬¥¹Ñ¼Ñ¡”Ý¥¹‘½Ü½¹”ÕÁÑ¥µ”Á…ÍÍ•€Ðä¸Ü‘…åÌ…¹(¼¼ÍÕÁÁÉ•ÍÍ•„±•¥Ñ¥µ…Ñ”É•Á±ä™½ÈÕÀÑ¼€ÄÉ ¸É¥Ù•¸Ñ¡É½Õ Q¥µ”èéÍ•ÑQ•ÍÑ5¥±±¥Ì ¤É…Ñ¡•ÈÑ¡…¸‰ä(¼¼Ý…¥Ñ¥¹œ¸(¼¼€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´()ÍÑ…Ñ¥Œ½¹ÍÑ•áÁÈÕ¥¹ÐÌÉ}Ð­MÕÁÁÉ•ÍÍM•Ì€ô€ÄÈ€¨€ØÀ€¨€ØÀì((¼¼•±¥Ù•È„9½‘•%¹™¼É•ÅÕ•ÍÐ™É½´Í•¹‘•É€…¹É•Á½ÉÐÝ¡•Ñ¡•ÈÝ”Ý½Õ±É•Á±äÑ¼¥Ð¸)ÍÑ…Ñ¥Œ‰½½°Ý½Õ±‘I•Á±åQ½9½‘•%¹™½I•ÅÕ•ÍÐ¡9½‘•%¹™½Q•ÍÑM¡¥´€™Í¡¥´°9½‘•9Õ´Í•¹‘•È¤)ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐµÀ€ôµ…­••½‘•¡Í•¹‘•È°9=9U5}	I=MP°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}9=%9=}A@°M511}Ae1=¤ì(€€€µÀ¹‘•½‘•¹Ý…¹Ñ}É•ÍÁ½¹Í”€ôÑÉÕ”ì(€€€µ•Í¡Ñ…ÍÑ¥}UÍ•ÈÕÍ•È€ôµ•Í¡Ñ…ÍÑ¥}UÍ•É}¥¹¥Ñ}é•É¼ì(€€€ÕÍ•È¹¥Í}±¥•¹Í•€ô½Ý¹•È¹¥Í}±¥•¹Í•ì((€€€Í¡¥´¹¡…¹‘±•I••¥Ù•‘AÉ½Ñ½‰Õ˜¡µÀ°€™ÕÍ•È¤ì((€€€9½‘•%¹™½Q•ÍÑM¡¥´èéÕÉÉ•¹ÑI•ÅÕ•ÍÐ€ô€™µÀì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ð€©É•Á±ä€ôÍ¡¥´¹…±±½I•Á±ä ¤ì(€€€9½‘•%¹™½Q•ÍÑM¡¥´èéÕÉÉ•¹ÑI•ÅÕ•ÍÐ€ô¹Õ±±ÁÑÈì((€€€¥˜€¡É•Á±ä¤ì(€€€€€€€Á…­•ÑA½½°¹É•±•…Í”¡É•Á±ä¤ì(€€€€€€€É•ÑÕÉ¸ÑÉÕ”ì(€€€ô(€€€É•ÑÕÉ¸™…±Í”ì)ô((¼¼MÑ•ÀÑ¡”¥¹©•Ñ•±½¬Ñ¡”Ý…äÑ¡”µ…¥¸±½½À‘½•Ì€´…‘Ù…¹”°Ñ¡•¸ÁÕ‰±¥Í Ñ¡”ÝÉ…À…ÉÉä¸)ÍÑ…Ñ¥ŒÙ½¥…‘Ù…¹•UÁÑ¥µ”¡Õ¥¹ÐÌÉ}Ð‘•±Ñ…5Ì¤)ì(€€€Q¥µ”èé…‘Ù…¹•Q•ÍÑ5¥±±¥Ì¡‘•±Ñ…5Ì¤ì(€€€Q¥µ”èéÍ•ÉÙ¥•5½¹½Ñ½¹¥Œ ¤ì)ô()Ù½¥Ñ•ÍÑ}8á}Í•½¹‘}É•ÅÕ•ÍÑ}¥¹Í¥‘•}Ñ¡•}Ý¥¹‘½Ý}¥Í}ÍÕÁÁÉ•ÍÍ•¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€Q¥µ”èéÍ•ÑQ•ÍÑ5¥±±¥Ì ØÀ€¨€ÄÀÀÀ¤ì(€€€Q¥µ”èéÍ•ÉÙ¥•5½¹½Ñ½¹¥Œ ¤ì((€€€9½‘•%¹™½Q•ÍÑM¡¥´Í¡¥´ì(€€€QMQ}MMIQ}QIU}5MM¡Ý½Õ±‘I•Á±åQ½9½‘•%¹™½I•ÅÕ•ÍÐ¡Í¡¥´°I5=Q}9=¤°€‰™¥ÉÍÐÉ•ÅÕ•ÍÐµÕÍÐ‰”…¹ÍÝ•É•ˆ¤ì((€€€…‘Ù…¹•UÁÑ¥µ” ØÀ€¨€ØÀ€¨€ÄÀÀÀ¤ì€¼¼€Å ±…Ñ•È°Ý•±°¥¹Í¥‘”Ñ¡”€ÄÉ Ý¥¹‘½Ü(€€€QMQ}MMIQ}1M}5MM¡Ý½Õ±‘I•Á±åQ½9½‘•%¹™½I•ÅÕ•ÍÐ¡Í¡¥´°I5=Q}9=¤°€‰É•Á•…ÐÉ•ÅÕ•ÍÐ¥¹Í¥‘”€ÄÉ µÕÍÐ‰”ÍÕÁÁÉ•ÍÍ•ˆ¤ì)ô()Ù½¥Ñ•ÍÑ}8å}É•ÅÕ•ÍÑ}…™Ñ•É}Ñ¡•}Ý¥¹‘½Ý}¥Í}…¹ÍÝ•É•¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€Q¥µ”èéÍ•ÑQ•ÍÑ5¥±±¥Ì ØÀ€¨€ÄÀÀÀ¤ì(€€€Q¥µ”èéÍ•ÉÙ¥•5½¹½Ñ½¹¥Œ ¤ì((€€€9½‘•%¹™½Q•ÍÑM¡¥´Í¡¥´ì(€€€QMQ}MMIQ}QIU¡Ý½Õ±‘I•Á±åQ½9½‘•%¹™½I•ÅÕ•ÍÐ¡Í¡¥´°I5=Q}9=¤¤ì((€€€…‘Ù…¹•UÁÑ¥µ” ¡­MÕÁÁÉ•ÍÍM•Ì€¬€ØÀ¤€¨€ÄÀÀÀ¤ì€¼¼€ÄÉ €¬„µ¥¹ÕÑ”(€€€QMQ}MMIQ}QIU}5MM¡Ý½Õ±‘I•Á±åQ½9½‘•%¹™½I•ÅÕ•ÍÐ¡Í¡¥´°I5=Q}9=¤°€‰É•ÅÕ•ÍÐ…™Ñ•È€ÄÉ µÕÍÐ‰”…¹ÍÝ•É•ˆ¤ì)ô((¼¼Q¡”É•É•ÍÍ¥½¸¸ÍÑ…µÀ¥Ì½¹±ä…±¥…Í•‰ä„½Õ¹Ñ•ÈÑ¡…ÐÝÉ…ÁÌÕ¹‘•É¹•…Ñ ¥Ð°Í¼Ñ¡”™…¥±ÕÉ”(¼¼¹••‘Ì„€©™Õ±°¨€ÉxÌÈµÌ½˜ÕÁÑ¥µ”Ñ¼•±…ÁÍ”°¹½Ðµ•É•±ä„É½ÍÍ¥¹œ½˜Ñ¡”‰½Õ¹‘…ÉäèÝ¥Ñ €ÌÈµ‰¥Ð(¼¼µ¥±±¥Í•½¹ÍÑ…µÁÌ¹½Ü€´ÍÑ…µÁ€Ñ¡•¸½µÁÕÑ•Ì…Ì€À…¹Ñ¡”Í•¹‘•È±½½­Ì±¥­”¥ÐÝ…Ì…¹ÍÝ•É•(¼¼Ñ¡¥Ì¥¹ÍÑ…¹Ð¸UÁÑ¥µ”Í•½¹‘Ì‘¼¹½ÐÝÉ…À™½È€ÄÌØå•…ÉÌ°Í¼Ñ¡”•¹ÑÉäÉ•…‘Ì…ÌøÐä¸Ü‘…åÌ½±¸)Ù½¥Ñ•ÍÑ}8ÄÁ}ÍÑ…±•}ÍÑ…µÁ}‘½•Í}¹½Ñ}…±¥…Í}…™Ñ•É}…}™Õ±±}ÝÉ…À¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€Q¥µ”èéÍ•ÑQ•ÍÑ5¥±±¥Ì ÁààÀÀÀÀÀÀÁÔ¤ì€¼¼øÈÐ¸à‘…åÌ½˜ÕÁÑ¥µ”(€€€Q¥µ”èéÍ•ÉÙ¥•5½¹½Ñ½¹¥Œ ¤ì((€€€9½‘•%¹™½Q•ÍÑM¡¥´Í¡¥´ì(€€€QMQ}MMIQ}QIU¡Ý½Õ±‘I•Á±åQ½9½‘•%¹™½I•ÅÕ•ÍÐ¡Í¡¥´°I5=Q}9=¤¤ì((€€€€¼¼Ý¡½±”µ¥±±¥Ì ¤å±”°¥¸ÑÝ¼Í•ÉÙ¥•¡…±Ù•Ì€´½¹”ÁÕ‰±¥Í Á•ÈÝ¥¹‘½Ü¥ÌÑ¡”½¹ÑÉ…Ð¸(€€€…‘Ù…¹•UÁÑ¥µ” ÁààÀÀÀÀÀÀÁÔ¤ì(€€€…‘Ù…¹•UÁÑ¥µ” ÁààÀÀÀÀÀÀÁÔ¤ì((€€€QMQ}MMIQ}QIU}5MM¡Ý½Õ±‘I•Á±åQ½9½‘•%¹™½I•ÅÕ•ÍÐ¡Í¡¥´°I5=Q}9=¤°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰„ÍÑ…µÀ½¹”™Õ±°ÝÉ…À½±µÕÍÐÉ•……ÌøÐä¸Ü‘…åÌ°¹½Ð…ÌÑ¡¥Ì¥¹ÍÑ…¹Ðˆ¤ì)ô((¼¼MÕÁÁÉ•ÍÍ¥½¸µÕÍÐÍÑ¥±°‰•¡…Ù”¹½Éµ…±±ä•¥Ñ¡•ÈÍ¥‘”½˜Ñ¡”‰½Õ¹‘…ÉäèÍÑ¥±°ÍÕÁÁÉ•ÍÍ¥¹œ¥¹Í¥‘”Ñ¡”(¼¼Ý¥¹‘½Ü°…¹…¹ÍÝ•É¥¹œ……¥¸½¹”€ÄÉ ¡…Ù”Á…ÍÍ•°Ý¥Ñ Ñ¡”ÍÑ…µÀ…¹Ñ¡”É•…‘¥¹œ½¸½ÁÁ½Í¥Ñ”(¼¼Í¥‘•Ì½˜Ñ¡”ÝÉ…À¸)Ù½¥Ñ•ÍÑ}8ÄÅ}Ý¥¹‘½Ý}ÍÑ¥±±}…ÁÁ±¥•Í}…É½ÍÍ}Ñ¡•}ÝÉ…À¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€Q¥µ”èéÍ•ÑQ•ÍÑ5¥±±¥Ì ÁáÀÀÀÁÔ¤ì€¼¼©ÕÍÐÍ¡½ÉÐ½˜Ñ¡”ÝÉ…À(€€€Q¥µ”èéÍ•ÉÙ¥•5½¹½Ñ½¹¥Œ ¤ì((€€€9½‘•%¹™½Q•ÍÑM¡¥´Í¡¥´ì(€€€QMQ}MMIQ}QIU¡Ý½Õ±‘I•Á±åQ½9½‘•%¹™½I•ÅÕ•ÍÐ¡Í¡¥´°I5=Q}9=¤¤ì((€€€…‘Ù…¹•UÁÑ¥µ” ÁàÈÀÀÀÁÔ¤ì€¼¼øÄÌÅÌ±…Ñ•È°…¹¹½ÜÁ…ÍÐÑ¡”ÝÉ…À(€€€QMQ}MMIQ}1M}5MM¡Ý½Õ±‘I•Á±åQ½9½‘•%¹™½I•ÅÕ•ÍÐ¡Í¡¥´°I5=Q}9=¤°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰Ñ¡”Ý¥¹‘½ÜµÕÍÐÍÑ¥±°‰¥Ñ”Ý¡•¸Ñ¡”ÍÑ…µÀÍ¥ÑÌÑ¡”½Ñ¡•ÈÍ¥‘”½˜Ñ¡”ÝÉ…Àˆ¤ì((€€€…‘Ù…¹•UÁÑ¥µ” ¡­MÕÁÁÉ•ÍÍM•Ì€¬€ØÀ¤€¨€ÄÀÀÀ¤ì(€€€QMQ}MMIQ}QIU}5MM¡Ý½Õ±‘I•Á±åQ½9½‘•%¹™½I•ÅÕ•ÍÐ¡Í¡¥´°I5=Q}9=¤°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰…¹µÕÍÐÍÑ¥±°É•±•…Í”½¹”€ÄÉ ¡…Ù”Á…ÍÍ•…É½ÍÌÑ¡”ÝÉ…Àˆ¤ì)ô()Ù½¥Ñ•ÍÑ}0Å}±¥•¹Í•‘}¹½‘•¥¹™½}ÁÕ‰±¥Í¡•Í}ÁÕ‰±¥}­•ä¡Ù½¥¤)ì(€€€½Ý¹•È¹¥Í}±¥•¹Í•€ôÑÉÕ”ì(€€€½Ý¹•È¹ÁÕ‰±¥}­•ä¹Í¥é”€ô€ÌÈì(€€€µ•µÍ•Ð¡½Ý¹•È¹ÁÕ‰±¥}­•ä¹‰åÑ•Ì°€ÁàÕ°½Ý¹•È¹ÁÕ‰±¥}­•ä¹Í¥é”¤ì((€€€9½‘•%¹™½Q•ÍÑM¡¥´Í¡¥´ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ð€©É•Á±ä€ôÍ¡¥´¹…±±½I•Á±ä ¤ì(€€€QMQ}MMIQ}9=Q}9U10¡É•Á±ä¤ì(€€€µ•Í¡Ñ…ÍÑ¥}UÍ•ÈÁÕ‰±¥Í¡•€ôµ•Í¡Ñ…ÍÑ¥}UÍ•É}¥¹¥Ñ}é•É¼ì(€€€QMQ}MMIQ}QIU (€€€€€€€Á‰}‘•½‘•}™É½µ}‰åÑ•Ì¡É•Á±ä´ù‘•½‘•¹Á…å±½…¹‰åÑ•Ì°É•Á±ä´ù‘•½‘•¹Á…å±½…¹Í¥é”°€™µ•Í¡Ñ…ÍÑ¥}UÍ•É}µÍœ°€™ÁÕ‰±¥Í¡•¤¤ì(€€€QMQ}MMIQ}QIU¡ÁÕ‰±¥Í¡•¹¥Í}±¥•¹Í•¤ì(€€€QMQ}MMIQ}EU0 ÌÈ°ÁÕ‰±¥Í¡•¹ÁÕ‰±¥}­•ä¹Í¥é”¤ì(€€€QMQ}MMIQ}EU1}U%9Pá}IId¡½Ý¹•È¹ÁÕ‰±¥}­•ä¹‰åÑ•Ì°ÁÕ‰±¥Í¡•¹ÁÕ‰±¥}­•ä¹‰åÑ•Ì°€ÌÈ¤ì(€€€Á…­•ÑA½½°¹É•±•…Í”¡É•Á±ä¤ì)ô()Ù½¥Ñ•ÍÑ}0É}±¥•¹Í•‘}¥‘•¹Ñ¥Ñå}­•å}¥Í}•¹•É…Ñ•‘}…¹‘}ÁÉ•Í•ÉÙ•¡Ù½¥¤)ì(€€€½Ý¹•È¹¥Í}±¥•¹Í•€ôÑÉÕ”ì(€€€½¹™¥œ¹±½É„¹É•¥½¸€ôµ•Í¡Ñ…ÍÑ¥}½¹™¥}1½I…½¹™¥}I•¥½¹½‘•}ULì(€€€½¹™¥œ¹Í•ÕÉ¥Ñä€ôµ•Í¡Ñ…ÍÑ¥}½¹™¥}M•ÕÉ¥Ñå½¹™¥}¥¹¥Ñ}é•É¼ì((€€€QMQ}MMIQ}QIU¡µ½­9½‘•´ù•¹•É…Ñ•ÉåÁÑ½-•åA…¥È ¤¤ì(€€€Õ¥¹Ðá}ÐÁÉ¥Ù…Ñ•-•ålÌÉt°ÁÕ‰±¥-•ålÌÉtì(€€€µ•µÁä¡ÁÉ¥Ù…Ñ•-•ä°½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÉ¥Ù…Ñ•}­•ä¹‰åÑ•Ì°Í¥é•½˜¡ÁÉ¥Ù…Ñ•-•ä¤¤ì(€€€µ•µÁä¡ÁÕ‰±¥-•ä°½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÕ‰±¥}­•ä¹‰åÑ•Ì°Í¥é•½˜¡ÁÕ‰±¥-•ä¤¤ì(€€€½¹ÍÐ9½‘•9Õ´µ¥É…Ñ•‘9½‘•9Õ´€ôµå9½‘•%¹™¼¹µå}¹½‘•}¹Õ´ì(€€€QMQ}MMIQ}9=Q}EU0¡1=1}9=°µ¥É…Ñ•‘9½‘•9Õ´¤ì(€€€QMQ}MMIQ}QIU¡µ½­9½‘•´ù±¥•¹Í•‘%‘•¹Ñ¥Ñå5¥É…Ñ¥½¹A•¹‘¥¹œ¤ì((€€€5½­5•Í¡M•ÉÙ¥”µ½­M•ÉÙ¥”ì(€€€Í•ÉÙ¥”€ô€™µ½­M•ÉÙ¥”ì(€€€QMQ}MMIQ}QIU¡µ½­9½‘•´ù¹½Ñ¥™åA•¹‘¥¹1¥•¹Í•‘%‘•¹Ñ¥Ñå5¥É…Ñ¥½¸ ¤¤ì(€€€QMQ}MMIQ}EU0 Ä°µ½­M•ÉÙ¥”¹¹½Ñ¥™¥…Ñ¥½¹½Õ¹Ð¤ì(€€€QMQ}MMIQ}1M¡µ½­9½‘•´ù±¥•¹Í•‘%‘•¹Ñ¥Ñå5¥É…Ñ¥½¹A•¹‘¥¹œ¤ì(€€€QMQ}MMIQ}1M¡µ½­9½‘•´ù¹½Ñ¥™åA•¹‘¥¹1¥•¹Í•‘%‘•¹Ñ¥Ñå5¥É…Ñ¥½¸ ¤¤ì(€€€QMQ}MMIQ}EU0 Ä°µ½­M•ÉÙ¥”¹¹½Ñ¥™¥…Ñ¥½¹½Õ¹Ð¤ì(€€€Í•ÉÙ¥”€ôÁ¥Á•±¥¹•M•ÉÙ¥”ì((€€€½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÕ‰±¥}­•ä¹Í¥é”€ô€Àì(€€€½Ý¹•È¹ÁÕ‰±¥}­•ä¹Í¥é”€ô€Àì(€€€QMQ}MMIQ}QIU¡µ½­9½‘•´ù•¹•É…Ñ•ÉåÁÑ½-•åA…¥È ¤¤ì(€€€QMQ}MMIQ}EU0¡µ¥É…Ñ•‘9½‘•9Õ´°µå9½‘•%¹™¼¹µå}¹½‘•}¹Õ´¤ì(€€€QMQ}MMIQ}EU1}U%9Pá}IId¡ÁÉ¥Ù…Ñ•-•ä°½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÉ¥Ù…Ñ•}­•ä¹‰åÑ•Ì°Í¥é•½˜¡ÁÉ¥Ù…Ñ•-•ä¤¤ì(€€€QMQ}MMIQ}EU1}U%9Pá}IId¡ÁÕ‰±¥-•ä°½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÕ‰±¥}­•ä¹‰åÑ•Ì°Í¥é•½˜¡ÁÕ‰±¥-•ä¤¤ì(€€€QMQ}MMIQ}EU1}U%9Pá}IId¡ÁÕ‰±¥-•ä°½Ý¹•È¹ÁÕ‰±¥}­•ä¹‰åÑ•Ì°Í¥é•½˜¡ÁÕ‰±¥-•ä¤¤ì)ô()Ù½¥Ñ•ÍÑ}0Í}™…Ñ½Éå}½¹™¥}É•Í•Ñ}ÁÉ•Í•ÉÙ•Í}Ù…±¥‘}¥‘•¹Ñ¥Ñå}ÁÉ¥Ù…Ñ•}­•ä¡Ù½¥¤)ì(€€€Õ¥¹Ðá}ÐÁÕ‰±¥-•ålÌÉt°ÁÉ¥Ù…Ñ•-•ålÌÉtì(€€€ÉåÁÑ¼´ù•¹•É…Ñ•-•åA…¥È¡ÁÕ‰±¥-•ä°ÁÉ¥Ù…Ñ•-•ä¤ì(€€€½¹™¥œ¹¡…Í}Í•ÕÉ¥Ñä€ôÑÉÕ”ì(€€€½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÉ¥Ù…Ñ•}­•ä¹Í¥é”€ô€ÌÈì(€€€µ•µÁä¡½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÉ¥Ù…Ñ•}­•ä¹‰åÑ•Ì°ÁÉ¥Ù…Ñ•-•ä°Í¥é•½˜¡ÁÉ¥Ù…Ñ•-•ä¤¤ì((€€€µ½­9½‘•´ù¥¹ÍÑ…±±•™…Õ±ÑÍAÉ•Í•ÉÙ¥¹%‘•¹Ñ¥Ñä ¤ì(€€€QMQ}MMIQ}EU0 ÌÈ°½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÉ¥Ù…Ñ•}­•ä¹Í¥é”¤ì(€€€QMQ}MMIQ}EU1}U%9Pá}IId¡ÁÉ¥Ù…Ñ•-•ä°½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÉ¥Ù…Ñ•}­•ä¹‰åÑ•Ì°Í¥é•½˜¡ÁÉ¥Ù…Ñ•-•ä¤¤ì(€€€QMQ}MMIQ}EU0 À°½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÕ‰±¥}­•ä¹Í¥é”¤ì((€€€½Ý¹•È¹¥Í}±¥•¹Í•€ôÑÉÕ”ì(€€€½¹™¥œ¹±½É„¹É•¥½¸€ôµ•Í¡Ñ…ÍÑ¥}½¹™¥}1½I…½¹™¥}I•¥½¹½‘•}ULì(€€€QMQ}MMIQ}QIU¡µ½­9½‘•´ù•¹•É…Ñ•ÉåÁÑ½-•åA…¥È ¤¤ì(€€€QMQ}MMIQ}EU1}U%9Pá}IId¡ÁÉ¥Ù…Ñ•-•ä°½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÉ¥Ù…Ñ•}­•ä¹‰åÑ•Ì°Í¥é•½˜¡ÁÉ¥Ù…Ñ•-•ä¤¤ì(€€€QMQ}MMIQ}EU1}U%9Pá}IId¡ÁÕ‰±¥-•ä°½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÕ‰±¥}­•ä¹‰åÑ•Ì°Í¥é•½˜¡ÁÕ‰±¥-•ä¤¤ì)ô()Ù½¥Ñ•ÍÑ}0Ñ}±¥•¹Í•‘}±½Ý}•¹ÑÉ½Áå}¥‘•¹Ñ¥Ñå}¥Í}É••¹•É…Ñ•¡Ù½¥¤)ì(€€€ÍÑ…Ñ¥Œ½¹ÍÐÕ¥¹Ðá}Ð½µÁÉ½µ¥Í•‘AÕ‰±¥-•ålÌÉt€ôì(€€€€€€€€Áá…Œ°€Áá…˜°€ÁàáŒ°€ÁàÅŒ°€ÁàÍŒ°€ÁàÅŒ°€ÁàÌÜ°€Áá…Œ°€ÁàÑ˜°€ÁàÀÌ°€Áá„Ä°€Áá”ä°€Áá™Œ°€ÁàÌÜ°€ÁàÈÌ°€ÁàÈä°(€€€€€€€€ÁáŒà°€Áá„Ì°€ÁàÕ°€ÁàÝ˜°€ÁàÀÔ°€ÁàÈØ°€Áá•ˆ°€ÁàÀÀ°€Áá‰°€ÁàÈØ°€Ááˆà°€ÁàÉ”°€ÁáˆÄ°€ÁàäÐ°€ÁàÝ°€ÁàÈÐ°(€€€ôì(€€€½Ý¹•È¹¥Í}±¥•¹Í•€ôÑÉÕ”ì(€€€½¹™¥œ¹±½É„¹É•¥½¸€ôµ•Í¡Ñ…ÍÑ¥}½¹™¥}1½I…½¹™¥}I•¥½¹½‘•}ULì(€€€½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÉ¥Ù…Ñ•}­•ä¹Í¥é”€ô€ÌÈì(€€€µ•µÍ•Ð¡½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÉ¥Ù…Ñ•}­•ä¹‰åÑ•Ì°€ÁáÔ°€ÌÈ¤ì(€€€½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÕ‰±¥}­•ä¹Í¥é”€ô€ÌÈì(€€€µ•µÁä¡½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÕ‰±¥}­•ä¹‰åÑ•Ì°½µÁÉ½µ¥Í•‘AÕ‰±¥-•ä°Í¥é•½˜¡½µÁÉ½µ¥Í•‘AÕ‰±¥-•ä¤¤ì(€€€QMQ}MMIQ}QIU¡µ½­9½‘•´ù¡•­1½Ý¹ÑÉ½ÁåAÕ‰±¥-•ä¡½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÕ‰±¥}­•ä¤¤ì((€€€Õ¥¹Ðá}Ð½±‘AÉ¥Ù…Ñ•-•ålÌÉtì(€€€µ•µÁä¡½±‘AÉ¥Ù…Ñ•-•ä°½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÉ¥Ù…Ñ•}­•ä¹‰åÑ•Ì°Í¥é•½˜¡½±‘AÉ¥Ù…Ñ•-•ä¤¤ì(€€€QMQ}MMIQ}QIU¡µ½­9½‘•´ù•¹•É…Ñ•ÉåÁÑ½-•åA…¥È ¤¤ì(€€€QMQ}MMIQ}QIU¡µ½­9½‘•´ù­•å%Í1½Ý¹ÑÉ½Áä¤ì(€€€QMQ}MMIQ}1M¡µ½­9½‘•´ù¡•­1½Ý¹ÑÉ½ÁåAÕ‰±¥-•ä¡½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÕ‰±¥}­•ä¤¤ì(€€€QMQ}MMIQ}1M¡µ•µµÀ¡½±‘AÉ¥Ù…Ñ•-•ä°½¹™¥œ¹Í•ÕÉ¥Ñä¹ÁÉ¥Ù…Ñ•}­•ä¹‰åÑ•Ì°Í¥é•½˜¡½±‘AÉ¥Ù…Ñ•-•ä¤¤€ôô€À¤ì)ô((¼¼€ôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôô(¼¼É½ÕÀ€´•¹½‘¥¹œ¥¹Ù…É¥…¹ÑÌÑ¡”É½ÕÑ¥¹œ…Ñ•Ì‘•Á•¹½¸(¼¼€ôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôô((¼¼ÄèÑ¡”•¹½‘•½Ù•É¡•…½˜Ñ¡”Í¥¹…ÑÕÉ”™¥•±µÕÍÐ‰”•á…Ñ±äaM}M%9QUI}%1}	eQL(¼¼€ ÄÑ…œ‰åÑ”€¬€Ä±•¹Ñ ‰åÑ”€¬€ØÐÍ¥¹…ÑÕÉ”‰åÑ•Ì¤¸Q¡”É••¥Ù•È‘½Ý¹É…‘”ÁÉ•‘¥…Ñ”…‘‘ÌÑ¡¥Ì(¼¼½¹ÍÑ…¹ÐÑ¼Ñ¡”Õ¹Í¥¹•Í¥é”ìÑ¡¥ÌÑ•ÍÐÁ¥¹ÌÑ¡…Ð¥Ðµ…Ñ¡•ÌÑ¡”É•…°Ý¥É”½Ù•É¡•…Ñ¡”(¼¼Í•¹‘•ÈÌ•¹½‘•ÈÁÉ½‘Õ•Ì°­••Á¥¹œÑ¡”ÑÝ¼Í¥‘•ÌÍåµµ•ÑÉ¥Œ¸%Ð‘É¥™ÑÌ¥˜Ñ¡”™¥•±¹Õµ‰•È•Ù•È(¼¼µ½Ù•ÌÑ¼€øô€ÄØ½ÈÑ¡”Í¥¹…ÑÕÉ”É½ÝÌÁ…ÍÐ€ÄÈÜ‰åÑ•Ì¸)Ù½¥Ñ•ÍÑ}Å}Í¥¹…ÑÕÉ•}™¥•±‘}½Ù•É¡•…‘}•á…Ð¡Ù½¥¤)ì(€€€µ•Í¡Ñ…ÍÑ¥}…Ñ„€ôµ•Í¡Ñ…ÍÑ¥}…Ñ…}¥¹¥Ñ}é•É¼ì(€€€¹Á½ÉÑ¹Õ´€ôµ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}QaQ}5MM}A@ì(€€€¹Á…å±½…¹Í¥é”€ô€ÄÀÀì((€€€½¹ÍÐÍ¥é•}ÐÝ¥Ñ¡½ÕÐ€ô•¹½‘•‘…Ñ…M¥é” ™¤ì(€€€¹á•‘‘Í…}Í¥¹…ÑÕÉ”¹Í¥é”€ôaM}M%9QUI}M%iì(€€€½¹ÍÐÍ¥é•}ÐÝ¥Ñ €ô•¹½‘•‘…Ñ…M¥é” ™¤ì((€€€QMQ}MMIQ}EU1}5MM¡aM}M%9QUI}%1}	eQL°Ý¥Ñ €´Ý¥Ñ¡½ÕÐ°€‰Í¥¹…ÑÕÉ”™¥•±Ý¥É”½Ù•É¡•…‘É¥™Ñ•ˆ¤ì)ô((¼¼€ôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôô(¼¼É½ÕÀ€´‘•½‘•µ¥¹É•ÍÌÁ½±¥ä€¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä¤(¼¼€ôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôôô(¼¼±É•…‘äµ‘•½‘•Á…­•ÑÌ¹•Ù•ÈÉ•… Á•É¡…ÁÍ•½‘”ÌÉåÁÑ¼Á…Ñ €¡¥Ð•…É±äµÉ•ÑÕÉ¹Ì¤°Í¼(¼¼Á±…¥¹Ñ•áÐµ5EQP‘½Ý¹±¥¹¬…ÁÁ±¥•ÌÑ¡¥ÌÁ½±¥ä™Õ¹Ñ¥½¸‘¥É•Ñ±ä…Ð¥¹É•ÍÌ€¡5EQP¹ÁÀ¤¸Q¡•Í”(¼¼Ñ•ÍÑÌ‘É¥Ù”¥ÐÑ¡”Í…µ”Ý…äè‘•½‘•Á…­•ÑÌ°Í¥é•™É½´À´ù‘•½‘••á…Ñ±ä…ÌÑ¡”IÁ…Ñ ¥Ì¸(¼¼¹µÑ¼µ•¹5EQPÝ¥É¥¹œ¥Ì½Ù•É•¥¸Ñ•ÍÑ}µÅÑÐ¸((¼¼ÄèÕ¹Í¥¹•Íµ…±°‰É½…‘…ÍÐ™É½´„­¹½Ý¸Í¥¹•È€´ø‘É½ÁÁ•€¡‘½Ý¹É…‘”ÁÉ½Ñ•Ñ¥½¸¡½±‘Ì½¸(¼¼Ñ¡”‘•½‘•µ¥¹É•ÍÌÁ…Ñ Ñ½¼€´Ñ¡”Ì‰åÁ…ÍÌ¤¸)Ù½¥Ñ•ÍÑ}Å}‘•½‘•‘}Õ¹Í¥¹•‘}‰É½…‘…ÍÑ}™É½µ}Í¥¹•É}‘É½ÁÁ•¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑM¥¹•É	¥Ð¡I5=Q}9=°ÑÉÕ”¤ì((€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­••½‘•¡I5=Q}9=°9=9U5}	I=MP°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}QaQ}5MM}A@°M511}Ae1=¤ì((€€€QMQ}MMIQ}1M¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä ™À¤¤ì)ô((¼¼ÈèÕ¹Í¥¹•‰É½…‘…ÍÐ™É½´„¹½¸µÍ¥¹•È€´ø…•ÁÑ•¸)Ù½¥Ñ•ÍÑ}É}‘•½‘•‘}Õ¹Í¥¹•‘}‰É½…‘…ÍÑ}™É½µ}¹½¹Í¥¹•É}…•ÁÑ•¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì€¼¼Í¥¹•È‰¥Ð±•…È((€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­••½‘•¡I5=Q}9=°9=9U5}	I=MP°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}QaQ}5MM}A@°M511}Ae1=¤ì((€€€QMQ}MMIQ}QIU¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä ™À¤¤ì(€€€QMQ}MMIQ}1M¡À¹á•‘‘Í…}Í¥¹•¤ì)ô((¼¼ÌèÙ…±¥Í¥¹…ÑÕÉ”Ý¥Ñ „­¹½Ý¸­•ä€´ø…•ÁÑ•°µ…É­•Ù•É¥™¥•°Í¥¹•È‰¥Ð±•…É¹•¸)Ù½¥Ñ•ÍÑ}Í}‘•½‘•‘}Ù…±¥‘}Í¥¹…ÑÕÉ•}Ù•É¥™¥•‘}…¹‘}±•…É¹Í}Í¥¹•È¡Ù½¥¤)ì(€€€Õ¥¹Ðá}ÐÁÕ‰lÌÉt°ÁÉ¥ÙlÌÉtì(€€€ÉåÁÑ¼´ù•¹•É…Ñ•-•åA…¥È¡ÁÕˆ°ÁÉ¥Ø¤ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑAÕ‰±¥-•ä¡I5=Q}9=°ÁÕˆ¤ì((€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­••½‘•¡I5=Q}9=°9=9U5}	I=MP°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}QaQ}5MM}A@°M511}Ae1=¤ì(€€€Í¥¹]¥Ñ¡ÕÉÉ•¹Ñ-•ä ™À¤ì((€€€QMQ}MMIQ}QIU¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä ™À¤¤ì(€€€QMQ}MMIQ}QIU¡À¹á•‘‘Í…}Í¥¹•¤ì(€€€QMQ}MMIQ}QIU}5MM¡É•µ½Ñ•M¥¹•É	¥Ð ¤°€‰Ù•É¥™¥•Í¥¹…ÑÕÉ”µÕÍÐÍ•ÐÑ¡”Í¥¹•È‰¥Ðˆ¤ì)ô((¼¼Ðè½ÉÉÕÁÑ•Í¥¹…ÑÕÉ”Ý¥Ñ „­¹½Ý¸­•ä€´ø‘É½ÁÁ•¸)Ù½¥Ñ•ÍÑ}Ñ}‘•½‘•‘}‰…‘}Í¥¹…ÑÕÉ•}‘É½ÁÁ•¡Ù½¥¤)ì(€€€Õ¥¹Ðá}ÐÁÕ‰lÌÉt°ÁÉ¥ÙlÌÉtì(€€€ÉåÁÑ¼´ù•¹•É…Ñ•-•åA…¥È¡ÁÕˆ°ÁÉ¥Ø¤ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑAÕ‰±¥-•ä¡I5=Q}9=°ÁÕˆ¤ì((€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­••½‘•¡I5=Q}9=°9=9U5}	I=MP°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}QaQ}5MM}A@°M511}Ae1=¤ì(€€€Í¥¹]¥Ñ¡ÕÉÉ•¹Ñ-•ä ™À¤ì(€€€À¹‘•½‘•¹á•‘‘Í…}Í¥¹…ÑÕÉ”¹‰åÑ•ÍlÁtxô€Ááì((€€€QMQ}MMIQ}1M¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä ™À¤¤ì(€€€QMQ}MMIQ}1M¡À¹á•‘‘Í…}Í¥¹•¤ì)ô((¼¼ÔèÕ¹Í¥¹•½Ù•ÉÍ¥é•‰É½…‘…ÍÐ™É½´„Í¥¹•È€´ø…•ÁÑ•€¡Á…­•ÑÌÝ¡½Í”Í¥¹••¹½‘¥¹œ(¼¼Ý½Õ±‘¸Ð™¥Ð…É”•á•µÁÐ°¥‘•¹Ñ¥…±±äÑ¼Ñ¡”IÁ…Ñ è‰½Ñ Í¥é”À´ù‘•½‘•¤¸)Ù½¥Ñ•ÍÑ}Õ}‘•½‘•‘}Õ¹Í¥¹•‘}½Ù•ÉÍ¥é•‘}‰É½…‘…ÍÑ}™É½µ}Í¥¹•É}…•ÁÑ•¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑM¥¹•É	¥Ð¡I5=Q}9=°ÑÉÕ”¤ì((€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­••½‘•¡I5=Q}9=°9=9U5}	I=MP°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}QaQ}5MM}A@°=YIM%i}Ae1=¤ì((€€€QMQ}MMIQ}QIU¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä ™À¤¤ì)ô((¼¼Øè	…±…¹•…•ÁÑÌÕ¹Í¥¹•Õ¹¥…ÍÐ™É½´„Í¥¹•È™½È±•…ä½µÁ…Ñ¥‰¥±¥Ñä¸)Ù½¥Ñ•ÍÑ}Ù}‘•½‘•‘}Õ¹Í¥¹•‘}Õ¹¥…ÍÑ}™É½µ}Í¥¹•É}…•ÁÑ•¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑM¥¹•É	¥Ð¡I5=Q}9=°ÑÉÕ”¤ì((€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­••½‘•¡I5=Q}9=°1=1}9=°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}AI%YQ}A@°M511}Ae1=¤ì((€€€QMQ}MMIQ}QIU¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä ™À¤¤ì)ô((¼¼àè„É…™Ñ•Á…ÉÑ¥…°€¡¹½¸´À°¹½¸´ØÐ¤Í¥¹…ÑÕÉ”µÕÍÐ¹½Ð±•Ð„™½É•‰É½…‘…ÍÐ‘½‘”Ñ¡”(¼¼‘½Ý¹É…‘”‘É½À¸€ØÌµ‰åÑ”©Õ¹¬Í¥¹…ÑÕÉ”¥¹™±…Ñ•ÌÑ¡”•¹½‘•Í¥é”Á…ÍÐÑ¡”™¥ÐÑ¡É•Í¡½±°Í¼(¼¼„Í¥é”µ½¹±äÁÉ•‘¥…Ñ”Ý½Õ±ÑÉ•…ÐÑ¡”Á…­•Ð…Ì€‰Ñ½¼‰¥œÑ¼Í¥¸ˆ…¹…•ÁÐ¥Ð…Ì…¸(¼¼¥µÁ•ÉÍ½¹…Ñ¥½¸½˜Í¥¹•ÈI5=Q¸Q¡”µ…±™½Éµ•µÍ¥é”É•©•Ð‘É½ÁÌ¥Ð‰•™½É”Ñ¡…Ðµ…Ñ ÉÕ¹Ì¸)Ù½¥Ñ•ÍÑ}á}‘•½‘•‘}Á…ÉÑ¥…±}Í¥¹…ÑÕÉ•}™É½µ}Í¥¹•É}‘É½ÁÁ•¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑM¥¹•É	¥Ð¡I5=Q}9=°ÑÉÕ”¤ì((€€€€¼¼€ÄÐØµ‰åÑ”Á…å±½…Í¥ÑÌ¥¸Ñ¡”‰…¹Ñ¡…Ð]=U1™¥Ð„Í¥¹…ÑÕÉ”€¡Í¼…¸¡½¹•ÍÐÕ¹Í¥¹•½¹”¥Ì„(€€€€¼¼‘½Ý¹É…‘”¤°‰ÕÐÑ¡”€ØÌ‰½ÕÌÍ¥¹…ÑÕÉ”‰åÑ•ÌÁÕÍ Ñ¡”É…ÜÍ¥é”½Ù•ÈÑ¡”™É…µ”±¥µ¥Ð¸(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­••½‘•¡I5=Q}9=°9=9U5}	I=MP°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}QaQ}5MM}A@°€ÄÐØ¤ì(€€€À¹‘•½‘•¹á•‘‘Í…}Í¥¹…ÑÕÉ”¹Í¥é”€ôaM}M%9QUI}M%i€´€Äì(€€€µ•µÍ•Ð¡À¹‘•½‘•¹á•‘‘Í…}Í¥¹…ÑÕÉ”¹‰åÑ•Ì°€Áá°À¹‘•½‘•¹á•‘‘Í…}Í¥¹…ÑÕÉ”¹Í¥é”¤ì((€€€QMQ}MMIQ}1M}5MM¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä ™À¤°€‰Á…ÉÑ¥…°Í¥¹…ÑÕÉ”™É½´„Í¥¹•ÈµÕÍÐ‰”‘É½ÁÁ•ˆ¤ì(€€€QMQ}MMIQ}1M¡À¹á•‘‘Í…}Í¥¹•¤ì)ô((¼¼äèÑ¡”µ…±™½Éµ•µÍ¥é”É•©•Ð¥ÌÕ¹½¹‘¥Ñ¥½¹…°€´„Á…ÉÑ¥…°Í¥¹…ÑÕÉ”¥Ì‘É½ÁÁ••Ù•¸™É½´„(¼¼¹½‘”Ý”Ù”¹•Ù•ÈÍ••¸Í¥¸€¡…¸¡½¹•ÍÐÍ•¹‘•È¹•Ù•È•µ¥ÑÌ„€Ä¸¸ØÌµ‰åÑ”Í¥¹…ÑÕÉ”™¥•±¤¸)Ù½¥Ñ•ÍÑ}å}‘•½‘•‘}Á…ÉÑ¥…±}Í¥¹…ÑÕÉ•}™É½µ}¹½¹Í¥¹•É}‘É½ÁÁ•¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì€¼¼Í¥¹•È‰¥Ð±•…È((€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­••½‘•¡I5=Q}9=°9=9U5}	I=MP°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}QaQ}5MM}A@°M511}Ae1=¤ì(€€€À¹‘•½‘•¹á•‘‘Í…}Í¥¹…ÑÕÉ”¹Í¥é”€ô€ÄÀì(€€€µ•µÍ•Ð¡À¹‘•½‘•¹á•‘‘Í…}Í¥¹…ÑÕÉ”¹‰åÑ•Ì°€ÁàÕ°À¹‘•½‘•¹á•‘‘Í…}Í¥¹…ÑÕÉ”¹Í¥é”¤ì((€€€QMQ}MMIQ}1M}5MM¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä ™À¤°€‰Á…ÉÑ¥…°Í¥¹…ÑÕÉ”µÕÍÐ‰”‘É½ÁÁ•…Ìµ…±™½Éµ•ˆ¤ì)ô((¼¼	Õ¥±…¸Õ¹Í¥¹•‰É½…‘…ÍÐÝ¡½Í”¥¹¹•Èµ•ÍÍ…”¥ÌÁ…‘‘•Ý¥Ñ …¸Õ¹­¹½Ý¸™¥•±°…¹Á¥¸Ñ¡…ÐÑ¡”(¼¼Á…‘‘¥¹œÁÕÍ¡•ÌÑ¡”I\Í¥é”Á…ÍÐÑ¡”™¥ÐÑ¡É•Í¡½±€´Ñ¡”•á•µÁÑ¥½¸Ñ¡”…ÑÑ…­•È¥Ì‰Õå¥¹œ€´Ý¡¥±”(¼¼Ñ¡”™É…µ”ÍÑ…åÌÍ•¹‘…‰±”¸]¥Ñ¡½ÕÐ…¹½¹¥…°¥¹¹•ÈÍ¥é¥¹œÑ¡•Í”Á…­•ÑÌ…É”ÝÉ½¹±ä…•ÁÑ•¸)ÍÑ…Ñ¥Œµ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•Ðµ…­•A…å±½…‘A…‘‘•‘	É½…‘…ÍÐ¡µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õ´Á½ÉÐ°½¹ÍÐÁ‰}µÍ‘•Í}Ð€©™¥•±‘Ì°½¹ÍÐÙ½¥€©¥¹¹•È°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€Í¥é•}ÐÁ…‘1•¸¤)ì(€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­••½‘•¡I5=Q}9=°9=9U5}	I=MP°Á½ÉÐ°€À¤ì(€€€½¹ÍÐÍ¥é•}Ð¥¹¹•É1•¸€ôÁ‰}•¹½‘•}Ñ½}‰åÑ•Ì¡À¹‘•½‘•¹Á…å±½…¹‰åÑ•Ì°Í¥é•½˜¡À¹‘•½‘•¹Á…å±½…¹‰åÑ•Ì¤°™¥•±‘Ì°¥¹¹•È¤ì(€€€QMQ}MMIQ}IQI}Q!9}5MM À°¥¹¹•É1•¸°€‰™…¥±•Ñ¼•¹½‘”Ñ¡”ÍÁ½½™•¥¹¹•Èµ•ÍÍ…”ˆ¤ì(€€€À¹‘•½‘•¹Á…å±½…¹Í¥é”€ô(€€€€€€€¥¹¹•É1•¸€¬…ÁÁ•¹‘U¹­¹½Ý¹¥•±¡À¹‘•½‘•¹Á…å±½…¹‰åÑ•Ì€¬¥¹¹•É1•¸°Í¥é•½˜¡À¹‘•½‘•¹Á…å±½…¹‰åÑ•Ì¤€´¥¹¹•É1•¸°Á…‘1•¸¤ì((€€€QMQ}MMIQ}1M}5MM¡Í¥¹•‘¹½‘¥¹¥ÑÌ ™À¹‘•½‘•¤°€‰Á…‘‘¥¹œµÕÍÐÁÕÍ Ñ¡”É…ÜÍ¥é”Á…ÍÐÑ¡”™¥ÐÑ¡É•Í¡½±ˆ¤ì(€€€QMQ}MMIQ}1MM}=I}EU1}5MM¡5a}1=I}Ae1=}18°•¹½‘•‘…Ñ…M¥é” ™À¹‘•½‘•¤€¬5M!QMQ%}!I}19Q °(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰Á…‘‘•™É…µ”µÕÍÐÍÑ¥±°‰”½¹”„É…‘¥¼½Õ±Í•¹ˆ¤ì(€€€É•ÑÕÉ¸Àì)ô((¼¼ÄÀèÕ¹­¹½Ý¸™¥•±‘Ì‰ÕÉ¥•¥¹Í¥‘”…Ñ„¹Á…å±½……É”‘¥Í…É‘•‰äÑ¡”µ½‘Õ±”Ì½Ý¸Á‰}‘•½‘”°Í¼(¼¼Ñ¡•äµÕÍÐ¹½ÐÍÝ…äÑ¡”‘½Ý¹É…‘”‘•¥Í¥½¸Ñ¡”Ý…äÄÀ…±É•…‘äÁ¥¹Ì™½È…Ñ„µ±•Ù•°Õ¹­¹½Ý¸™¥•±‘Ì¸)Ù½¥Ñ•ÍÑ}ÄÁ}‘•½‘•‘}Õ¹Í¥¹•‘}Á½Í¥Ñ¥½¹}Á…‘‘•‘}¥¹Í¥‘•}Á…å±½…‘}‘É½ÁÁ•¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑM¥¹•É	¥Ð¡I5=Q}9=°ÑÉÕ”¤ì((€€€µ•Í¡Ñ…ÍÑ¥}A½Í¥Ñ¥½¸Á½Ì€ôµ•Í¡Ñ…ÍÑ¥}A½Í¥Ñ¥½¹}¥¹¥Ñ}é•É¼ì(€€€Á½Ì¹¡…Í}±…Ñ¥ÑÕ‘•}¤€ôÁ½Ì¹¡…Í}±½¹¥ÑÕ‘•}¤€ôÑÉÕ”ì(€€€Á½Ì¹±…Ñ¥ÑÕ‘•}¤€ô€ÌÜÄÈÌÐÔØÜì(€€€Á½Ì¹±½¹¥ÑÕ‘•}¤€ô€´ÄÈÈÄÈÌÐÔØÜì((€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­•A…å±½…‘A…‘‘•‘	É½…‘…ÍÐ¡µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}A=M%Q%=9}A@°€™µ•Í¡Ñ…ÍÑ¥}A½Í¥Ñ¥½¹}µÍœ°€™Á½Ì°€ÄØÌ¤ì((€€€QMQ}MMIQ}1M}5MM¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä ™À¤°€‰Á…å±½…µÁ…‘‘•Õ¹Í¥¹•A½Í¥Ñ¥½¸™É½´„Í¥¹•ÈµÕÍÐ‰”‘É½ÁÁ•ˆ¤ì(€€€QMQ}MMIQ}1M¡À¹á•‘‘Í…}Í¥¹•¤ì)ô((¼¼ÄÄè½Ù•Èµ½ÉÉ•Ñ¥½¸Õ…É¸Q•±•µ•ÑÉä€ ÈÜÈ‰åÑ•Ìµ…à¤…¹]…åÁ½¥¹Ð€ Äää¤…¸±•¥Ñ¥µ…Ñ•±ä•á••(¼¼Ñ¡”Í¥¹…‰±”‰Õ‘•Ð°Í¼…¹½¹¥…°Í¥é¥¹œµÕÍÐ¹½ÐÍ¡É¥¹¬…¸¡½¹•ÍÐ½¹”¥¹Ñ¼Ñ¡”‘É½ÀÉ…¹”¸)Ù½¥Ñ•ÍÑ}ÄÅ}‘•½‘•‘}Õ¹Í¥¹•‘}½Ù•ÉÍ¥é•‘}Ñ•±•µ•ÑÉå}™É½µ}Í¥¹•É}…•ÁÑ•¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑM¥¹•É	¥Ð¡I5=Q}9=°ÑÉÕ”¤ì((€€€µ•Í¡Ñ…ÍÑ¥}Q•±•µ•ÑÉäÐ€ôµ•Í¡Ñ…ÍÑ¥}Q•±•µ•ÑÉå}¥¹¥Ñ}é•É¼ì(€€€Ð¹Ý¡¥¡}Ù…É¥…¹Ð€ôµ•Í¡Ñ…ÍÑ¥}Q•±•µ•ÑÉå}¡½ÍÑ}µ•ÑÉ¥Í}Ñ…œì(€€€Ð¹Ù…É¥…¹Ð¹¡½ÍÑ}µ•ÑÉ¥Ì¹ÕÁÑ¥µ•}Í•½¹‘Ì€ô€ÄÈÌÐÔØì(€€€Ð¹Ù…É¥…¹Ð¹¡½ÍÑ}µ•ÑÉ¥Ì¹¡…Í}ÕÍ•É}ÍÑÉ¥¹œ€ôÑÉÕ”ì(€€€µ•µÍ•Ð¡Ð¹Ù…É¥…¹Ð¹¡½ÍÑ}µ•ÑÉ¥Ì¹ÕÍ•É}ÍÑÉ¥¹œ°€àœ°Í¥é•½˜¡Ð¹Ù…É¥…¹Ð¹¡½ÍÑ}µ•ÑÉ¥Ì¹ÕÍ•É}ÍÑÉ¥¹œ¤€´€Ä¤ì((€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­••½‘•¡I5=Q}9=°9=9U5}	I=MP°µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}Q15QIe}A@°€À¤ì(€€€À¹‘•½‘•¹Á…å±½…¹Í¥é”€ô(€€€€€€€Á‰}•¹½‘•}Ñ½}‰åÑ•Ì¡À¹‘•½‘•¹Á…å±½…¹‰åÑ•Ì°Í¥é•½˜¡À¹‘•½‘•¹Á…å±½…¹‰åÑ•Ì¤°€™µ•Í¡Ñ…ÍÑ¥}Q•±•µ•ÑÉå}µÍœ°€™Ð¤ì(€€€QMQ}MMIQ}IQI}Q!9}5MM À°À¹‘•½‘•¹Á…å±½…¹Í¥é”°€‰™…¥±•Ñ¼•¹½‘”Ñ¡”½Ù•ÉÍ¥é•Q•±•µ•ÑÉäˆ¤ì((€€€€¼¼Ù•Éä‰åÑ”¡•É”¥Ì„™¥•±Ñ¡¥Ì‰Õ¥±Õ¹‘•ÉÍÑ…¹‘Ì°Í¼…¹½¹¥…°Í¥é¥¹œµÕÍÐ±•…Ù”¥Ð…±½¹”¸(€€€QMQ}MMIQ}1M}5MM¡Í¥¹•‘¹½‘¥¹¥ÑÌ ™À¹‘•½‘•¤°€‰Ñ•±•µ•ÑÉäµÕÍÐ‰”Ñ½¼‰¥œÑ¼Í¥¸°•±Í”Ñ¡”Ñ•ÍÐ¥ÌÙ…Õ½ÕÌˆ¤ì((€€€QMQ}MMIQ}QIU}5MM¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä ™À¤°€‰¡½¹•ÍÐ½Ù•ÉÍ¥é•Ñ•±•µ•ÑÉä™É½´„Í¥¹•ÈµÕÍÐ¹½Ð‰”‘É½ÁÁ•ˆ¤ì)ô((¼¼ÄÈèÄÀ™½ÈÑ¡”]…åÁ½¥¹Ð‰É…¹ ½˜Ñ¡”…¹½¹¥…°µÍ¥é¥¹œÍÝ¥Ñ ¸)Ù½¥Ñ•ÍÑ}ÄÉ}‘•½‘•‘}Õ¹Í¥¹•‘}Ý…åÁ½¥¹Ñ}Á…‘‘•‘}¥¹Í¥‘•}Á…å±½…‘}‘É½ÁÁ•¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑM¥¹•É	¥Ð¡I5=Q}9=°ÑÉÕ”¤ì((€€€µ•Í¡Ñ…ÍÑ¥}]…åÁ½¥¹ÐÜ€ôµ•Í¡Ñ…ÍÑ¥}]…åÁ½¥¹Ñ}¥¹¥Ñ}é•É¼ì(€€€Ü¹¥€ô€ÐÈì(€€€Ü¹¡…Í}±…Ñ¥ÑÕ‘•}¤€ôÜ¹¡…Í}±½¹¥ÑÕ‘•}¤€ôÑÉÕ”ì(€€€Ü¹±…Ñ¥ÑÕ‘•}¤€ô€ÌÜÄÈÌÐÔØÜì(€€€Ü¹±½¹¥ÑÕ‘•}¤€ô€´ÄÈÈÄÈÌÐÔØÜì(€€€ÍÑÉÁä¡Ü¹¹…µ”°€‰ÍÁ½½™•ˆ¤ì((€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­•A…å±½…‘A…‘‘•‘	É½…‘…ÍÐ¡µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}]eA=%9Q}A@°€™µ•Í¡Ñ…ÍÑ¥}]…åÁ½¥¹Ñ}µÍœ°€™Ü°€ÄÔÀ¤ì((€€€QMQ}MMIQ}1M}5MM¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä ™À¤°€‰Á…å±½…µÁ…‘‘•Õ¹Í¥¹•]…åÁ½¥¹Ð™É½´„Í¥¹•ÈµÕÍÐ‰”‘É½ÁÁ•ˆ¤ì(€€€QMQ}MMIQ}1M¡À¹á•‘‘Í…}Í¥¹•¤ì)ô((¼¼ÄÌèÄÀ™½ÈÑ¡”9½‘•%¹™¼½UÍ•È‰É…¹ ¸I½ÕÑ•È‘É½ÁÌ¥Ð‰•™½É”É•‰É½…‘…ÍÐì9½‘•%¹™½5½‘Õ±”Ì½Ý¸(¼¼¡•¬€¡É½ÕÀ¤¥ÌÉ••¥Ù•Èµ±½…°…¹Ý½Õ±¹½ÐÍÑ½ÀÑ¡”Á…­•ÐÁÉ½Á……Ñ¥¹œ¸)Ù½¥Ñ•ÍÑ}ÄÍ}‘•½‘•‘}Õ¹Í¥¹•‘}¹½‘•¥¹™½}Á…‘‘•‘}¥¹Í¥‘•}Á…å±½…‘}‘É½ÁÁ•¡Ù½¥¤)ì(€€€µ½­9½‘•´ù…‘‘9½‘”¡I5=Q}9=¤ì(€€€µ½­9½‘•´ùÍ•ÑM¥¹•É	¥Ð¡I5=Q}9=°ÑÉÕ”¤ì((€€€µ•Í¡Ñ…ÍÑ¥}UÍ•ÈÔ€ôµ•Í¡Ñ…ÍÑ¥}UÍ•É}¥¹¥Ñ}é•É¼ì(€€€ÍÑÉÁä¡Ô¹¥°€ˆ„ÁˆÁˆÁˆÁˆˆ¤ì(€€€ÍÑÉÁä¡Ô¹±½¹}¹…µ”°€‰ÍÁ½½™•¹½‘”ˆ¤ì(€€€ÍÑÉÁä¡Ô¹Í¡½ÉÑ}¹…µ”°€‰MAˆ¤ì((€€€µ•Í¡Ñ…ÍÑ¥}5•Í¡A…­•ÐÀ€ôµ…­•A…å±½…‘A…‘‘•‘	É½…‘…ÍÐ¡µ•Í¡Ñ…ÍÑ¥}A½ÉÑ9Õµ}9=%9=}A@°€™µ•Í¡Ñ…ÍÑ¥}UÍ•É}µÍœ°€™Ô°€ÄÔÀ¤ì((€€€QMQ}MMIQ}1M}5MM¡¡•­a•‘‘Í…I••¥Ù•A½±¥ä ™À¤°€‰Á…å±½…µÁ…‘‘•Õ¹Í¥¹•9½‘•%¹™¼™É½´„Í¥¹•ÈµÕÍÐ‰”‘É½ÁÁ•ˆ¤ì(€€€QMQ}MMIQ}1M¡À¹á•‘‘Í…}Í¥¹•¤ì)ô()Ù½¥Í•ÑÕÀ ¤)ì(€€€¥¹¥Ñ¥…±¥é•Q•ÍÑ¹Ù¥É½¹µ•¹Ð ¤ì(€€€¥ÉQ¥µ”€©Í…Ù•‘¥ÉQ¥µ”€ô…¥ÉQ¥µ”ì(€€€µ•Í¡Ñ…ÍÑ¥Œèé9½‘•MÑ…ÑÕÌ€©Í…Ù•‘9½‘•MÑ…ÑÕÌ€ô¹½‘•MÑ…ÑÕÌì(€€€¥ÉQ¥µ”Ñ•ÍÑ¥ÉQ¥µ”ì(€€€µ•Í¡Ñ…ÍÑ¥Œèé9½‘•MÑ…ÑÕÌÑ•ÍÑ9½‘•MÑ…ÑÕÌì(€€€…¥ÉQ¥µ”€ô€™Ñ•ÍÑ¥ÉQ¥µ”ì(€€€¹½‘•MÑ…ÑÕÌ€ô€™Ñ•ÍÑ9½‘•MÑ…ÑÕÌì((€€€½¹™¥œ¹±½É„¹É•¥½¸€ôµ•Í¡Ñ…ÍÑ¥}½¹™¥}1½I…½¹™¥}I•¥½¹½‘•}ULì(€€€¥¹¥ÑI•¥½¸ ¤ì(€€€Á¥Á•±¥¹•I½ÕÑ•È€ô¹•ÜÕÑ¡A¥Á•±¥¹•I½ÕÑ•È ¤ì(€€€…ÕÑ¼Á¥Á•±¥¹•I…‘¥½=Ý¹•È€ôÍÑèéµ…­•}Õ¹¥ÅÕ”ñÕÑ¡A¥Á•±¥¹•I…‘¥¼ø ¤ì(€€€Á¥Á•±¥¹•I…‘¥¼€ôÁ¥Á•±¥¹•I…‘¥½=Ý¹•È¹•Ð ¤ì(€€€Á¥Á•±¥¹•I½ÕÑ•È´ù…‘‘%¹Ñ•É™…”¡ÍÑèéµ½Ù”¡Á¥Á•±¥¹•I…‘¥½=Ý¹•È¤¤ì(€€€É½ÕÑ•È€ôÁ¥Á•±¥¹•I½ÕÑ•Èì(€€€É½ÕÑ¥¹5½‘Õ±”€ôÁ¥Á•±¥¹•I½ÕÑ¥¹œ€ô¹•ÜÕÑ¡A¥Á•±¥¹•I½ÕÑ¥¹5½‘Õ±” ¤ì(€€€Á¥Á•±¥¹•5½‘Õ±”€ô¹•ÜÕÑ¡A¥Á•±¥¹•5½‘Õ±” ¤ì(€€€Í•ÉÙ¥”€ôÁ¥Á•±¥¹•M•ÉÙ¥”€ô¹•Ü5•Í¡M•ÉÙ¥” ¤ì(€€€µÅÑÐ€ôÁ¥Á•±¥¹•5ÅÑÐ€ô¹•ÜÕÑ¡A¥Á•±¥¹•5ÅÑÐ ¤ì((€€€U9%Qe}	%8 ¤ì((€€€ÁÉ¥¹Ñ˜ ‰q¸ôôôÉ½ÕÀèÉ••¥Ù”µÍ¥‘”…•ÁÐ½É•©•Ð€ôôõq¸ˆ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Å}Ù…±¥‘}Í¥¹…ÑÕÉ•}…•ÁÑ•‘}…¹‘}±•…É¹Í}Í¥¹•È¤ì(€€€IU9}QMP¡Ñ•ÍÑ}É}‰…‘}Í¥¹…ÑÕÉ•}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Í}Í¥¹•‘}¹½}ÁÕ‰­•å}…•ÁÑ•‘}Õ¹Ù•É¥™¥•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Ñ}‘½Ý¹É…‘•}Õ¹Í¥¹•‘}‰É½…‘…ÍÑ}™É½µ}Í¥¹•É}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Õ}Õ¹Í¥¹•‘}‰É½…‘…ÍÑ}™É½µ}¹½¹Í¥¹•É}…•ÁÑ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Ù}Õ¹Í¥¹•‘}Õ¹¥…ÍÑ}™É½µ}Í¥¹•É}…•ÁÑ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Ý}Õ¹Í¥¹•‘}½Ù•ÉÍ¥é•‘}‰É½…‘…ÍÑ}™É½µ}Í¥¹•É}…•ÁÑ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}á}Õ¹Í¥¹•‘}‘•…‘‰…¹‘}‰É½…‘…ÍÑ}™É½µ}Í¥¹•É}…•ÁÑ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}å}Õ¹Í¥¹•‘}‰½Õ¹‘…Éå}‰É½…‘…ÍÑ}™É½µ}Í¥¹•É}ÍÑ¥±±}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÁ}½µÁ…Ñ¥‰±•}…•ÁÑÍ}Õ¹Í¥¹•‘}‰É½…‘…ÍÑ}™É½µ}Í¥¹•È¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÅ}ÍÑÉ¥Ñ}É•©•ÑÍ}Õ¹Í¥¹•‘}…±±}Á½ÉÑ¹ÕµÍ}‘•ÍÑ¥¹…Ñ¥½¹Í}…¹‘}Í¥é•Ì¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÉ}ÍÑÉ¥Ñ}É•©•ÑÍ}Í¥¹•‘}Á…­•Ñ}Ý¥Ñ¡½ÕÑ}­•ä¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÍ}ÍÑÉ¥Ñ}…•ÁÑÍ}±½…±±å}…ÕÑ¡•¹Ñ¥…Ñ•‘}Á­¥}Á…­•Ð¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÍ‰}ÍÑÉ¥Ñ}É•©•ÑÍ}ÍÁ½½™•‘}Á­¥}™±…}½¹}•¹ÉåÁÑ•‘}¥¹É•ÍÌ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÑ}ÍÑÉ¥Ñ}‰½½ÑÍÑÉ…ÁÍ}¥‘•¹Ñ¥Ñå}‰½Õ¹‘}Í¥¹•‘}¹½‘•¥¹™¼¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÕ}ÍÑÉ¥Ñ}É•©•ÑÍ}¹½‘•¥¹™½}­•å}Ý¥Ñ¡½ÕÑ}¥‘•¹Ñ¥Ñå}‰¥¹‘¥¹œ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÙ}½µÁ…Ñ¥‰±•}É•©•ÑÍ}¥¹Ù…±¥‘}™¥ÉÍÑ}½¹Ñ…Ñ}¹½‘•¥¹™¼¤ì(¥˜]I5}9=}=U9P€ø€À(€€€IU9}QMP¡Ñ•ÍÑ}ÄÝ}ÍÑÉ¥Ñ}Ù•É¥™¥•Í}Í¥¹•É}™É½µ}Ý…Éµ}­•å}ÍÑ½É”¤ì(•¹‘¥˜(€€€IU9}QMP¡Ñ•ÍÑ}Äá}Õ¹Í¥¹•‘}‰É½…‘…ÍÑ}™É½µ}Í¥¹•É}Ý¥Ñ¡}Õ¹­¹½Ý¹}™¥•±‘Í}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Äå}Õ¹Í¥¹•‘}‰É½…‘…ÍÑ}™É½µ}¹½¹Í¥¹•É}Ý¥Ñ¡}Õ¹­¹½Ý¹}™¥•±‘Í}…•ÁÑ•¤ì((€€€ÁÉ¥¹Ñ˜ ‰q¸ôôôÉ½ÕÀèÍ•¹µÍ¥‘”Í¥¹¥¹œÁ½±¥ä€ôôõq¸ˆ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Å}±½…±}‰É½…‘…ÍÑ}¥Í}Í¥¹•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}É}±½…±}Õ¹¥…ÍÑ}¹½Ñ}Í¥¹•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Í}±½…±}½Ù•ÉÍ¥é•‘}‰É½…‘…ÍÑ}¹½Ñ}Í¥¹•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Ñ}…±±}‰É½…‘…ÍÑ}Í¥é•Í}‘•±¥Ù•É…‰±•}¹½}‘•…‘‰…¹¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Õ}ÁÉ•Í•Ñ}Í¥¹…ÑÕÉ•}½¹}±½…±}Á…­•Ñ}±•…É•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Ù}É¥¡}Í¡…Á•}ÍÝ••Á}¹½}‘•…‘‰…¹¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Ý}¥¹™É…ÍÑÉÕÑÕÉ•}Á½ÉÑ}Í¥¹¥¹}µ…ÑÉ¥à¤ì(€€€IU9}QMP¡Ñ•ÍÑ}á}±¥•¹Í•‘}‰É½…‘…ÍÑ}…¹‘}Õ¹¥…ÍÑ}…É•}Í¥¹•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}å}±¥•¹Í•‘}Õ¹¥…ÍÑ}¹•Ù•É}ÕÍ•Í}Á­¥}•¹ÉåÁÑ¥½¸¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÁ}±¥•¹Í•‘}½Ù•ÉÍ¥é•‘}Õ¹¥…ÍÑ}É•µ…¥¹Í}Õ¹Í¥¹•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÅ}¹½Éµ…±}Õ¹¥…ÍÑ}ÍÑ¥±±}ÕÍ•Í}Á­¤¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÉ}±¥•¹Í•‘}É••¥Ù•É}‘½•Í}¹½Ñ}‘•ÉåÁÑ}Á­¤¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÍ}±¥•¹Í•‘}Á½ÉÑ}…¹‘}‘•ÍÑ¥¹…Ñ¥½¹}Í¥¹¥¹}µ…ÑÉ¥à¤ì((€€€ÁÉ¥¹Ñ˜ ‰q¸ôôôÉ½ÕÀèÉ½ÕÑ¥¹œÁ¥Á•±¥¹”…ÕÑ¡•¹Ñ¥…Ñ¥½¸½É‘•É¥¹œ€ôôõq¸ˆ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Å}¥¹Ù…±¥‘}™¥ÉÍÑ}½Áå}‘½•Í}¹½Ñ}Á½¥Í½¹}Ù…±¥‘}Í…µ•}¥¤ì(€€€IU9}QMP¡Ñ•ÍÑ}É}¥¹Ù…±¥‘}½É‘¥¹…Éå}‘ÕÁ±¥…Ñ•}¡…Í}¹½}…¹•±}½É}‘•±¥Ù•Éå}•™™•ÑÌ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Í}¥¹Ù…±¥‘}É•Á•…Ñ•‘}Á…­•Ñ}…¹¹½Ñ}…­}½É}¡…¹•}É•ÑÉå}ÍÑ…Ñ”¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Ñ}¥¹Ù…±¥‘}™…±±‰…­}Á…­•Ñ}…¹¹½Ñ}É•±…ä¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Õ}¥¹Ù…±¥‘}ÕÁÉ…‘•}…¹¹½Ñ}É•µ½Ù•}Á•¹‘¥¹}Ù…±¥‘}Í•¹¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Ù}½Á…ÅÕ•}Õ¹­¹½Ý¹}¡…¹¹•±}¥Í}É•±…å}½¹±ä¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Ý}ÍÑÉ¥Ñ}É•©•ÑÍ}Õ¹Í¥¹•‘}‘•½‘•‘}Í¥µÉ…‘¥½}¥¹É•ÍÌ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}á}ÑÉÕÍÑ•‘}±½…±}‘•½‘•‘}‘•±¥Ù•Éå}¥Í}¹½Ñ}™¥±Ñ•É•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}å}­¹½Ý¹}¡…¹¹•±}µ…±™½Éµ•‘}Á±…¥¹Ñ•áÑ}¡…Í}¹½}Á¥Á•±¥¹•}•™™•ÑÌ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÁ}±•…å}¡…¹¹•±}‘µ}™…¥±ÕÉ•}¡…Í}¹½}Á¥Á•±¥¹•}•™™•ÑÌ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÅ}µ…±™½Éµ•‘}Á­¥}Á±…¥¹Ñ•áÑ}¡…Í}¹½}Á¥Á•±¥¹•}•™™•ÑÌ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÉ}•á…Ñ}…ÕÑ¡•¹Ñ¥…Ñ•‘}É•Á±…å}É•ÕÍ•Í}Ù•É‘¥Ñ}Ý¥Ñ¡½ÕÑ}½±±¥Í¥½¹}‰åÁ…ÍÌ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÍ}™…¥±•‘}¥¹¥Ñ¥…±}É•±¥…‰±•}Í•¹‘}‘½•Í}¹½Ñ}É•ÑÉä¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÑ}‘ÕÑå}å±•}±¥µ¥Ñ•‘}É•±¥…‰±•}Í•¹‘}É•µ…¥¹Í}Á•¹‘¥¹œ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÕ}É•±¥…‰±•}Õ¹¥…ÍÑ}ÑÉ…­Í}™¥Ù•}Ñ½Ñ…±}…ÑÑ•µÁÑÌ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÙ}É•±¥…‰±•}‰É½…‘…ÍÑ}­••ÁÍ}Ñ¡É••}Ñ½Ñ…±}…ÑÑ•µÁÑÌ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÝ}½±±¥‘¥¹}¡…¹¹•±}¡…Í¡}™½É•¥¹}‰É½…‘…ÍÑ}¥Í}É•±…å}½¹±ä¤ì(€€€ÁÉ¥¹Ñ˜ ‰q¸ôôôÉ½ÕÀ8è9½‘•%¹™½5½‘Õ±”…ÕÑ¡•¹Ñ¥…Ñ¥½¸€ôôõq¸ˆ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}8Å}Õ¹Í¥¹•‘}¹½‘•¥¹™½}™É½µ}Í¥¹•É}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}8É}Í¥¹•‘}¹½‘•¥¹™½}™É½µ}Í¥¹•É}¹½Ñ}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}8Í}Õ¹Í¥¹•‘}¹½‘•¥¹™½}™É½µ}¹½¹Í¥¹•É}¹½Ñ}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}8Ñ}Õ¹Í¥¹•‘}Õ¹¥…ÍÑ}¹½‘•¥¹™½}™É½µ}Í¥¹•É}…•ÁÑ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}8Õ}Õ¹Í¥¹•‘}Õ¹¥…ÍÑ}¹½‘•¥¹™½}™É½µ}Í¥¹•É}‘½•Í}¹½Ñ}¡…¹•}¹…µ”¤ì(€€€IU9}QMP¡Ñ•ÍÑ}8Ù}Í¥¹•‘}Õ¹¥…ÍÑ}¹½‘•¥¹™½}™É½µ}Í¥¹•É}¡…¹•Í}¹…µ”¤ì(€€€IU9}QMP¡Ñ•ÍÑ}8Ý}Õ¹Í¥¹•‘}Õ¹¥…ÍÑ}¹½‘•¥¹™½}™É½µ}¹½¹Í¥¹•É}¡…¹•Í}¹…µ”¤ì(€€€IU9}QMP¡Ñ•ÍÑ}8á}Í•½¹‘}É•ÅÕ•ÍÑ}¥¹Í¥‘•}Ñ¡•}Ý¥¹‘½Ý}¥Í}ÍÕÁÁÉ•ÍÍ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}8å}É•ÅÕ•ÍÑ}…™Ñ•É}Ñ¡•}Ý¥¹‘½Ý}¥Í}…¹ÍÝ•É•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}8ÄÁ}ÍÑ…±•}ÍÑ…µÁ}‘½•Í}¹½Ñ}…±¥…Í}…™Ñ•É}…}™Õ±±}ÝÉ…À¤ì(€€€IU9}QMP¡Ñ•ÍÑ}8ÄÅ}Ý¥¹‘½Ý}ÍÑ¥±±}…ÁÁ±¥•Í}…É½ÍÍ}Ñ¡•}ÝÉ…À¤ì((€€€ÁÉ¥¹Ñ˜ ‰q¸ôôôÉ½ÕÀ0è±¥•¹Í•¥‘•¹Ñ¥Ñä…¹Á±…¥¹Ñ•áÐÍ¥¹¥¹œ€ôôõq¸ˆ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}0Å}±¥•¹Í•‘}¹½‘•¥¹™½}ÁÕ‰±¥Í¡•Í}ÁÕ‰±¥}­•ä¤ì(€€€IU9}QMP¡Ñ•ÍÑ}0É}±¥•¹Í•‘}¥‘•¹Ñ¥Ñå}­•å}¥Í}•¹•É…Ñ•‘}…¹‘}ÁÉ•Í•ÉÙ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}0Í}™…Ñ½Éå}½¹™¥}É•Í•Ñ}ÁÉ•Í•ÉÙ•Í}Ù…±¥‘}¥‘•¹Ñ¥Ñå}ÁÉ¥Ù…Ñ•}­•ä¤ì(€€€IU9}QMP¡Ñ•ÍÑ}0Ñ}±¥•¹Í•‘}±½Ý}•¹ÑÉ½Áå}¥‘•¹Ñ¥Ñå}¥Í}É••¹•É…Ñ•¤ì((€€€ÁÉ¥¹Ñ˜ ‰q¸ôôôÉ½ÕÀè•¹½‘¥¹œ¥¹Ù…É¥…¹ÑÌ€ôôõq¸ˆ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Å}Í¥¹…ÑÕÉ•}™¥•±‘}½Ù•É¡•…‘}•á…Ð¤ì((€€€ÁÉ¥¹Ñ˜ ‰q¸ôôôÉ½ÕÀè‘•½‘•µ¥¹É•ÍÌÁ½±¥ä€ôôõq¸ˆ¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Å}‘•½‘•‘}Õ¹Í¥¹•‘}‰É½…‘…ÍÑ}™É½µ}Í¥¹•É}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}É}‘•½‘•‘}Õ¹Í¥¹•‘}‰É½…‘…ÍÑ}™É½µ}¹½¹Í¥¹•É}…•ÁÑ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Í}‘•½‘•‘}Ù…±¥‘}Í¥¹…ÑÕÉ•}Ù•É¥™¥•‘}…¹‘}±•…É¹Í}Í¥¹•È¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Ñ}‘•½‘•‘}‰…‘}Í¥¹…ÑÕÉ•}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Õ}‘•½‘•‘}Õ¹Í¥¹•‘}½Ù•ÉÍ¥é•‘}‰É½…‘…ÍÑ}™É½µ}Í¥¹•É}…•ÁÑ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}Ù}‘•½‘•‘}Õ¹Í¥¹•‘}Õ¹¥…ÍÑ}™É½µ}Í¥¹•É}…•ÁÑ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}á}‘•½‘•‘}Á…ÉÑ¥…±}Í¥¹…ÑÕÉ•}™É½µ}Í¥¹•É}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}å}‘•½‘•‘}Á…ÉÑ¥…±}Í¥¹…ÑÕÉ•}™É½µ}¹½¹Í¥¹•É}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÁ}‘•½‘•‘}Õ¹Í¥¹•‘}Á½Í¥Ñ¥½¹}Á…‘‘•‘}¥¹Í¥‘•}Á…å±½…‘}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÅ}‘•½‘•‘}Õ¹Í¥¹•‘}½Ù•ÉÍ¥é•‘}Ñ•±•µ•ÑÉå}™É½µ}Í¥¹•É}…•ÁÑ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÉ}‘•½‘•‘}Õ¹Í¥¹•‘}Ý…åÁ½¥¹Ñ}Á…‘‘•‘}¥¹Í¥‘•}Á…å±½…‘}‘É½ÁÁ•¤ì(€€€IU9}QMP¡Ñ•ÍÑ}ÄÍ}‘•½‘•‘}Õ¹Í¥¹•‘}¹½‘•¥¹™½}Á…‘‘•‘}¥¹Í¥‘•}Á…å±½…‘}‘É½ÁÁ•¤ì((€€€½¹ÍÐ¥¹ÐÉ•ÍÕ±Ð€ôU9%Qe}9 ¤ì(€€€…¥ÉQ¥µ”€ôÍ…Ù•‘¥ÉQ¥µ”ì(€€€¹½‘•MÑ…ÑÕÌ€ôÍ…Ù•‘9½‘•MÑ…ÑÕÌì(€€€•á¥Ð¡É•ÍÕ±Ð¤ì)ô()Ù½¥±½½À ¤íô((•±Í”€¼¼a‘M½ÈA-$•á±Õ‘•()Ù½¥Í•ÑUÀ¡Ù½¥¤íô)Ù½¥Ñ•…É½Ý¸¡Ù½¥¤íô)Ù½¥Í•ÑÕÀ ¤)ì(€€€¥¹¥Ñ¥…±¥é•Q•ÍÑ¹Ù¥É½¹µ•¹Ð ¤ì(€€€U9%Qe}	%8 ¤ì(€€€•á¥Ð¡U9%Qe}9 ¤¤ì)ô)Ù½¥±½½À ¤íô((•¹‘¥˜

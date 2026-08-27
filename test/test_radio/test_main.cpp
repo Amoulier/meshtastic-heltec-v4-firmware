@@ -430,17 +430,6 @@ static void test_regionPresetMap_unsetCarriesUserprefsIntent()
 #endif
 }
 
-// In-flight packet bytes as packetPool reports them, 0 before the first alloc registers the tag.
-static int32_t packetPoolLiveBytes()
-{
-    memaudit::Tag rows[memaudit::kMaxTags];
-    size_t n = memaudit::snapshot(rows, memaudit::kMaxTags);
-    for (size_t i = 0; i < n; i++)
-        if (rows[i].tag && strcmp(rows[i].tag, "pktpool(live)") == 0)
-            return rows[i].bytes;
-    return 0;
-}
-
 // Oversize is refused at the radio queue in Router::send(). If one ever gets this far the memcpy is
 // clamped instead of failing, and the packet stays the caller's to release.
 static void test_beginSending_oversizedPayloadIsClamped()
