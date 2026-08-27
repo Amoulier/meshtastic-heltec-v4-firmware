@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - audit/mqtt-implicit-ack-2.8.0
-      - audit/superbase-upstream-power-20260827
   workflow_dispatch:
 
 permissions: read-all
