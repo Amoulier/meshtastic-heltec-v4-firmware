@@ -1,0 +1,109 @@
+name: Final Superbase audit
+
+on:
+  push:
+    branches:
+      - audit/superbase-upstream-power-20260827
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  native-shards:
+    name: Native audit shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 1
+            suites: >-
+              test_admin_radio test_admin_session_repro test_airtime test_atak
+              test_banner_font_tags test_bme680_iaq test_breakout test_buzzer_mode
+              test_channel_keys test_chirpy
+          - shard: 2
+            suites: >-
+              test_crypto test_default test_event_channel_phone_api test_event_channel_router
+              test_event_profile_storage test_firmware_edition test_fscommon_getfiles
+              test_fuzz_config test_fuzz_decode
+          - shard: 3
+            suites: >-
+              test_fuzz_emotes test_fuzz_packets test_geocoord_distance test_geofence
+              test_gps_fix_hold test_gps_update_scheduling test_hop_scaling
+              test_hop_start_policy test_http_content_handler
+          - shard: 4
+            suites: >-
+              test_mac_from_string test_mem_audit test_mesh_beacon test_mesh_module
+              test_meshpacket_queue test_meshpacket_serializer test_module_config
+              test_mqtt test_nexthop_routing
+          - shard: 5
+            suites: >-
+              test_nmea_wpl test_nodedb_blocked test_nodedb_boot_recovery
+              test_nodedb_identity_hygiene test_nodedb_legacy_migration
+              test_nodedb_v25_roundtrip test_observer test_optin_migration test_packet_history
+          - shard: 6
+            suites: >-
+              test_packet_signing test_phone_api_config_dump test_pki_admin_fallback
+              test_position_module test_position_precision test_radio test_reliable_ack_matrix
+              test_rolling_counter test_routing_response_hops
+          - shard: 7
+            suites: >-
+              test_rtc test_safefile test_serial test_snake test_stream_api
+              test_stream_framing test_tak_config test_throttle test_tophone_queue
+          - shard: 8
+            suites: >-
+              test_traceroute_nexthop test_trackball_press test_traffic_management
+              test_transmit_history test_type_conversions test_uptime_clock test_utf8
+              test_warm_store test_waypoint_expiry test_xmodem
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+
+      - name: Setup native build
+        uses: ./.github/actions/setup-native
+
+      - name: Disable BUILD_EPOCH
+        run: sed -i 's/-DBUILD_EPOCH=$UNIX_TIME/#-DBUILD_EPOCH=$UNIX_TIME/' platformio.ini
+
+      - name: Validate packet-signing source integrity
+        if: matrix.shard == 6
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('test/test_packet_signing/test_main.cpp')
+          raw = p.read_bytes()
+          text = raw.decode('utf-8')
+          required = (
+              'UNITY_BEGIN()', 'UNITY_END()', 'class AuthPipelineRoutingModule',
+              'const meshtastic_MeshPacket * = nullptr',
+              'test_A1_valid_signature_accepted_and_learns_signer',
+              'test_E13_decoded_unsigned_nodeinfo_padded_inside_payload_dropped',
+          )
+          missing = [token for token in required if token not in text]
+          if missing or len(raw) < 70000:
+              raise SystemExit(f'invalid packet-signing source: size={len(raw)}, missing={missing}')
+          print(f'packet-signing source OK: {len(raw)} bytes')
+          PY
+
+      - name: Build and run shard
+        shell: bash
+        env:
+          SUITES: ${{ matrix.suites }}
+        run: |
+          set -euo pipefail
+          filters=()
+          for suite in $SUITES; do
+            filters+=(--filter "$suite")
+          done
+          timeout --signal=TERM --kill-after=30s 30m platformio test -e coverage "${filters[@]}"
+
+  build-muzi-base:
+    name: Build Muzi Base firmware
+    uses: ./.github/workflows/build_firmware.yml
+    with:
+      version: 2.8.0-superbase-upstream-power-audit
+      platform: nrf52840
+      pio_env: muzi-base
