@@ -627,7 +627,11 @@ class AnalogBatteryLevel : public HasBatteryLevel
     /// For heltecs with no battery connected, the measured voltage is 2204, so
     // need to be higher than that, in this case is 2500mV (3000-500)
     const uint16_t OCV[NUM_OCV_POINTS] = {OCV_ARRAY};
+#ifdef BATTERY_CHARGING_MILLIVOLTS
+    const float chargingVolt = BATTERY_CHARGING_MILLIVOLTS;
+#else
     const float chargingVolt = (OCV[0] + 10) * NUM_CELLS;
+#endif
     const float noBatVolt = (OCV[NUM_OCV_POINTS - 1] - 500) * NUM_CELLS;
     // Start value from minimum voltage for the filter to not start from 0
     // that could trigger some events.
@@ -1064,17 +1068,13 @@ void Power::readPowerStatus()
 
 #endif
 
-    // If we have a battery at all and it is less than 0%, force deep sleep if we
-    // have more than 10 low readings in a row. NOTE: min LiIon/LiPo voltage
-    // is 2.0 to 2.5V, current OCV min is set to 3100 that is large enough.
-    //
-
     if (batteryLevel && powerStatus2.getHasBattery() && !powerStatus2.getHasUSB()) {
-        if (batteryLevel->getBattVoltage() < OCV[NUM_OCV_POINTS - 1]) {
-            low_voltage_counter++;
-            LOG_DEBUG("Low voltage counter: %d/10", low_voltage_counter);
-            if (low_voltage_counter > 10) {
-                LOG_INFO("Low voltage detected, trigger deep sleep");
+        if (batteryVoltageMv > 0 && batteryVoltageMv <= BATTERY_CRITICAL_MILLIVOLTS) {
+            if (low_voltage_counter < BATTERY_CRITICAL_READINGS)
+                low_voltage_counter++;
+            LOG_DEBUG("Low voltage counter: %d/%d", low_voltage_counter, BATTERY_CRITICAL_READINGS);
+            if (low_voltage_counter >= BATTERY_CRITICAL_READINGS) {
+                LOG_INFO("Battery at %dmV; entering protective deep sleep", batteryVoltageMv);
                 powerFSM.trigger(EVENT_LOW_BATTERY);
             }
         } else {

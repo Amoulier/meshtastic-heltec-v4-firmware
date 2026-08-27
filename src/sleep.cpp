@@ -256,8 +256,8 @@ void doDeepSleep(uint32_t msecToWake, bool skipPreflight = false, bool skipSaveN
         nodeDB->saveToDisk();
     }
 
-    // Persist broadcast transmit times so throttle survives reboot
-    if (transmitHistory)
+    // Low-voltage shutdown must not perform any optional flash writes.
+    if (!skipSaveNodeDb && transmitHistory)
         transmitHistory->saveToDisk();
 
 #ifdef PIN_POWER_EN

@@ -111,10 +111,18 @@ static void sdsEnter()
     doDeepSleep(Default::getConfiguredOrDefaultMs(config.power.sds_secs), false, false);
 }
 
+__attribute__((noinline)) void prepareLowBatterySleep() __attribute__((weak));
+__attribute__((noinline)) void prepareLowBatterySleep() {}
+
 static void lowBattSDSEnter()
 {
     LOG_POWERFSM("State: Lower batt SDS");
+    prepareLowBatterySleep();
+#ifdef BATTERY_CRITICAL_SLEEP_MSEC
+    doDeepSleep(BATTERY_CRITICAL_SLEEP_MSEC, false, true);
+#else
     doDeepSleep(Default::getConfiguredOrDefaultMs(config.power.sds_secs), false, true);
+#endif
 }
 extern Power *power;
 

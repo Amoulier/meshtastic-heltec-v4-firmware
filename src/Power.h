@@ -15,6 +15,14 @@
 #define NUM_OCV_POINTS 11
 #endif
 
+#ifndef BATTERY_CRITICAL_MILLIVOLTS
+#define BATTERY_CRITICAL_MILLIVOLTS 3100
+#endif
+
+#ifndef BATTERY_CRITICAL_READINGS
+#define BATTERY_CRITICAL_READINGS 10
+#endif
+
 // Device specific curves go in variant.h
 #ifndef OCV_ARRAY
 #if defined(ARCH_STM32) && BATTERY_PIN == AVBAT
@@ -98,7 +106,7 @@ class Power : public concurrency::OSThread
     virtual int32_t runOnce() override;
     void setStatusHandler(meshtastic::PowerStatus *handler) { statusHandler = handler; }
     const uint16_t OCV[11] = {OCV_ARRAY};
-    bool isLowBattery() { return low_voltage_counter >= 10; };
+    bool isLowBattery() { return low_voltage_counter >= BATTERY_CRITICAL_READINGS; };
 
 #ifdef ARCH_ESP32
     int beforeLightSleep(void *unused);
