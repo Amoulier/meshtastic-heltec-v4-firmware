@@ -17,6 +17,18 @@ void ICM20948SetInterrupt()
     ICM20948_IRQ = true;
 }
 
+// startupMagnetometer() configures the AK09916 for continuous 100 Hz measurements.
+// The ICM20948 SLEEP bit does not change the AK09916 operating mode, so explicitly
+// power the auxiliary magnetometer down while the IMU is asleep and restore its
+// normal mode when the IMU wakes. This avoids leaving the compass measuring while
+// the display is off and heading data is not being consumed.
+static ICM_20948_Status_e setMagnetometerMode(ICM20948Singleton *sensor, AK09916_mode_e mode)
+{
+    AK09916_CNTL2_Reg_t reg{};
+    reg.MODE = mode;
+    return sensor->writeMag(AK09916_REG_CNTL2, reinterpret_cast<uint8_t *>(&reg));
+}
+
 ICM20948Sensor::ICM20948Sensor(ScanI2C::FoundDevice foundDevice) : MotionSensor::MotionSensor(foundDevice) {}
 
 bool ICM20948Sensor::init()
@@ -56,13 +68,37 @@ int32_t ICM20948Sensor::runOnce()
         !config.device.double_tap_as_button_press) {
         if (!isAsleep) {
             LOG_DEBUG("sleeping IMU");
-            sensor->sleep(true);
+
+            auto magStatus = setMagnetometerMode(sensor, AK09916_mode_power_down);
+            if (magStatus != ICM_20948_Stat_Ok) {
+                LOG_WARN("ICM20948 failed to power down magnetometer - %s", sensor->statusString(magStatus));
+            }
+
+            auto sleepStatus = sensor->sleep(true);
+            if (sleepStatus != ICM_20948_Stat_Ok) {
+                LOG_WARN("ICM20948 failed to enter sleep - %s", sensor->statusString(sleepStatus));
+            }
+
+            // Treat the low-power transition as active even if one command failed so
+            // the wake path restores both devices instead of leaving the magnetometer
+            // powered down after a partial transition.
             isAsleep = true;
         }
         return MOTION_SENSOR_SLEEP_CHECK_INTERVAL_MS;
     }
     if (isAsleep) {
-        sensor->sleep(false);
+        auto wakeStatus = sensor->sleep(false);
+        if (wakeStatus != ICM_20948_Stat_Ok) {
+            LOG_WARN("ICM20948 failed to leave sleep - %s", sensor->statusString(wakeStatus));
+            return MOTION_SENSOR_CHECK_INTERVAL_MS;
+        }
+
+        auto magStatus = setMagnetometerMode(sensor, AK09916_mode_cont_100hz);
+        if (magStatus != ICM_20948_Stat_Ok) {
+            LOG_WARN("ICM20948 failed to restart magnetometer - %s", sensor->statusString(magStatus));
+            return MOTION_SENSOR_CHECK_INTERVAL_MS;
+        }
+
         isAsleep = false;
     }
 
