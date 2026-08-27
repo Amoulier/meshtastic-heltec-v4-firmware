@@ -25,7 +25,30 @@ jobs:
         run: sed -i 's/-DBUILD_EPOCH=$UNIX_TIME/#-DBUILD_EPOCH=$UNIX_TIME/' platformio.ini
 
       - name: Validate packet-signing source
-        run: git diff --check HEAD^ -- test/test_packet_signing/test_main.cpp
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('test/test_packet_signing/test_main.cpp')
+          raw = path.read_bytes()
+          text = raw.decode('utf-8')
+
+          required = (
+              'UNITY_BEGIN()',
+              'UNITY_END()',
+              'class AuthPipelineRoutingModule',
+              'const meshtastic_MeshPacket * = nullptr',
+              'test_A1_valid_signature_accepted_and_learns_signer',
+              'test_E13_decoded_unsigned_nodeinfo_padded_inside_payload_dropped',
+          )
+          missing = [token for token in required if token not in text]
+          if missing:
+              raise SystemExit(f'packet-signing source is incomplete; missing: {missing}')
+          if len(raw) < 70000:
+              raise SystemExit(f'packet-signing source is unexpectedly small: {len(raw)} bytes')
+          print(f'packet-signing source OK: {len(raw)} bytes, UTF-8, required markers present')
+          PY
 
       - name: Build and run packet signing
         shell: bash
