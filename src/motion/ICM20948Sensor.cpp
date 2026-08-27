@@ -17,10 +17,11 @@ void ICM20948SetInterrupt()
     ICM20948_IRQ = true;
 }
 
+#ifdef MUZI_BASE
 // startupMagnetometer() configures the AK09916 for continuous 100 Hz measurements.
 // The ICM20948 SLEEP bit does not change the AK09916 operating mode, so explicitly
-// power the auxiliary magnetometer down while the IMU is asleep and restore its
-// normal mode when the IMU wakes. This avoids leaving the compass measuring while
+// power the auxiliary magnetometer down while the Superbase IMU is asleep and restore
+// its normal mode when the IMU wakes. This avoids leaving the compass measuring while
 // the display is off and heading data is not being consumed.
 static ICM_20948_Status_e setMagnetometerMode(ICM20948Singleton *sensor, AK09916_mode_e mode)
 {
@@ -28,6 +29,7 @@ static ICM_20948_Status_e setMagnetometerMode(ICM20948Singleton *sensor, AK09916
     reg.MODE = mode;
     return sensor->writeMag(AK09916_REG_CNTL2, reinterpret_cast<uint8_t *>(&reg));
 }
+#endif
 
 ICM20948Sensor::ICM20948Sensor(ScanI2C::FoundDevice foundDevice) : MotionSensor::MotionSensor(foundDevice) {}
 
@@ -68,7 +70,7 @@ int32_t ICM20948Sensor::runOnce()
         !config.device.double_tap_as_button_press) {
         if (!isAsleep) {
             LOG_DEBUG("sleeping IMU");
-
+#ifdef MUZI_BASE
             auto magStatus = setMagnetometerMode(sensor, AK09916_mode_power_down);
             if (magStatus != ICM_20948_Stat_Ok) {
                 LOG_WARN("ICM20948 failed to power down magnetometer - %s", sensor->statusString(magStatus));
@@ -83,10 +85,15 @@ int32_t ICM20948Sensor::runOnce()
             // the wake path restores both devices instead of leaving the magnetometer
             // powered down after a partial transition.
             isAsleep = true;
+#else
+            sensor->sleep(true);
+            isAsleep = true;
+#endif
         }
         return MOTION_SENSOR_SLEEP_CHECK_INTERVAL_MS;
     }
     if (isAsleep) {
+#ifdef MUZI_BASE
         auto wakeStatus = sensor->sleep(false);
         if (wakeStatus != ICM_20948_Stat_Ok) {
             LOG_WARN("ICM20948 failed to leave sleep - %s", sensor->statusString(wakeStatus));
@@ -100,6 +107,10 @@ int32_t ICM20948Sensor::runOnce()
         }
 
         isAsleep = false;
+#else
+        sensor->sleep(false);
+        isAsleep = false;
+#endif
     }
 
     float magX = 0, magY = 0, magZ = 0;
