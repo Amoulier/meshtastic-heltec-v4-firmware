@@ -1241,6 +1241,12 @@ void setup()
     setCPUFast(false); // 80MHz is fine for our slow peripherals
 #endif
 
+#if defined(HELTEC_V4_OLED)
+    // Dynamic frequency scaling saves idle CPU power without using automatic
+    // light sleep, so Bluetooth remains continuously discoverable/reconnectable.
+    enableModemSleep();
+#endif
+
 #ifdef ARDUINO_ARCH_ESP32
     LOG_DEBUG("Free heap  : %7d bytes", ESP.getFreeHeap());
     LOG_DEBUG("Free PSRAM : %7d bytes", ESP.getFreePsram());

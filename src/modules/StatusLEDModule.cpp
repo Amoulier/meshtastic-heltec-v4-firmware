@@ -4,6 +4,9 @@
 #include "mesh/RadioInterface.h"
 #include "mesh/Throttle.h"
 #include <Arduino.h>
+#if defined(HELTEC_V4_OLED)
+#include "graphics/Screen.h"
+#endif
 
 /*
 StatusLEDModule manages the device's status LEDs, updating their states based on power and Bluetooth status.
@@ -182,6 +185,17 @@ int32_t StatusLEDModule::runOnce()
     }
 #endif
 
+#if defined(HELTEC_V4_OLED)
+    // Persistent display-off is the user's explicit unattended/battery mode.
+    // Keep the status LED dark as well, but leave Bluetooth state and pairing
+    // behavior untouched. Status observers still wake this thread as needed.
+    if (screen && screen->isDisplayDisabled()) {
+        CHARGE_LED_state = LED_STATE_OFF;
+        PAIRING_LED_state = LED_STATE_OFF;
+        my_interval = 5000;
+    }
+#endif
+
     // Override if disabled in config
     if (config.device.led_heartbeat_disabled) {
         CHARGE_LED_state = LED_STATE_OFF;
@@ -287,6 +301,12 @@ int32_t StatusLEDModule::runOnce()
 
 void StatusLEDModule::setPowerLED(bool LEDon)
 {
+
+#if defined(HELTEC_V4_OLED)
+    if (screen && screen->isDisplayDisabled()) {
+        LEDon = false;
+    }
+#endif
 
 #if defined(HAS_PMU)
     if (pmu_found && PMU) {

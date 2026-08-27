@@ -562,7 +562,12 @@ esp_sleep_wakeup_cause_t doLightSleep(uint64_t sleepMsec) // FIXME, use a more r
 void enableModemSleep()
 {
     static esp_pm_config_t esp32_config; // filled with zeros because bss
-#if CONFIG_IDF_TARGET_ESP32S3
+#if defined(HELTEC_V4_OLED)
+    // Keep the OLED Heltec responsive to BLE while reducing idle CPU power.
+    // Automatic light sleep remains disabled below: explicit light sleep stops
+    // BLE advertising, which would make an unattended node undiscoverable.
+    esp32_config.max_freq_mhz = 80;
+#elif CONFIG_IDF_TARGET_ESP32S3
     esp32_config.max_freq_mhz = CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ;
 #elif CONFIG_IDF_TARGET_ESP32S2
     esp32_config.max_freq_mhz = CONFIG_ESP32S2_DEFAULT_CPU_FREQ_MHZ;
@@ -579,7 +584,12 @@ void enableModemSleep()
 #else
     esp32_config.max_freq_mhz = CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ;
 #endif
-    esp32_config.min_freq_mhz = 20; // 10Mhz is minimum recommended
+    esp32_config.min_freq_mhz =
+#if defined(HELTEC_V4_OLED)
+        40; // Conservative floor for SPI/LoRa and NimBLE validation on Heltec V4.
+#else
+        20; // 10Mhz is minimum recommended
+#endif
     esp32_config.light_sleep_enable = false;
     int rv = esp_pm_configure(&esp32_config);
     LOG_DEBUG("Sleep request result %x", rv);
