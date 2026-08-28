@@ -42,6 +42,13 @@ struct PendingPacket {
     /** Initial remaining retry count, used to detect whether a retry has fired. */
     uint8_t initialNumRetransmissions = 0;
 
+    /**
+     * True after the client has been told that this packet was implicitly acknowledged through MQTT.
+     * MQTT evidence intentionally does not cancel LoRa retries, but it must prevent a later terminal
+     * MAX_RETRANSMIT from contradicting the successful delivery status for the same packet id.
+     */
+    bool mqttImplicitAckSeen = false;
+
     PendingPacket() {}
     explicit PendingPacket(meshtastic_MeshPacket *p, uint8_t numRetransmissions);
 };

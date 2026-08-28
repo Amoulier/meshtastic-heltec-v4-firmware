@@ -182,6 +182,14 @@ void ReliableRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtas
             } else {
                 stopRetransmission(p->to, nakId);
             }
+        } else if (ackId && isFromUs(p) &&
+                   p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT) {
+            // #8939 deliberately keeps the LoRa retry/fallback path alive for our MQTT echo. Remember
+            // that the client has nevertheless received a successful implicit ACK, so exhausting the
+            // independent LoRa retry budget cannot later overwrite that success with MAX_RETRANSMIT.
+            PendingPacket *pendingPacket = findPendingPacket(p->to, ackId);
+            if (pendingPacket)
+                pendingPacket->mqttImplicitAckSeen = true;
         }
     }
 

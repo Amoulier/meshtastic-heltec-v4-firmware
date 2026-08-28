@@ -1,4 +1,5 @@
 #include "MQTT.h"
+#include "concurrency/LockGuard.h"
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "PowerFSM.h"
@@ -59,6 +60,29 @@ static bool isConnected = false;
 static uint32_t lastPositionUnavailableWarning = 0;
 static const uint32_t POSITION_UNAVAILABLE_WARNING_INTERVAL_MS = 15000; // 15 seconds
 
+constexpr size_t MQTT_ACK_HISTORY_SIZE = 16;
+struct MqttAckHistoryEntry {
+    NodeNum from = 0;
+    PacketId id = 0;
+};
+static MqttAckHistoryEntry mqttAckHistory[MQTT_ACK_HISTORY_SIZE] = {};
+static size_t mqttAckHistoryNext = 0;
+static concurrency::Lock mqttAckHistoryLock;
+
+bool rememberMqttAck(NodeNum from, PacketId id)
+{
+    if (id == 0)
+        return false;
+    concurrency::LockGuard guard(&mqttAckHistoryLock);
+    for (const auto &entry : mqttAckHistory) {
+        if (entry.from == from && entry.id == id)
+            return false;
+    }
+    mqttAckHistory[mqttAckHistoryNext] = {.from = from, .id = id};
+    mqttAckHistoryNext = (mqttAckHistoryNext + 1) % MQTT_ACK_HISTORY_SIZE;
+    return true;
+}
+
 inline bool shouldDropMqttDownlink(const meshtastic_MeshPacket &packet)
 {
     if (is_in_repeated(config.lora.ignore_incoming, packet.from)) {
@@ -118,8 +142,9 @@ inline void onReceiveProto(char *topic, byte *payload, size_t length)
     if (strcmp(e.gateway_id, nodeId.c_str()) == 0) {
         // Generate an implicit ACK towards ourselves (handled and processed only locally!) for this message.
         // We do this because packets are not rebroadcasted back into MQTT anymore and we assume that at least one node
-        // receives it when we get our own packet back. Then we'll stop our retransmissions.
-        if (isFromUs(e.packet)) {
+        // receives it when we get our own packet back. ReliableRouter surfaces that evidence to the client while preserving
+        // the independent LoRa retry/fallback path.
+        if (isFromUs(e.packet) && rememberMqttAck(getFrom(e.packet), e.packet->id)) {
             auto pAck = routingModule->allocAckNak(meshtastic_Routing_Error_NONE, getFrom(e.packet), e.packet->id, ch.index);
             if (!pAck)
                 return;

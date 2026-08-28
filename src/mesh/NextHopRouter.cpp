@@ -460,11 +460,17 @@ int32_t NextHopRouter::doRetransmissions()
         if (Throttle::deadlinePassedAt(now, p.nextTxMsec)) {
             if (p.numRetransmissions == 0) {
                 if (isFromUs(p.packet)) {
-                    LOG_DEBUG("Reliable send failed, return nak fr=0x%08x,to=0x%08x,id=0x%08x", p.packet->from, p.packet->to,
-                              p.packet->id);
-                    sendAckNak(meshtastic_Routing_Error_MAX_RETRANSMIT, getFrom(p.packet), p.packet->id, p.packet->channel);
+                    if (p.mqttImplicitAckSeen) {
+                        LOG_DEBUG("LoRa retries exhausted after MQTT implicit ACK, omit contradictory NAK id=0x%08x",
+                                  p.packet->id);
+                    } else {
+                        LOG_DEBUG("Reliable send failed, return nak fr=0x%08x,to=0x%08x,id=0x%08x", p.packet->from,
+                                  p.packet->to, p.packet->id);
+                        sendAckNak(meshtastic_Routing_Error_MAX_RETRANSMIT, getFrom(p.packet), p.packet->id, p.packet->channel);
+                    }
                 }
-                // Note: we don't stop retransmission here, instead the Nak packet gets processed in sniffReceived
+                // Remove the completed record directly. A generated NAK is also processed locally, but an MQTT-confirmed
+                // packet intentionally has no terminal NAK to drive that path.
                 stopRetransmission(it->first);
                 stillValid = false; // just deleted it
             } else {
