@@ -976,6 +976,23 @@ void Power::readPowerStatus()
         }
     }
 
+#ifdef BATTERY_PERCENT_SLEW_INTERVAL_MSEC
+    // Keep raw voltage available to the low-battery protection below, but prevent
+    // brief load-induced voltage sag from making the reported percentage jump.
+    // A sustained change converges at one percentage point per configured interval.
+    if (batteryChargePercent >= 0) {
+        if (reportedBatteryPercent < 0) {
+            reportedBatteryPercent = batteryChargePercent;
+            lastBatteryPercentChangeMs = millis();
+        } else if (batteryChargePercent != reportedBatteryPercent &&
+                   Throttle::hasElapsed(lastBatteryPercentChangeMs, BATTERY_PERCENT_SLEW_INTERVAL_MSEC)) {
+            reportedBatteryPercent += batteryChargePercent > reportedBatteryPercent ? 1 : -1;
+            lastBatteryPercentChangeMs = millis();
+        }
+        batteryChargePercent = reportedBatteryPercent;
+    }
+#endif
+
 // FIXME: IMO we shouldn't be littering our code with all these ifdefs.  Way
 // better instead to make a Nrf52IsUsbPowered subclass (which shares a
 // superclass with the BatteryLevel stuff) that just provides a few methods. But

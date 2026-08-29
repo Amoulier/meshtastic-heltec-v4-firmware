@@ -17,6 +17,9 @@
 #define BATTERY_CRITICAL_SLEEP_MSEC 60000
 #define BATTERY_BOOT_GUARD_MIN_MILLIVOLTS 2500
 #define BATTERY_CHARGING_MILLIVOLTS 4320
+// Limit the published state-of-charge movement without delaying the raw-voltage
+// protection path. This rejects short LoRa TX voltage sags from the UI/telemetry.
+#define BATTERY_PERCENT_SLEW_INTERVAL_MSEC 60000
 #endif
 
 #define USE_SX1262
