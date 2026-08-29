@@ -11,7 +11,7 @@ jobs:
   build:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: heltec-v4-power-v2.8.0.2
+      version: heltec-v4-power-v2.8.0.3
       platform: esp32s3
       pio_env: heltec-v4
 
@@ -26,7 +26,7 @@ jobs:
       - name: Download Heltec V4 firmware
         uses: actions/download-artifact@v8
         with:
-          name: firmware-esp32s3-heltec-v4-heltec-v4-power-v2.8.0.2
+          name: firmware-esp32s3-heltec-v4-heltec-v4-power-v2.8.0.3
           path: release-assets
 
       - name: Verify release contents
@@ -37,9 +37,9 @@ jobs:
       - name: Publish Heltec V4 release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: heltec-v4-power-v2.8.0.2
+          tag_name: heltec-v4-power-v2.8.0.3
           target_commitish: ${{ github.sha }}
-          name: Heltec V4 Power Optimized v2.8.0.2
+          name: Heltec V4 Power Optimized v2.8.0.3
           prerelease: true
           generate_release_notes: false
           body: |
@@ -53,12 +53,20 @@ jobs:
             - GPS is disabled by default on a fresh Heltec V4 OLED installation.
             - GPS initialization and probing are skipped while GPS is disabled.
             - Display and GPS controls remain independent.
+            - Battery percentage uses a Heltec-specific voltage curve and smoothing to prevent temporary LoRa transmit voltage dips from producing large visual jumps.
+            - Published battery percentage changes by at most one point per minute; low-voltage protection continues to use the unsmoothed voltage.
+            - Low-battery shutdown protects the configuration from full-discharge brownouts, with a 3.50 V cutoff and 3.65 V recovery threshold.
+            - Dynamic 40-80 MHz CPU operation reduces idle consumption while Bluetooth remains discoverable and reconnectable without pressing PRG.
+            - The status LED remains off while the display is persistently disabled.
+            - MQTT implicit acknowledgements are handled correctly without changing normal LoRa acknowledgements.
             - RX Boosted Gain behavior is unchanged.
+            - LoRa transmit power and regional radio settings are unchanged.
 
             Hardware validation:
             - Persistent display disable was tested on a Heltec WiFi LoRa 32 V4.3 OLED.
             - Incoming messages did not wake the persistently disabled OLED.
             - Holding PRG for about one second restored the display.
+            - Bluetooth discovery and reconnection, public and private messages, MQTT acknowledgement behavior, and thermal stability were validated on hardware.
 
             Target: `heltec-v4` only. This release does not contain Muziworks Superbase firmware or TFT/R8 builds.
           files: release-assets/*
