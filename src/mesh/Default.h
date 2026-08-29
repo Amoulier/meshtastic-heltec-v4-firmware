@@ -23,14 +23,22 @@
 // precision) or fixed_position: identical positions get deduped by traffic management anyway.
 // Held one hour above default_traffic_mgmt_position_min_interval_secs so this refresh clears
 // the receivers' dedup window instead of being dropped as a duplicate.
+#ifdef MUZI_BASE
+#define default_position_stationary_broadcast_secs (12 * 60 * 60)
+#else
 #define default_position_stationary_broadcast_secs (6 * 60 * 60)
+#endif
 #define min_default_broadcast_interval_secs IF_ROUTER(ONE_DAY / 2, 60 * 60)
 #define min_default_broadcast_smart_minimum_interval_secs 5 * 60
 #define default_wait_bluetooth_secs IF_ROUTER(1, 60)
 #define default_sds_secs IF_ROUTER(ONE_DAY, UINT32_MAX) // Default to forever super deep sleep
 #define default_ls_secs IF_ROUTER(ONE_DAY, 5 * 60)
 #define default_min_wake_secs 10
+#ifdef USERPREFS_CONFIG_SCREEN_ON_SECS
+#define default_screen_on_secs IF_ROUTER(1, USERPREFS_CONFIG_SCREEN_ON_SECS)
+#else
 #define default_screen_on_secs IF_ROUTER(1, 60 * 10)
+#endif
 #define default_node_info_broadcast_secs 3 * 60 * 60
 #define default_neighbor_info_broadcast_secs 6 * 60 * 60
 #define default_mesh_beacon_min_broadcast_interval_secs 3600

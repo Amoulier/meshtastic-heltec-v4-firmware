@@ -81,10 +81,11 @@ class MockRoutingModule : public RoutingModule
 {
   public:
     void sendAckNak(meshtastic_Routing_Error err, NodeNum to, PacketId idFrom, ChannelIndex chIndex, uint8_t hopLimit = 0,
-                    bool ackWantsAck = false) override
+                    bool ackWantsAck = false, const meshtastic_MeshPacket *relaySource = nullptr) override
     {
         (void)hopLimit;
         (void)ackWantsAck;
+        (void)relaySource;
         ackNaks.push_back({err, to, idFrom, chIndex});
     }
 

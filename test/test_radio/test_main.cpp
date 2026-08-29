@@ -4,13 +4,24 @@
 #include "RadioInterface.h"
 #include "TestUtil.h"
 #include "memory/MemAudit.h"
-#include <string.h>
+#include <cstring>
 #include <unity.h>
 
 #include "meshtastic/config.pb.h"
 #include "support/MockMeshService.h"
 
 static MockMeshService *mockMeshService;
+
+static int32_t packetPoolLiveBytes()
+{
+    memaudit::Tag rows[memaudit::kMaxTags];
+    const size_t count = memaudit::snapshot(rows, memaudit::kMaxTags);
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(rows[i].tag, "pktpool(live)") == 0)
+            return rows[i].bytes;
+    }
+    return 0;
+}
 
 static void test_lr20x0BandClassification()
 {
@@ -419,17 +430,6 @@ static void test_regionPresetMap_unsetCarriesUserprefsIntent()
 #endif
 }
 
-// In-flight packet bytes as packetPool reports them, 0 before the first alloc registers the tag.
-static int32_t packetPoolLiveBytes()
-{
-    memaudit::Tag rows[memaudit::kMaxTags];
-    size_t n = memaudit::snapshot(rows, memaudit::kMaxTags);
-    for (size_t i = 0; i < n; i++)
-        if (rows[i].tag && strcmp(rows[i].tag, "pktpool(live)") == 0)
-            return rows[i].bytes;
-    return 0;
-}
-
 // Oversize is refused at the radio queue in Router::send(). If one ever gets this far the memcpy is
 // clamped instead of failing, and the packet stays the caller's to release.
 static void test_beginSending_oversizedPayloadIsClamped()
@@ -460,8 +460,12 @@ static void test_beginSending_oversizedPayloadIsClamped()
 // The clamp must not shorten ordinary traffic, and a maximum-size frame must still fit the PHY.
 static void test_beginSending_fittingPayloadIsSentWhole()
 {
+    // Portduino uses the dynamic packet pool, where malloc is not required to reuse the address
+    // that was just freed. The live-byte counter verifies the release without allocator assumptions.
+    const int32_t liveBytesBefore = packetPoolLiveBytes();
     meshtastic_MeshPacket *p = packetPool.allocZeroed();
     TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_EQUAL_INT32(liveBytesBefore + static_cast<int32_t>(sizeof(*p)), packetPoolLiveBytes());
     p->from = 0x12345678;
     p->to = 0x87654321;
     p->id = 0x10203041;
@@ -472,6 +476,7 @@ static void test_beginSending_fittingPayloadIsSentWhole()
                                    "the largest allowed payload must produce a frame at the PHY limit");
     testRadio->clearSendingPacketForTest();
     packetPool.release(p);
+    TEST_ASSERT_EQUAL_INT32(liveBytesBefore, packetPoolLiveBytes());
 }
 void setUp(void)
 {

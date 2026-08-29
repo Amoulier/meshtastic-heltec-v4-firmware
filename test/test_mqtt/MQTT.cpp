@@ -103,8 +103,10 @@ class MockRoutingModule : public RoutingModule
 {
   public:
     void sendAckNak(meshtastic_Routing_Error err, NodeNum to, PacketId idFrom, ChannelIndex chIndex, uint8_t hopLimit = 0,
-                    bool ackWantsAck = false) override
+                    bool ackWantsAck = false, const meshtastic_MeshPacket *relaySource = nullptr) override
     {
+        (void)ackWantsAck;
+        (void)relaySource;
         ackNacks_.emplace_back(err, to, idFrom, chIndex, hopLimit);
     }
     std::list<std::tuple<meshtastic_Routing_Error, NodeNum, PacketId, ChannelIndex, uint8_t>>
@@ -798,6 +800,26 @@ void test_receiveAcksOwnSentMessages(void)
 
     mockMeshService->releaseToPool(ack);
     TEST_ASSERT_NULL(mockMeshService->getForPhone()); // exactly one ACK
+}
+
+// Broker bridges can deliver the same self-gateway envelope more than once. It is one piece of
+// delivery evidence, not one relay per duplicate, so only the first copy may reach the phone.
+void test_receiveDeduplicatesOwnSentMessageAcks(void)
+{
+    meshtastic_MeshPacket p = decoded;
+    p.from = myNodeInfo.my_node_num;
+    p.id++;
+
+    unitTest->publish(&p, nodeDB->getNodeId().c_str());
+    unitTest->publish(&p, nodeDB->getNodeId().c_str());
+    unitTest->publish(&p, nodeDB->getNodeId().c_str());
+
+    meshtastic_MeshPacket *ack = mockMeshService->getForPhone();
+    TEST_ASSERT_NOT_NULL(ack);
+    TEST_ASSERT_EQUAL(p.id, ack->decoded.request_id);
+    TEST_ASSERT_EQUAL(meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT, ack->transport_mechanism);
+    mockMeshService->releaseToPool(ack);
+    TEST_ASSERT_NULL(mockMeshService->getForPhone());
 }
 
 // Should ignore our own messages from MQTT that were heard by other nodes.
@@ -1508,6 +1530,7 @@ void setup()
     RUN_TEST(test_receiveEncryptedPKITopicToUs);
     RUN_TEST(test_receiveIgnoresOwnPublishedMessages);
     RUN_TEST(test_receiveAcksOwnSentMessages);
+    RUN_TEST(test_receiveDeduplicatesOwnSentMessageAcks);
     RUN_TEST(test_receiveIgnoresSentMessagesFromOthers);
     RUN_TEST(test_receiveIgnoresDecodedWhenEncryptionEnabled);
     RUN_TEST(test_receiveIgnoresDecodedAdminApp);

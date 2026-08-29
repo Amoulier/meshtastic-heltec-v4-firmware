@@ -5,6 +5,7 @@
 
 #include "MeshTypes.h" // before TestUtil.h: provides NodeNum etc.
 #include "TestUtil.h"
+#include "UptimeClock.h"
 #include <unity.h>
 
 #include "airtime.h"
@@ -88,6 +89,22 @@ class ReliableRouterTestShim : public ReliableRouter
 
     bool hasPending(NodeNum from, PacketId id) { return findPendingPacket(from, id) != nullptr; }
 
+    bool mqttImplicitAckSeen(NodeNum from, PacketId id)
+    {
+        PendingPacket *entry = findPendingPacket(from, id);
+        TEST_ASSERT_NOT_NULL(entry);
+        return entry->mqttImplicitAckSeen;
+    }
+
+    void expireRetry(NodeNum from, PacketId id)
+    {
+        PendingPacket *entry = findPendingPacket(from, id);
+        TEST_ASSERT_NOT_NULL(entry);
+        entry->numRetransmissions = 0;
+        entry->nextTxMsec = Time::getMillis();
+        doRetransmissions();
+    }
+
     uint32_t pendingNextTx(NodeNum from, PacketId id)
     {
         PendingPacket *entry = findPendingPacket(from, id);
@@ -165,8 +182,9 @@ class MockRoutingModule : public RoutingModule
 {
   public:
     void sendAckNak(meshtastic_Routing_Error err, NodeNum to, PacketId idFrom, ChannelIndex chIndex, uint8_t hopLimit = 0,
-                    bool ackWantsAck = false) override
+                    bool ackWantsAck = false, const meshtastic_MeshPacket *relaySource = nullptr) override
     {
+        (void)relaySource;
         ackNaks.emplace_back(err, to, idFrom, chIndex, hopLimit, ackWantsAck);
     }
 
@@ -588,6 +606,166 @@ void test_remote_ack_via_mqtt_still_stops_retransmissions(void)
     TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
 }
 
+void test_lora_ack_stops_message_originally_marked_mqtt(void)
+{
+    auto original = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+    original.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
+    reliableShim->seedRetry(original, NextHopRouter::NUM_RELIABLE_UNICAST_ATTEMPTS);
+
+    auto ack = makeDecodedPacket(meshtastic_PortNum_ROUTING_APP, kRemoteNode, kLocalNode, 1);
+    ack.decoded.request_id = original.id;
+    ack.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
+    meshtastic_Routing routing = meshtastic_Routing_init_zero;
+    routing.error_reason = meshtastic_Routing_Error_NONE;
+
+    reliableShim->sniffForTest(&ack, &routing);
+
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+}
+
+void test_broadcast_without_ack_reports_max_retransmit(void)
+{
+    auto original =
+        makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, NODENUM_BROADCAST, 1, /*wantAck=*/true);
+    reliableShim->seedRetry(original, NextHopRouter::NUM_RELIABLE_RETX);
+
+    reliableShim->expireRetry(kLocalNode, original.id);
+
+    expectSingleAckNak(meshtastic_Routing_Error_MAX_RETRANSMIT, kLocalNode, original.id, 1, /*hopLimit=*/0,
+                       /*ackWantsAck=*/false);
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+}
+
+void test_broadcast_marked_mqtt_without_ack_reports_max_retransmit(void)
+{
+    auto original =
+        makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, NODENUM_BROADCAST, 1, /*wantAck=*/true);
+    original.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
+    reliableShim->seedRetry(original, NextHopRouter::NUM_RELIABLE_RETX);
+
+    reliableShim->expireRetry(kLocalNode, original.id);
+
+    expectSingleAckNak(meshtastic_Routing_Error_MAX_RETRANSMIT, kLocalNode, original.id, 1, /*hopLimit=*/0,
+                       /*ackWantsAck=*/false);
+}
+
+void test_broadcast_lora_implicit_ack_stops_retransmissions(void)
+{
+    auto original =
+        makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, NODENUM_BROADCAST, 1, /*wantAck=*/true);
+    reliableShim->seedRetry(original, NextHopRouter::NUM_RELIABLE_RETX);
+
+    meshtastic_MeshPacket overheard = original;
+    overheard.hop_limit--;
+    overheard.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
+    overheard.which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
+    overheard.encrypted.size = 32;
+    reliableShim->filterForTest(&overheard);
+
+    expectSingleAckNak(meshtastic_Routing_Error_NONE, kLocalNode, original.id, 1, /*hopLimit=*/0,
+                       /*ackWantsAck=*/false);
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+}
+
+void test_broadcast_mqtt_implicit_ack_omits_later_max_retransmit(void)
+{
+    auto original =
+        makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, NODENUM_BROADCAST, 1, /*wantAck=*/true);
+    reliableShim->seedRetry(original, NextHopRouter::NUM_RELIABLE_RETX);
+
+    auto ack = makeDecodedPacket(meshtastic_PortNum_ROUTING_APP, kLocalNode, kLocalNode, 1);
+    ack.decoded.request_id = original.id;
+    ack.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
+    reliableShim->sniffForTest(&ack, nullptr);
+
+    TEST_ASSERT_TRUE(reliableShim->mqttImplicitAckSeen(kLocalNode, original.id));
+    reliableShim->expireRetry(kLocalNode, original.id);
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+}
+
+void test_duplicate_mqtt_implicit_acks_remain_idempotent_at_timeout(void)
+{
+    auto original =
+        makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, NODENUM_BROADCAST, 1, /*wantAck=*/true);
+    reliableShim->seedRetry(original, NextHopRouter::NUM_RELIABLE_RETX);
+
+    auto ack = makeDecodedPacket(meshtastic_PortNum_ROUTING_APP, kLocalNode, kLocalNode, 1);
+    ack.decoded.request_id = original.id;
+    ack.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
+    reliableShim->sniffForTest(&ack, nullptr);
+    reliableShim->sniffForTest(&ack, nullptr); // broker/bridge duplicate
+    reliableShim->sniffForTest(&ack, nullptr);
+
+    TEST_ASSERT_TRUE(reliableShim->mqttImplicitAckSeen(kLocalNode, original.id));
+    reliableShim->expireRetry(kLocalNode, original.id);
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+}
+
+void test_mismatched_mqtt_ack_does_not_hide_failure(void)
+{
+    auto original =
+        makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, NODENUM_BROADCAST, 1, /*wantAck=*/true);
+    reliableShim->seedRetry(original, NextHopRouter::NUM_RELIABLE_RETX);
+
+    auto ack = makeDecodedPacket(meshtastic_PortNum_ROUTING_APP, kLocalNode, kLocalNode, 1);
+    ack.decoded.request_id = original.id + 1;
+    ack.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
+    reliableShim->sniffForTest(&ack, nullptr);
+
+    TEST_ASSERT_FALSE(reliableShim->mqttImplicitAckSeen(kLocalNode, original.id));
+    reliableShim->expireRetry(kLocalNode, original.id);
+    expectSingleAckNak(meshtastic_Routing_Error_MAX_RETRANSMIT, kLocalNode, original.id, 1, /*hopLimit=*/0,
+                       /*ackWantsAck=*/false);
+}
+
+void test_mqtt_ack_just_before_timeout_wins(void)
+{
+    auto original =
+        makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, NODENUM_BROADCAST, 1, /*wantAck=*/true);
+    reliableShim->seedRetry(original, NextHopRouter::NUM_RELIABLE_RETX);
+
+    auto ack = makeDecodedPacket(meshtastic_PortNum_ROUTING_APP, kLocalNode, kLocalNode, 1);
+    ack.decoded.request_id = original.id;
+    ack.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
+    reliableShim->sniffForTest(&ack, nullptr);
+    reliableShim->expireRetry(kLocalNode, original.id);
+
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+}
+
+void test_mqtt_ack_after_timeout_does_not_rewrite_failure(void)
+{
+    auto original =
+        makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, NODENUM_BROADCAST, 1, /*wantAck=*/true);
+    reliableShim->seedRetry(original, NextHopRouter::NUM_RELIABLE_RETX);
+    reliableShim->expireRetry(kLocalNode, original.id);
+
+    auto ack = makeDecodedPacket(meshtastic_PortNum_ROUTING_APP, kLocalNode, kLocalNode, 1);
+    ack.decoded.request_id = original.id;
+    ack.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
+    reliableShim->sniffForTest(&ack, nullptr);
+
+    expectSingleAckNak(meshtastic_Routing_Error_MAX_RETRANSMIT, kLocalNode, original.id, 1, /*hopLimit=*/0,
+                       /*ackWantsAck=*/false);
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+}
+
+void test_direct_mqtt_implicit_ack_preserves_relayed_status_at_timeout(void)
+{
+    auto original = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+    reliableShim->seedRetry(original, NextHopRouter::NUM_RELIABLE_UNICAST_ATTEMPTS);
+
+    auto ack = makeDecodedPacket(meshtastic_PortNum_ROUTING_APP, kLocalNode, kLocalNode, 1);
+    ack.decoded.request_id = original.id;
+    ack.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
+    reliableShim->sniffForTest(&ack, nullptr);
+    reliableShim->expireRetry(kLocalNode, original.id);
+
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+}
+
 // ===========================================================================
 // Group 5 - implicit ACK for our own overheard DM through shouldFilterReceived. This is the
 // pre-existing route (a decodable copy still in encrypted wire form reaches it); the #11502
@@ -830,6 +1008,16 @@ void setup()
     RUN_TEST(test_own_ack_echo_via_mqtt_keeps_retransmissions);
     RUN_TEST(test_own_ack_echo_via_lora_stops_retransmissions);
     RUN_TEST(test_remote_ack_via_mqtt_still_stops_retransmissions);
+    RUN_TEST(test_lora_ack_stops_message_originally_marked_mqtt);
+    RUN_TEST(test_broadcast_without_ack_reports_max_retransmit);
+    RUN_TEST(test_broadcast_marked_mqtt_without_ack_reports_max_retransmit);
+    RUN_TEST(test_broadcast_lora_implicit_ack_stops_retransmissions);
+    RUN_TEST(test_broadcast_mqtt_implicit_ack_omits_later_max_retransmit);
+    RUN_TEST(test_duplicate_mqtt_implicit_acks_remain_idempotent_at_timeout);
+    RUN_TEST(test_mismatched_mqtt_ack_does_not_hide_failure);
+    RUN_TEST(test_mqtt_ack_just_before_timeout_wins);
+    RUN_TEST(test_mqtt_ack_after_timeout_does_not_rewrite_failure);
+    RUN_TEST(test_direct_mqtt_implicit_ack_preserves_relayed_status_at_timeout);
 
     printf("\n=== implicit ACK for our own overheard DM ===\n");
     RUN_TEST(test_overheard_own_dm_rebroadcast_mints_implicit_ack);

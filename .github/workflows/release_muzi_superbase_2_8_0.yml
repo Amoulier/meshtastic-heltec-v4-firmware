@@ -1,0 +1,132 @@
+name: Release MuziWorks Superbase 2.8.0
+
+on:
+  push:
+    branches:
+      - release/muzi-base-2.8.0-superbase.4
+    paths:
+      - .github/workflows/release_muzi_superbase_2_8_0.yml
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  native-tests:
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+    uses: ./.github/workflows/test_native.yml
+
+  build-muzi-base:
+    uses: ./.github/workflows/build_firmware.yml
+    with:
+      version: 2.8.0-superbase.4
+      platform: nrf52840
+      pio_env: muzi-base
+
+  release:
+    needs:
+      - native-tests
+      - build-muzi-base
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download Muzi Base firmware
+        uses: actions/download-artifact@v8
+        with:
+          name: firmware-nrf52840-muzi-base-2.8.0-superbase.4
+          path: release-assets
+
+      - name: Select Muzi Base release files
+        shell: bash
+        run: |
+          shopt -s nullglob
+          uf2_files=(release-assets/firmware-muzi-base-*.uf2)
+          manifest_files=(release-assets/firmware-muzi-base-*.mt.json)
+          ota_files=(release-assets/firmware-muzi-base-*-ota.zip)
+
+          if [[ ${#uf2_files[@]} -ne 1 || ${#manifest_files[@]} -ne 1 || ${#ota_files[@]} -ne 1 ]]; then
+            echo "Expected exactly one Muzi Base UF2, manifest, and OTA DFU package" >&2
+            printf 'UF2: %s\n' "${uf2_files[@]}" >&2
+            printf 'Manifest: %s\n' "${manifest_files[@]}" >&2
+            printf 'OTA: %s\n' "${ota_files[@]}" >&2
+            exit 1
+          fi
+
+          mkdir curated-release-assets
+          cp "${uf2_files[0]}" "${manifest_files[0]}" "${ota_files[0]}" curated-release-assets/
+
+      - name: Validate Nordic OTA DFU package
+        shell: bash
+        run: |
+          ota_file=(curated-release-assets/firmware-muzi-base-*-ota.zip)
+          python - "${ota_file[0]}" <<'PY'
+          import json
+          import sys
+          import zipfile
+
+          with zipfile.ZipFile(sys.argv[1]) as package:
+              entries = sorted(package.namelist())
+              manifest = json.loads(package.read("manifest.json"))
+
+          application = manifest["manifest"]["application"]
+          expected = sorted(["manifest.json", application["bin_file"], application["dat_file"]])
+          if entries != expected:
+              raise SystemExit(f"Unexpected Nordic DFU package contents: {entries}")
+          if not application["bin_file"].endswith(".bin") or not application["dat_file"].endswith(".dat"):
+              raise SystemExit("Nordic DFU manifest has invalid application filenames")
+
+          print(json.dumps(manifest, indent=2, sort_keys=True))
+          PY
+
+      - name: Create Muzi Base firmware bundle
+        run: zip -j -9 firmware-muzi-base-v2.8.0-superbase.4-bundle.zip curated-release-assets/*.uf2 curated-release-assets/*.mt.json curated-release-assets/*-ota.zip
+
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v2.8.0-superbase.4
+          target_commitish: ${{ github.sha }}
+          name: Meshtastic 2.8.0 for MuziWorks Superbase — Upstream Sync and Power Optimization
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            Custom Meshtastic 2.8.0 firmware exclusively for the MuziWorks Superbase (`muzi-base`).
+
+            ## New in this release
+
+            - Integrates the reviewed upstream `develop` changes while preserving the Superbase-specific behavior already validated in this fork.
+            - Keeps the MQTT implicit-ACK fix so a successfully relayed channel broadcast does not later change to **Failed to deliver to mesh** because of a retransmit timeout.
+            - Keeps the corrected **DMs Only** buzzer behavior and the existing Superbase audio/power fixes.
+            - Keeps the Muzi Base stationary position interval at 12 hours instead of adopting the upstream 6-hour interval, reducing unnecessary stationary transmissions.
+            - Improves idle battery use on the Superbase ICM20948: when the screen is off and motion wake/double-tap are not requested, the auxiliary AK09916 magnetometer is placed in power-down together with the sleeping IMU and restored to continuous 100 Hz operation when the IMU wakes.
+            - The AK09916 power optimization is scoped only to `MUZI_BASE`; other ICM20948 targets retain their previous behavior.
+
+            **RX Boosted Gain and LoRa TX power were not modified.**
+
+            ## Validation
+
+            - Final Superbase native audit: all 8 shards passed.
+            - Packet-signing native audit: passed.
+            - MuziWorks Superbase nRF52840 build: passed.
+            - The release workflow reruns the full native test workflow and performs a fresh `muzi-base` build before publishing.
+            - The Nordic OTA ZIP is structurally validated before upload.
+
+            This build is intended for physical field testing of functionality and battery runtime before being considered stable.
+
+            ## Installation
+
+            - **OTA:** select the `firmware-muzi-base-*-ota.zip` file without extracting it. OTA requires the MuziWorks OTAFIX bootloader.
+            - **USB/UF2:** enter the UF2 bootloader and copy the standalone `firmware-muzi-base-*.uf2` file to the mounted `muzi-Base` drive.
+            - The bundle ZIP contains the OTA package, UF2 firmware, and Meshtastic manifest for convenience.
+
+            Back up the node configuration and keep the device powered throughout installation.
+
+            This is an unofficial prerelease from this fork and is not an official Meshtastic stable release.
+          files: |
+            firmware-muzi-base-v2.8.0-superbase.4-bundle.zip
+            curated-release-assets/firmware-muzi-base-*.uf2
+            curated-release-assets/firmware-muzi-base-*.mt.json
+            curated-release-assets/firmware-muzi-base-*-ota.zip
