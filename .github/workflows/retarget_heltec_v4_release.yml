@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   retarget:
-    if: github.event.head_commit.message == 'chore(heltec-v4): retarget v2.8.0.3 tag'
+    if: "${{ github.event.head_commit.message == 'chore(heltec-v4): retarget v2.8.0.3 tag (retry)' }}"
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
