@@ -3,7 +3,7 @@ name: Release Heltec V4 Power Optimized
 on:
   push:
     branches:
-      - "feature/heltec-v4-power-optimization"
+      - "main"
 
 permissions: read-all
 
