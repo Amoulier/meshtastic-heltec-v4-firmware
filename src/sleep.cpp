@@ -202,17 +202,21 @@ bool doPreflightSleep(bool deepSleep)
 }
 
 /// Tell devices we are going to sleep and wait for them to handle things
-static void waitEnterSleep(bool skipPreflight, bool deepSleep)
+static void waitEnterSleep(bool skipPreflight, bool deepSleep,
+                           DeepSleepWakePolicy wakePolicy = DeepSleepWakePolicy::ROLE_DEFAULT)
 {
     if (!skipPreflight) {
         uint32_t now = millis();
         while (!doPreflightSleep(deepSleep)) {
             delay(100); // Kinda yucky - wait until radio says say we can shutdown (finished in process sends/receives)
 
-            if (!Throttle::isWithinTimespanMs(now,
-                                              THIRTY_SECONDS_MS)) { // If we wait too long just report an error and go to sleep
-                RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_SLEEP_ENTER_WAIT);
-                assert(0); // FIXME - for now we just restart, need to fix bug #167
+            if (!Throttle::isWithinTimespanMs(now, THIRTY_SECONDS_MS)) {
+                if (shouldAssertOnDeepSleepPreflightTimeout(wakePolicy)) {
+                    RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_SLEEP_ENTER_WAIT);
+                    assert(0); // FIXME - for now we just restart, need to fix bug #167
+                } else {
+                    LOG_WARN("Critical sleep preflight timed out; forcing peripheral shutdown");
+                }
                 break;
             }
         }
@@ -233,7 +237,7 @@ void doDeepSleep(uint32_t msecToWake, bool skipPreflight, bool skipSaveNodeDb, D
 
     // not using wifi yet, but once we are this is needed to shutoff the radio hw
     // esp_wifi_stop();
-    waitEnterSleep(skipPreflight, true);
+    waitEnterSleep(skipPreflight, true, wakePolicy);
 
 #if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_BLUETOOTH
     // Full shutdown of bluetooth hardware

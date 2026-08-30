@@ -13,6 +13,8 @@ static_assert(shouldEnableExternalWakeInDeepSleep(DeepSleepWakePolicy::ROLE_DEFA
 static_assert(!shouldEnableExternalWakeInDeepSleep(DeepSleepWakePolicy::TIMER_ONLY));
 static_assert(shouldKeepRtcPeripheralsPoweredInDeepSleep(DeepSleepWakePolicy::ROLE_DEFAULT));
 static_assert(!shouldKeepRtcPeripheralsPoweredInDeepSleep(DeepSleepWakePolicy::TIMER_ONLY));
+static_assert(shouldAssertOnDeepSleepPreflightTimeout(DeepSleepWakePolicy::ROLE_DEFAULT));
+static_assert(!shouldAssertOnDeepSleepPreflightTimeout(DeepSleepWakePolicy::TIMER_ONLY));
 
 static_assert(!shouldUseCriticalBatteryRecovery(0, false, 2500, 3500, 3650));
 static_assert(!shouldUseCriticalBatteryRecovery(2499, false, 2500, 3500, 3650));
