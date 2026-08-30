@@ -69,15 +69,11 @@ static void configureAndHoldEarlyPin(int pin, uint8_t level)
 
 static void releaseBatteryRecoveryHolds()
 {
-    releaseEarlyPinHold(ADC_CTRL);
-    releaseEarlyPinHold(BATTERY_PIN);
-    releaseEarlyPinHold(RESET_OLED);
-    releaseEarlyPinHold(VEXT_ENABLE);
-    releaseEarlyPinHold(PIN_GPS_EN);
-    releaseEarlyPinHold(LORA_RESET);
-    releaseEarlyPinHold(LORA_KCT8103L_PA_CSD);
-    releaseEarlyPinHold(LORA_PA_POWER);
-    releaseEarlyPinHold(LED_POWER);
+    // A reset during recovery reports an undefined wake cause, so initDeepSleep() will not run its
+    // normal release loop. Clear every inherited hold here before resuming a full boot.
+    for (int pin = 0; pin <= GPIO_NUM_MAX; pin++) {
+        releaseEarlyPinHold(pin);
+    }
     gpio_deep_sleep_hold_dis();
 }
 
