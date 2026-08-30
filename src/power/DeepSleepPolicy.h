@@ -20,6 +20,11 @@ constexpr bool shouldEnableExternalWakeInDeepSleep(DeepSleepWakePolicy policy)
     return policy == DeepSleepWakePolicy::ROLE_DEFAULT;
 }
 
+constexpr bool shouldKeepRtcPeripheralsPoweredInDeepSleep(DeepSleepWakePolicy policy)
+{
+    return policy == DeepSleepWakePolicy::ROLE_DEFAULT;
+}
+
 constexpr bool shouldUseCriticalBatteryRecovery(uint16_t batteryMillivolts, bool recoveryLatched,
                                                 uint16_t bootGuardMinimumMillivolts,
                                                 uint16_t criticalMillivolts, uint16_t recoveryMillivolts)

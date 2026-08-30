@@ -392,8 +392,9 @@ void cpuDeepSleep(uint32_t msecToWake, DeepSleepWakePolicy wakePolicy)
     }
 
 #if SOC_PM_SUPPORT_RTC_PERIPH_PD
-    // We want RTC peripherals to stay on
-    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    // External GPIO wake needs RTC peripherals; timer-only critical sleep can power them down.
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH,
+                        shouldKeepRtcPeripheralsPoweredInDeepSleep(wakePolicy) ? ESP_PD_OPTION_ON : ESP_PD_OPTION_AUTO);
 #endif
 
     // User shutdown (DELAY_FOREVER / portMAX_DELAY): no RTC timer - align with nRF52 system_off semantics.
