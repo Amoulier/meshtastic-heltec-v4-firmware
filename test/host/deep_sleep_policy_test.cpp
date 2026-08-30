@@ -1,6 +1,12 @@
 #include "power/DeepSleepPolicy.h"
 
+static_assert(criticalBatteryDeepSleepWakePolicy(false) == DeepSleepWakePolicy::ROLE_DEFAULT);
+static_assert(criticalBatteryDeepSleepWakePolicy(true) == DeepSleepWakePolicy::TIMER_ONLY);
+#if defined(HELTEC_V4_SOLAR_ROUTER_PROFILE) && HELTEC_V4_SOLAR_ROUTER_PROFILE
 static_assert(criticalBatteryDeepSleepWakePolicy() == DeepSleepWakePolicy::TIMER_ONLY);
+#else
+static_assert(criticalBatteryDeepSleepWakePolicy() == DeepSleepWakePolicy::ROLE_DEFAULT);
+#endif
 
 static_assert(shouldKeepLoraAwakeInDeepSleep(true, true, DeepSleepWakePolicy::ROLE_DEFAULT));
 static_assert(!shouldKeepLoraAwakeInDeepSleep(true, true, DeepSleepWakePolicy::TIMER_ONLY));

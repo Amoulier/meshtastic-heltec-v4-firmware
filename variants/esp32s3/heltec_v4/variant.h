@@ -11,15 +11,21 @@
 #ifdef HELTEC_V4_OLED
 // Calibrated from the usable discharge range of the Heltec V4.3 test node.
 #define OCV_ARRAY 4300, 4160, 4080, 4000, 3920, 3825, 3750, 3690, 3630, 3565, 3500
+#define BATTERY_CHARGING_MILLIVOLTS 4320
+// Limit the published state-of-charge movement without delaying the raw-voltage
+// protection path. This rejects short LoRa TX voltage sags from the UI/telemetry.
+#define BATTERY_PERCENT_SLEW_INTERVAL_MSEC 60000
+
+#if defined(HELTEC_V4_SOLAR_ROUTER_PROFILE) && HELTEC_V4_SOLAR_ROUTER_PROFILE
+// Aggressive brownout protection is intentionally limited to the explicit
+// Solar Router build. The Standard profile retains Meshtastic's normal
+// critical-battery threshold and wake behavior.
 #define BATTERY_CRITICAL_MILLIVOLTS 3500
 #define BATTERY_CRITICAL_RECOVERY_MILLIVOLTS 3650
 #define BATTERY_CRITICAL_READINGS 3
 #define BATTERY_CRITICAL_SLEEP_MSEC 60000
 #define BATTERY_BOOT_GUARD_MIN_MILLIVOLTS 2500
-#define BATTERY_CHARGING_MILLIVOLTS 4320
-// Limit the published state-of-charge movement without delaying the raw-voltage
-// protection path. This rejects short LoRa TX voltage sags from the UI/telemetry.
-#define BATTERY_PERCENT_SLEW_INTERVAL_MSEC 60000
+#endif
 #endif
 
 #define USE_SX1262

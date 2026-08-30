@@ -1,29 +1,47 @@
-# Meshtastic Heltec V4 Power-Optimized Firmware
+# Meshtastic Heltec V4 Firmware Profiles
 
-A focused Meshtastic firmware distribution for the **Heltec WiFi LoRa 32 V4 OLED** PlatformIO target (`heltec-v4`), developed and hardware-tested on the **Heltec V4.3 OLED**.
+A focused Meshtastic firmware distribution for the **Heltec WiFi LoRa 32 V4 OLED**, developed and hardware-tested on the **Heltec V4.3 OLED**.
 
-The purpose of this repository is to improve unattended battery operation, protect configuration data during deep discharge, and provide predictable display, GPS, Bluetooth, and MQTT behavior without reducing LoRa reception or changing regional radio limits.
+This repository keeps one maintained source tree but produces two explicit firmware profiles:
+
+- **Standard** for regular personal, portable, mobile, or client nodes.
+- **Solar Router** for fixed, unattended solar infrastructure deliberately configured as `ROUTER` or `ROUTER_LATE`.
+
+The common goal is lower avoidable power consumption, protection against deep-discharge corruption, and predictable OLED, GPS, Bluetooth, and MQTT behavior without reducing LoRa reception or changing regional radio limits.
 
 > This is an independent, hardware-specific distribution based on the official [Meshtastic firmware](https://github.com/meshtastic/firmware). It is not an official Meshtastic release.
 
-## Hardware scope
+## Choose the correct profile
 
-This repository intentionally supports one firmware target:
+| Profile | PlatformIO environment | Intended use | Critical-battery behavior |
+| --- | --- | --- | --- |
+| **Standard** | `heltec-v4-standard` | `CLIENT`, `CLIENT_MUTE`, `CLIENT_BASE`, tracker, handheld, mobile, and other regular nodes | Meshtastic's normal 3.10 V threshold, 10 confirming readings, and role-default wake behavior |
+| **Solar Router** | `heltec-v4-solar-router` | Fixed, elevated, unattended solar infrastructure using `ROUTER` or `ROUTER_LATE` | 3.50 V threshold, 3 confirming readings, timer-only sleep, peripheral isolation, and a 3.65 V recovery latch |
+
+The firmware profile does **not** change the node role automatically. Select the intended role separately in the Meshtastic app or CLI.
+
+Do not use an advanced routing role merely because a node is stationary. Most personal and mobile nodes should remain on a client role. Use the Solar Router profile only where the node is intentionally part of fixed routing infrastructure and has an appropriate antenna, location, battery, and solar supply.
+
+### Legacy build target
+
+The historical PlatformIO environment:
 
 ```text
 heltec-v4
 ```
 
-It does **not** build or publish firmware for:
+remains as a compatibility alias for `heltec-v4-solar-router`. New releases publish only the explicit `standard` and `solar-router` filenames so the installed behavior is unambiguous.
+
+## Hardware scope
+
+This repository intentionally supports only the Heltec V4 OLED family represented by these profiles. It does **not** build or publish firmware for:
 
 - Heltec V4 TFT
 - Heltec V4 R8
 - Muziworks Superbase
 - Any other ESP32, nRF52, RP2040, STM32, Portduino, or Linux target
 
-The source tree, PlatformIO configuration, GitHub Actions workflows, and releases are kept specific to the Heltec V4 OLED.
-
-## What this fork changes
+## Improvements shared by both profiles
 
 ### Persistent OLED power control
 
@@ -35,30 +53,27 @@ A dedicated **Display Options → Disable Display** command provides a true pers
 - Persists across reboots and OTA updates.
 - Holding **PRG for approximately one second** restores the display.
 
-This is different from **Sleep Screen**, which is a temporary screen sleep and may wake on normal events.
+This is different from **Sleep Screen**, which is temporary and may wake on normal events.
 
 ### GPS power behavior
 
 - GPS is disabled by default after a clean installation.
 - GPS probing and initialization are skipped while GPS is disabled.
 - OLED and GPS controls remain independent.
-- Users can enable GPS normally from Meshtastic when location services are required.
+- GPS can be enabled normally when location services are required.
 
-### Battery reporting and storage protection
+### Battery reporting
 
 - Uses a voltage curve calibrated for the usable discharge range observed on the Heltec V4.3 test node.
 - Smooths the published battery percentage so brief LoRa transmission voltage sag does not create large temporary jumps.
 - The displayed and telemetered percentage changes by no more than one percentage point per minute.
-- Low-voltage protection continues to use the **raw, unsmoothed voltage**.
-- At sustained readings of **3.50 V or below**, the node enters protective deep sleep.
-- Normal boot is held until the battery recovers to approximately **3.65 V**.
-- Optional flash writes are skipped during critical-voltage shutdown to reduce the risk of configuration corruption or loss.
+- Critical-voltage decisions continue to use the raw, unsmoothed voltage.
 
-Battery percentage remains an estimate derived from voltage; load, temperature, battery chemistry, cell condition, and charging state can affect the reading.
+Battery percentage remains an estimate derived from voltage. Load, temperature, battery chemistry, cell condition, and charging state can affect the reading.
 
 ### Bluetooth and CPU power
 
-- Enables dynamic CPU scaling between **40 and 80 MHz** for lower idle consumption.
+- Enables dynamic CPU scaling between **40 and 80 MHz** to reduce idle consumption.
 - Automatic light sleep remains disabled so Bluetooth advertising and reconnection stay available.
 - Disabling the OLED does **not** disconnect Bluetooth.
 - A phone can discover, connect, disconnect, and reconnect without pressing PRG.
@@ -75,17 +90,31 @@ Normal LoRa acknowledgements and routing behavior remain intact.
 
 ### Radio behavior intentionally unchanged
 
-The power optimizations do not change:
+Neither profile changes:
 
 - Regional LoRa limits
 - Configured transmit power
 - RX Boosted Gain behavior
-- LoRa FEM power-control behavior
+- LoRa FEM power-control behavior during normal operation
 - Normal packet reception, retransmission, or mesh participation
+
+## Solar Router safeguards
+
+The `heltec-v4-solar-router` profile adds aggressive protection intended for an unattended node that must survive poor solar conditions:
+
+1. Three consecutive raw readings at or below **3.50 V** trigger protective deep sleep.
+2. The critical sleep path skips optional flash writes to reduce brownout-related configuration damage.
+3. External wake sources are disabled; recovery checks use a timer only.
+4. The OLED, GPS, LED, LoRa FEM, radio state, and retained power domains are forced into their lowest safe state.
+5. A bounded preflight prevents the shutdown path from hanging indefinitely on a busy subsystem.
+6. After a critical shutdown, early boot checks battery voltage before starting Meshtastic.
+7. The node remains in recovery sleep until the battery reaches approximately **3.65 V**, preventing rapid boot/sleep oscillation.
+
+These safeguards are intentionally excluded from `heltec-v4-standard`. A regular node therefore retains normal button/external-wake behavior and does not enter the Solar Router boot-recovery latch.
 
 ## Validated behavior
 
-The current implementation has been hardware-tested for:
+The common implementation has been hardware-tested for:
 
 - Persistent OLED disable and PRG restoration
 - Public-channel and private-message reception while the OLED remains off
@@ -96,47 +125,65 @@ The current implementation has been hardware-tested for:
 - Battery telemetry under real LoRa traffic
 - Stable temperature and absence of unexpected reboots during the validation period
 
+Profile isolation is additionally checked by host policy tests and by compiling the Standard and Solar Router environments independently in GitHub Actions. The Solar Router critical-discharge path remains published as a prerelease until a complete low-voltage sleep and solar-recovery cycle is validated on the target installation.
+
 ## Installation
 
 Download the latest package from [Releases](https://github.com/Amoulier/meshtastic-heltec-v4-firmware/releases/latest).
 
-### OTA update — recommended
+### Standard node
 
-Use:
+Use files beginning with:
 
 ```text
-firmware-heltec-v4-*.bin
+firmware-heltec-v4-standard-
 ```
 
-An OTA or normal firmware update is recommended because it preserves the node configuration, cryptographic identity, keys, and persistent display setting.
+### Solar router
+
+Use files beginning with:
+
+```text
+firmware-heltec-v4-solar-router-
+```
+
+### OTA update — recommended
+
+Use the normal `.bin` image that does not contain `.factory` in its filename. An OTA or normal firmware update preserves the node configuration, cryptographic identity, keys, Bluetooth bonds, and persistent display setting.
 
 ### Clean installation
 
-Use:
-
-```text
-firmware-heltec-v4-*.factory.bin
-```
-
-The factory image is intended for recovery or a deliberately clean installation. Erasing flash may remove configuration, keys, Bluetooth bonds, and node identity.
+Use the `.factory.bin` image only for recovery or a deliberately clean installation. Erasing flash may remove configuration, keys, Bluetooth bonds, and node identity.
 
 Always connect the correct regional antenna before operating the LoRa radio.
 
 ## Build
 
-Build locally with PlatformIO:
+Build a regular-node image:
+
+```bash
+pio run -e heltec-v4-standard
+```
+
+Build the dedicated solar-router image:
+
+```bash
+pio run -e heltec-v4-solar-router
+```
+
+The legacy command remains available and maps to Solar Router:
 
 ```bash
 pio run -e heltec-v4
 ```
 
-GitHub Actions compiles only `heltec-v4`. A release is published only from an explicit commit whose message begins with:
+GitHub Actions compiles both explicit profiles. A release is published only from an explicit commit whose message begins with:
 
 ```text
 release(heltec-v4):
 ```
 
-Each release contains the normal OTA firmware, factory image, LittleFS image, manifest, installation scripts, ELF file, and ESP32-S3 unified OTA component.
+Each release provides directly flashable profile-specific binaries plus a complete ZIP bundle for each profile.
 
 ## Upstream synchronization
 
@@ -149,6 +196,7 @@ The fork is periodically audited and synchronized with the official Meshtastic `
 - GPS initialization
 - MQTT and LoRa acknowledgement routing
 - Radio and FEM power control
+- Standard versus Solar Router profile isolation
 
 The current firmware line incorporates official Meshtastic changes through:
 
