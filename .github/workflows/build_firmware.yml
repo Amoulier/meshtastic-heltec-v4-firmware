@@ -27,12 +27,20 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Test low-battery sleep policy
+      - name: Test Standard low-battery sleep policy
         run: |
           g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Isrc \
             test/host/deep_sleep_policy_test.cpp \
-            -o /tmp/heltec-v4-deep-sleep-policy-test
-          /tmp/heltec-v4-deep-sleep-policy-test
+            -o /tmp/heltec-v4-standard-deep-sleep-policy-test
+          /tmp/heltec-v4-standard-deep-sleep-policy-test
+
+      - name: Test Solar Router low-battery sleep policy
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -pedantic \
+            -DHELTEC_V4_SOLAR_ROUTER_PROFILE=1 -Isrc \
+            test/host/deep_sleep_policy_test.cpp \
+            -o /tmp/heltec-v4-solar-router-deep-sleep-policy-test
+          /tmp/heltec-v4-solar-router-deep-sleep-policy-test
 
       - name: Build ${{ inputs.platform }}
         id: build

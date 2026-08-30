@@ -1,4 +1,4 @@
-name: Release Heltec V4 Power Optimized
+name: Build and Release Heltec V4 Profiles
 
 on:
   push:
@@ -10,12 +10,19 @@ on:
 permissions: read-all
 
 jobs:
-  build:
+  build-standard:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: ${{ github.ref_name == 'main' && 'heltec-v4-power-v2.8.0.4' || format('heltec-v4-test-{0}', github.sha) }}
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-standard-v2.8.0.5' || format('heltec-v4-standard-test-{0}', github.sha) }}
       platform: esp32s3
-      pio_env: heltec-v4
+      pio_env: heltec-v4-standard
+
+  build-solar-router:
+    uses: ./.github/workflows/build_firmware.yml
+    with:
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-solar-router-v2.8.0.5' || format('heltec-v4-solar-router-test-{0}', github.sha) }}
+      platform: esp32s3
+      pio_env: heltec-v4-solar-router
 
   release:
     if: github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(heltec-v4):')
@@ -23,57 +30,85 @@ jobs:
       actions: read
       contents: write
     runs-on: ubuntu-latest
-    needs: build
+    needs:
+      - build-standard
+      - build-solar-router
     steps:
-      - name: Download Heltec V4 firmware
+      - name: Download Standard firmware
         uses: actions/download-artifact@v8
         with:
-          name: firmware-esp32s3-heltec-v4-heltec-v4-power-v2.8.0.4
-          path: release-assets
+          name: firmware-esp32s3-heltec-v4-standard-heltec-v4-standard-v2.8.0.5
+          path: release-assets/standard
 
-      - name: Verify release contents
+      - name: Download Solar Router firmware
+        uses: actions/download-artifact@v8
+        with:
+          name: firmware-esp32s3-heltec-v4-solar-router-heltec-v4-solar-router-v2.8.0.5
+          path: release-assets/solar-router
+
+      - name: Verify and package profile assets
         run: |
-          test -n "$(find release-assets -maxdepth 1 -type f -name 'firmware-heltec-v4-*.bin' -print -quit)"
-          find release-assets -maxdepth 1 -type f -print | sort
+          set -euo pipefail
 
-      - name: Publish Heltec V4 release
+          test -n "$(find release-assets/standard -maxdepth 1 -type f -name 'firmware-heltec-v4-standard-*.bin' -print -quit)"
+          test -n "$(find release-assets/solar-router -maxdepth 1 -type f -name 'firmware-heltec-v4-solar-router-*.bin' -print -quit)"
+
+          mkdir -p publish
+
+          find release-assets/standard -maxdepth 1 -type f \( -name 'firmware-heltec-v4-standard-*.bin' -o -name 'firmware-heltec-v4-standard-*.mt.json' \) -exec cp {} publish/ \;
+          find release-assets/solar-router -maxdepth 1 -type f \( -name 'firmware-heltec-v4-solar-router-*.bin' -o -name 'firmware-heltec-v4-solar-router-*.mt.json' \) -exec cp {} publish/ \;
+
+          (
+            cd release-assets/standard
+            zip -9 -r ../../publish/heltec-v4-standard-complete-v2.8.0.5.zip .
+          )
+          (
+            cd release-assets/solar-router
+            zip -9 -r ../../publish/heltec-v4-solar-router-complete-v2.8.0.5.zip .
+          )
+
+          find publish -maxdepth 1 -type f -print | sort
+
+      - name: Publish Heltec V4 profile release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: heltec-v4-power-v2.8.0.4
+          tag_name: heltec-v4-profiles-v2.8.0.5
           target_commitish: ${{ github.sha }}
-          name: Heltec V4 Power Optimized v2.8.0.4
+          name: Heltec V4 Standard and Solar Router v2.8.0.5
           prerelease: true
           generate_release_notes: false
           body: |
-            Custom Meshtastic firmware exclusively for the Heltec V4 OLED.
+            Custom Meshtastic firmware exclusively for the Heltec V4 OLED, now distributed as two explicit profiles from one maintained codebase.
 
-            Upstream base:
-            - Meshtastic `develop` through `7239fe886a30fa13cd35946fa5ae1a46a2807eeb`.
-            - Includes the upstream Bluetooth, NodeDB, radio, routing, waypoint, storage and BaseUI corrections through that commit.
+            Choose one profile:
 
-            Included improvements:
+            - `heltec-v4-standard`: regular personal or mobile nodes. It keeps the common OLED, GPS, Bluetooth, battery reporting, CPU and MQTT improvements, while retaining normal Meshtastic critical-battery thresholds and wake behavior.
+            - `heltec-v4-solar-router`: fixed solar infrastructure configured as `ROUTER` or `ROUTER_LATE`. It adds the aggressive 3.50 V protective shutdown, timer-only critical sleep, peripheral power isolation and 3.65 V recovery hysteresis.
+
+            The legacy PlatformIO target `heltec-v4` remains a compatibility alias for `heltec-v4-solar-router`, but release files use only the explicit profile names.
+
+            Common improvements:
+
             - Persistent `Display Options -> Disable Display` control.
-            - OLED power rail and reset line are shut down when the display is disabled.
-            - Incoming messages and other automatic events do not wake a disabled display.
-            - Holding the PRG button for about one second restores the display.
-            - GPS is disabled by default on a fresh Heltec V4 OLED installation.
-            - GPS initialization and probing are skipped while GPS is disabled.
-            - Display and GPS controls remain independent.
-            - Battery percentage uses a Heltec-specific voltage curve and smoothing to prevent temporary LoRa transmit voltage dips from producing large visual jumps.
-            - Published battery percentage changes by at most one point per minute; low-voltage protection continues to use the unsmoothed voltage.
-            - Low-battery shutdown protects the configuration from full-discharge brownouts, with a 3.50 V cutoff and 3.65 V recovery threshold.
-            - Dynamic 40-80 MHz CPU operation reduces idle consumption while Bluetooth remains discoverable and reconnectable without pressing PRG.
-            - The status LED remains off while the display is persistently disabled.
-            - MQTT implicit acknowledgements are handled correctly without changing normal LoRa acknowledgements.
-            - RX Boosted Gain behavior is unchanged.
-            - LoRa transmit power and regional radio settings are unchanged.
+            - Incoming messages and automatic events do not wake a persistently disabled OLED.
+            - Holding PRG for about one second restores the display.
+            - GPS is disabled by default on a clean installation and is not probed while disabled.
+            - Bluetooth remains discoverable and reconnectable without pressing PRG.
+            - Profile-aligned battery curves: Standard represents the normal 3.10 V discharge tail, while Solar Router reaches 0% at its 3.50 V protective cutoff.
+            - Published battery percentage is slew-limited without delaying raw-voltage protection.
+            - At each profile's own critical threshold, the optional NodeDB save is skipped to reduce brownout-related configuration risk.
+            - Correct MQTT implicit acknowledgement handling without changing normal LoRa acknowledgements.
+            - Regional settings, configured LoRa transmit power and RX Boosted Gain behavior remain unchanged.
 
-            Hardware validation:
-            - Persistent display disable was tested on a Heltec WiFi LoRa 32 V4.3 OLED.
-            - Incoming messages did not wake the persistently disabled OLED.
-            - Holding PRG for about one second restored the display.
-            - Bluetooth discovery and reconnection, public and private messages, MQTT acknowledgement behavior, and thermal stability were validated on hardware.
+            Solar Router safeguards:
 
-            Target: `heltec-v4` only. This release does not contain Muziworks Superbase firmware or TFT/R8 builds.
-          files: release-assets/*
+            - Three consecutive raw battery readings at or below 3.50 V trigger protective deep sleep.
+            - Critical sleep disables external wake sources and wakes only by timer.
+            - OLED, GPS, LED, LoRa FEM and other retained power domains are forced off.
+            - Boot remains in recovery sleep until battery voltage reaches approximately 3.65 V.
+
+            Upstream base: Meshtastic `develop` through `7239fe886a30fa13cd35946fa5ae1a46a2807eeb`.
+
+            This is an independent prerelease and is not an official Meshtastic build.
+          files: publish/*
           fail_on_unmatched_files: true

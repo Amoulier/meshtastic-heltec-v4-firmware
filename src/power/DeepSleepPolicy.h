@@ -4,9 +4,18 @@
 
 enum class DeepSleepWakePolicy : uint8_t { ROLE_DEFAULT, TIMER_ONLY };
 
+constexpr DeepSleepWakePolicy criticalBatteryDeepSleepWakePolicy(bool solarRouterProfile)
+{
+    return solarRouterProfile ? DeepSleepWakePolicy::TIMER_ONLY : DeepSleepWakePolicy::ROLE_DEFAULT;
+}
+
 constexpr DeepSleepWakePolicy criticalBatteryDeepSleepWakePolicy()
 {
-    return DeepSleepWakePolicy::TIMER_ONLY;
+#if defined(HELTEC_V4_SOLAR_ROUTER_PROFILE) && HELTEC_V4_SOLAR_ROUTER_PROFILE
+    return criticalBatteryDeepSleepWakePolicy(true);
+#else
+    return criticalBatteryDeepSleepWakePolicy(false);
+#endif
 }
 
 constexpr bool shouldKeepLoraAwakeInDeepSleep(bool hasTimedWake, bool isRouterRole,

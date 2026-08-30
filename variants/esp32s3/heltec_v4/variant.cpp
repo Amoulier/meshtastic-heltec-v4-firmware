@@ -5,7 +5,7 @@
 #include "power/DeepSleepPolicy.h"
 #include "variant.h"
 
-#if defined(HELTEC_V4_OLED)
+#if defined(HELTEC_V4_OLED) && defined(HELTEC_V4_SOLAR_ROUTER_PROFILE) && HELTEC_V4_SOLAR_ROUTER_PROFILE
 
 RTC_DATA_ATTR static bool batteryCriticalLatched = false;
 
