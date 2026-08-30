@@ -9,14 +9,9 @@
 #define ADC_MULTIPLIER 4.9 * 1.045
 
 #ifdef HELTEC_V4_OLED
-// Calibrated from the usable discharge range of the Heltec V4.3 test node.
-#define OCV_ARRAY 4300, 4160, 4080, 4000, 3920, 3825, 3750, 3690, 3630, 3565, 3500
-#define BATTERY_CHARGING_MILLIVOLTS 4320
-// Limit the published state-of-charge movement without delaying the raw-voltage
-// protection path. This rejects short LoRa TX voltage sags from the UI/telemetry.
-#define BATTERY_PERCENT_SLEW_INTERVAL_MSEC 60000
-
 #if defined(HELTEC_V4_SOLAR_ROUTER_PROFILE) && HELTEC_V4_SOLAR_ROUTER_PROFILE
+// The Solar Router curve deliberately reaches 0% at the protective 3.50 V cutoff.
+#define OCV_ARRAY 4300, 4160, 4080, 4000, 3920, 3825, 3750, 3690, 3630, 3565, 3500
 // Aggressive brownout protection is intentionally limited to the explicit
 // Solar Router build. The Standard profile retains Meshtastic's normal
 // critical-battery threshold and wake behavior.
@@ -25,7 +20,16 @@
 #define BATTERY_CRITICAL_READINGS 3
 #define BATTERY_CRITICAL_SLEEP_MSEC 60000
 #define BATTERY_BOOT_GUARD_MIN_MILLIVOLTS 2500
+#else
+// The Standard curve preserves the calibrated upper range while representing
+// Meshtastic's normal usable discharge tail instead of reporting 0% at 3.50 V.
+#define OCV_ARRAY 4300, 4160, 4080, 4000, 3920, 3825, 3720, 3630, 3530, 3420, 3100
 #endif
+
+#define BATTERY_CHARGING_MILLIVOLTS 4320
+// Limit the published state-of-charge movement without delaying the raw-voltage
+// protection path. This rejects short LoRa TX voltage sags from the UI/telemetry.
+#define BATTERY_PERCENT_SLEW_INTERVAL_MSEC 60000
 #endif
 
 #define USE_SX1262
@@ -89,7 +93,7 @@
 //   Shutdown:        CSD=0, CTX=X, CPS=X
 // Pin mapping:
 //   CPS (pin 5)  -> SX1262 DIO2: TX/RX path select (automatic via SX126X_DIO2_AS_RF_SWITCH)
-//   CSD (pin 4)  -> GPIO2: Chip enable (HIGH=on, LOW=shutdown)
+//   CSD (pin 4)  -> GPIO2: Chip enable (HIGH=on)
 //   CTX (pin 6)  -> GPIO5: Switch between Receive LNA Mode and Receive Bypass Mode. (HIGH=RX bypass, LOW=RX LNA)
 //   VCC0/VCC1    -> Vfem via U3 LDO, controlled by GPIO7
 // KCT8103L FEM: TX/RX path switching is handled by DIO2 -> CPS pin (via SX126X_DIO2_AS_RF_SWITCH)
