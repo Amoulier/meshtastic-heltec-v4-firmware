@@ -11,7 +11,7 @@ jobs:
   build:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: heltec-v4-power-v2.8.0.3
+      version: heltec-v4-power-v2.8.0.4
       platform: esp32s3
       pio_env: heltec-v4
 
@@ -26,7 +26,7 @@ jobs:
       - name: Download Heltec V4 firmware
         uses: actions/download-artifact@v8
         with:
-          name: firmware-esp32s3-heltec-v4-heltec-v4-power-v2.8.0.3
+          name: firmware-esp32s3-heltec-v4-heltec-v4-power-v2.8.0.4
           path: release-assets
 
       - name: Verify release contents
@@ -37,13 +37,17 @@ jobs:
       - name: Publish Heltec V4 release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: heltec-v4-power-v2.8.0.3
+          tag_name: heltec-v4-power-v2.8.0.4
           target_commitish: ${{ github.sha }}
-          name: Heltec V4 Power Optimized v2.8.0.3
+          name: Heltec V4 Power Optimized v2.8.0.4
           prerelease: true
           generate_release_notes: false
           body: |
             Custom Meshtastic firmware exclusively for the Heltec V4 OLED.
+
+            Upstream base:
+            - Meshtastic `develop` through `7239fe886a30fa13cd35946fa5ae1a46a2807eeb`.
+            - Includes the upstream Bluetooth, NodeDB, radio, routing, waypoint, storage and BaseUI corrections through that commit.
 
             Included improvements:
             - Persistent `Display Options -> Disable Display` control.

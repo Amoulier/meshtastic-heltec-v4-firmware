@@ -37,4 +37,6 @@ Use the normal `.bin` file for OTA updates that preserve configuration, identity
 
 ## Upstream
 
-Based on the open-source [Meshtastic firmware](https://github.com/meshtastic/firmware). Meshtastic is a registered trademark of Meshtastic LLC; this is an independent hardware-specific distribution.
+Based on the open-source [Meshtastic firmware](https://github.com/meshtastic/firmware). The current tree is synchronized with official `develop` through commit `7239fe886a30fa13cd35946fa5ae1a46a2807eeb`.
+
+Meshtastic is a registered trademark of Meshtastic LLC; this is an independent hardware-specific distribution.
