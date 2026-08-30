@@ -95,6 +95,7 @@ jobs:
             - GPS is disabled by default on a clean installation and is not probed while disabled.
             - Bluetooth remains discoverable and reconnectable without pressing PRG.
             - Heltec-specific battery percentage curve and slew limiting.
+            - At each profile's own critical threshold, the optional NodeDB save is skipped to reduce brownout-related configuration risk.
             - Correct MQTT implicit acknowledgement handling without changing normal LoRa acknowledgements.
             - Regional settings, configured LoRa transmit power and RX Boosted Gain behavior remain unchanged.
 
@@ -104,7 +105,6 @@ jobs:
             - Critical sleep disables external wake sources and wakes only by timer.
             - OLED, GPS, LED, LoRa FEM and other retained power domains are forced off.
             - Boot remains in recovery sleep until battery voltage reaches approximately 3.65 V.
-            - Critical shutdown skips optional flash writes to reduce brownout-related configuration loss.
 
             Upstream base: Meshtastic `develop` through `7239fe886a30fa13cd35946fa5ae1a46a2807eeb`.
 
