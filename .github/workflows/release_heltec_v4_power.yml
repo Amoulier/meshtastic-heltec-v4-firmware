@@ -13,14 +13,14 @@ jobs:
   build-standard:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: ${{ github.ref_name == 'main' && 'heltec-v4-standard-v2.8.0.5' || format('heltec-v4-standard-test-{0}', github.sha) }}
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-standard-v2.8.0.6' || format('heltec-v4-standard-test-{0}', github.sha) }}
       platform: esp32s3
       pio_env: heltec-v4-standard
 
   build-solar-router:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: ${{ github.ref_name == 'main' && 'heltec-v4-solar-router-v2.8.0.5' || format('heltec-v4-solar-router-test-{0}', github.sha) }}
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-solar-router-v2.8.0.6' || format('heltec-v4-solar-router-test-{0}', github.sha) }}
       platform: esp32s3
       pio_env: heltec-v4-solar-router
 
@@ -37,13 +37,13 @@ jobs:
       - name: Download Standard firmware
         uses: actions/download-artifact@v8
         with:
-          name: firmware-esp32s3-heltec-v4-standard-heltec-v4-standard-v2.8.0.5
+          name: firmware-esp32s3-heltec-v4-standard-heltec-v4-standard-v2.8.0.6
           path: release-assets/standard
 
       - name: Download Solar Router firmware
         uses: actions/download-artifact@v8
         with:
-          name: firmware-esp32s3-heltec-v4-solar-router-heltec-v4-solar-router-v2.8.0.5
+          name: firmware-esp32s3-heltec-v4-solar-router-heltec-v4-solar-router-v2.8.0.6
           path: release-assets/solar-router
 
       - name: Verify and package profile assets
@@ -60,11 +60,11 @@ jobs:
 
           (
             cd release-assets/standard
-            zip -9 -r ../../publish/heltec-v4-standard-complete-v2.8.0.5.zip .
+            zip -9 -r ../../publish/heltec-v4-standard-complete-v2.8.0.6.zip .
           )
           (
             cd release-assets/solar-router
-            zip -9 -r ../../publish/heltec-v4-solar-router-complete-v2.8.0.5.zip .
+            zip -9 -r ../../publish/heltec-v4-solar-router-complete-v2.8.0.6.zip .
           )
 
           find publish -maxdepth 1 -type f -print | sort
@@ -72,10 +72,11 @@ jobs:
       - name: Publish Heltec V4 profile release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: heltec-v4-profiles-v2.8.0.5
+          tag_name: heltec-v4-profiles-v2.8.0.6
           target_commitish: ${{ github.sha }}
-          name: Heltec V4 Standard and Solar Router v2.8.0.5
-          prerelease: true
+          name: Heltec V4 Standard and Solar Router v2.8.0.6
+          prerelease: false
+          make_latest: true
           generate_release_notes: false
           body: |
             Custom Meshtastic firmware exclusively for the Heltec V4 OLED, now distributed as two explicit profiles from one maintained codebase.
@@ -109,6 +110,6 @@ jobs:
 
             Upstream base: Meshtastic `develop` through `7239fe886a30fa13cd35946fa5ae1a46a2807eeb`.
 
-            This is an independent prerelease and is not an official Meshtastic build.
+            This is an independent release and is not an official Meshtastic build. Validate the complete low-voltage shutdown and recovery cycle on the target solar power system before unattended deployment.
           files: publish/*
           fail_on_unmatched_files: true

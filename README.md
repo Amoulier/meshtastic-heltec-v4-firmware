@@ -139,11 +139,11 @@ The common implementation has been hardware-tested for:
 - Battery telemetry under real LoRa traffic
 - Stable temperature and absence of unexpected reboots during the validation period
 
-Profile isolation is additionally checked by host policy tests and by compiling the Standard and Solar Router environments independently in GitHub Actions. The Solar Router critical-discharge path remains published as a prerelease until a complete low-voltage sleep and solar-recovery cycle is validated on the target installation.
+Profile isolation is additionally checked by host policy tests and by compiling the Standard and Solar Router environments independently in GitHub Actions. Before unattended deployment, validate the complete Solar Router low-voltage sleep and recovery cycle on the target board, battery, regulator, and solar supply.
 
 ## Installation
 
-Open the repository's [Releases](https://github.com/Amoulier/meshtastic-heltec-v4-firmware/releases) page. Profile releases are initially marked as prereleases while the complete Solar Router discharge-and-recovery cycle is validated on hardware.
+Open the repository's [Releases](https://github.com/Amoulier/meshtastic-heltec-v4-firmware/releases) page and select the latest stable profile release.
 
 ### Standard node
 
