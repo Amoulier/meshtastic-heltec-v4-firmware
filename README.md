@@ -64,7 +64,9 @@ This is different from **Sleep Screen**, which is temporary and may wake on norm
 
 ### Battery reporting and critical-write protection
 
-- Uses a voltage curve calibrated for the usable discharge range observed on the Heltec V4.3 test node.
+- Uses profile-aligned voltage curves with the same calibrated Heltec V4 upper range.
+- The Standard curve continues through the normal discharge tail toward 3.10 V instead of displaying 0% prematurely at 3.50 V.
+- The Solar Router curve deliberately reaches 0% at its protective 3.50 V cutoff.
 - Smooths the published battery percentage so brief LoRa transmission voltage sag does not create large temporary jumps.
 - The displayed and telemetered percentage changes by no more than one percentage point per minute.
 - Critical-voltage decisions continue to use the raw, unsmoothed voltage.
