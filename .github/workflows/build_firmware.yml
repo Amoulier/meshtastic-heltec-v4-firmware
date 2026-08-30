@@ -27,6 +27,13 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Test low-battery sleep policy
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Isrc \
+            test/host/deep_sleep_policy_test.cpp \
+            -o /tmp/heltec-v4-deep-sleep-policy-test
+          /tmp/heltec-v4-deep-sleep-policy-test
+
       - name: Build ${{ inputs.platform }}
         id: build
         uses: meshtastic/gh-action-firmware@main

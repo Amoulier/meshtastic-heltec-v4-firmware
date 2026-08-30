@@ -3,8 +3,11 @@
 #include "Arduino.h"
 #include "Observer.h"
 #include "configuration.h"
+#include "power/DeepSleepPolicy.h"
 
-void doDeepSleep(uint32_t msecToWake, bool skipPreflight, bool skipSaveNodeDb), cpuDeepSleep(uint32_t msecToWake);
+void doDeepSleep(uint32_t msecToWake, bool skipPreflight, bool skipSaveNodeDb,
+                 DeepSleepWakePolicy wakePolicy = DeepSleepWakePolicy::ROLE_DEFAULT);
+void cpuDeepSleep(uint32_t msecToWake, DeepSleepWakePolicy wakePolicy);
 
 #ifdef ARCH_ESP32
 #include "esp_sleep.h"
@@ -61,5 +64,5 @@ extern Observable<esp_sleep_wakeup_cause_t> notifyLightSleepEnd;
 void enableModemSleep();
 #ifdef ARCH_ESP32
 void enableLoraInterrupt();
-bool shouldLoraWake(uint32_t msecToWake);
+bool shouldLoraWake(uint32_t msecToWake, DeepSleepWakePolicy policy = DeepSleepWakePolicy::ROLE_DEFAULT);
 #endif

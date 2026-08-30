@@ -102,9 +102,10 @@ static void lowBattSDSEnter()
     LOG_POWERFSM("State: Lower batt SDS");
     prepareLowBatterySleep();
 #ifdef BATTERY_CRITICAL_SLEEP_MSEC
-    doDeepSleep(BATTERY_CRITICAL_SLEEP_MSEC, false, true);
+    doDeepSleep(BATTERY_CRITICAL_SLEEP_MSEC, false, true, criticalBatteryDeepSleepWakePolicy());
 #else
-    doDeepSleep(Default::getConfiguredOrDefaultMs(config.power.sds_secs), false, true);
+    doDeepSleep(Default::getConfiguredOrDefaultMs(config.power.sds_secs), false, true,
+                criticalBatteryDeepSleepWakePolicy());
 #endif
 }
 extern Power *power;
@@ -363,6 +364,7 @@ void PowerFSM_setup()
     powerFSM.add_transition(&stateNB, &stateLowBattSDS, EVENT_LOW_BATTERY, NULL, "LowBat");
     powerFSM.add_transition(&stateDARK, &stateLowBattSDS, EVENT_LOW_BATTERY, NULL, "LowBat");
     powerFSM.add_transition(&stateON, &stateLowBattSDS, EVENT_LOW_BATTERY, NULL, "LowBat");
+    powerFSM.add_transition(&statePOWER, &stateLowBattSDS, EVENT_LOW_BATTERY, NULL, "LowBat");
     powerFSM.add_transition(&stateSERIAL, &stateLowBattSDS, EVENT_LOW_BATTERY, NULL, "LowBat");
 
     // Handle being told to power off

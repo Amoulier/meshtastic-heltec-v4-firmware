@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - "main"
+      - "feature/**"
+      - "fix/**"
 
 permissions: read-all
 
@@ -11,12 +13,12 @@ jobs:
   build:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: heltec-v4-power-v2.8.0.4
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-power-v2.8.0.4' || format('heltec-v4-test-{0}', github.sha) }}
       platform: esp32s3
       pio_env: heltec-v4
 
   release:
-    if: startsWith(github.event.head_commit.message, 'release(heltec-v4):')
+    if: github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(heltec-v4):')
     permissions:
       actions: read
       contents: write

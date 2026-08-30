@@ -34,8 +34,10 @@
 
 // Weak empty variant shutdown prep function.
 // May be redefined by variant files.
-void variant_shutdown() __attribute__((weak));
-void variant_shutdown() {}
+// noinline: weak default and call site share this TU, so LTO must not inline the empty body
+// instead of linking the variant's strong override.
+__attribute__((noinline)) void variant_shutdown() __attribute__((weak));
+__attribute__((noinline)) void variant_shutdown() {}
 
 #if !defined(CONFIG_IDF_TARGET_ESP32S2) && !MESHTASTIC_EXCLUDE_BLUETOOTH
 static bool bluetoothMemoryReleased;
@@ -317,7 +319,7 @@ void esp32Loop()
     // radio.radioIf.canSleep();
 }
 
-void cpuDeepSleep(uint32_t msecToWake)
+void cpuDeepSleep(uint32_t msecToWake, DeepSleepWakePolicy wakePolicy)
 {
     /*
     Some ESP32 IOs have internal pullups or pulldowns, which are enabled by default.
@@ -349,39 +351,45 @@ void cpuDeepSleep(uint32_t msecToWake)
         rtc_gpio_isolate((gpio_num_t)rtcGpios[i]);
 #endif
 
-        // FIXME, disable internal rtc pullups/pulldowns on the non isolated pins. for inputs that we aren't using
-        // to detect wake and in normal operation the external part drives them hard.
+    // FIXME, disable internal rtc pullups/pulldowns on the non isolated pins. for inputs that we aren't using
+    // to detect wake and in normal operation the external part drives them hard.
 #ifdef BUTTON_PIN
+    if (shouldEnableExternalWakeInDeepSleep(wakePolicy)) {
         // Only GPIOs which are have RTC functionality can be used in this bit map: 0,2,4,12-15,25-27,32-39.
 #if SOC_RTCIO_HOLD_SUPPORTED && SOC_PM_SUPPORT_EXT_WAKEUP
-    uint64_t gpioMask = (1ULL << (config.device.button_gpio ? config.device.button_gpio : BUTTON_PIN));
+        uint64_t gpioMask = (1ULL << (config.device.button_gpio ? config.device.button_gpio : BUTTON_PIN));
 #endif
 #ifdef ALT_BUTTON_WAKE
-    gpioMask |= (1ULL << BUTTON_PIN_ALT);
+        gpioMask |= (1ULL << BUTTON_PIN_ALT);
 #endif
 #ifdef BUTTON_NEED_PULLUP
-    gpio_pullup_en((gpio_num_t)BUTTON_PIN);
+        gpio_pullup_en((gpio_num_t)BUTTON_PIN);
 #endif
 
-    // Not needed because both of the current boards have external pullups
-    // FIXME change polarity in hw so we can wake on ANY_HIGH instead - that would allow us to use all three buttons (instead
-    // of just the first) gpio_pullup_en((gpio_num_t)BUTTON_PIN);
+        // Not needed because both of the current boards have external pullups
+        // FIXME change polarity in hw so we can wake on ANY_HIGH instead - that would allow us to use all three buttons
+        // (instead of just the first) gpio_pullup_en((gpio_num_t)BUTTON_PIN);
 
 #ifdef ESP32S3_WAKE_TYPE
-    esp_sleep_enable_ext1_wakeup(gpioMask, ESP32S3_WAKE_TYPE);
+        esp_sleep_enable_ext1_wakeup(gpioMask, ESP32S3_WAKE_TYPE);
 #else
 #if SOC_PM_SUPPORT_EXT_WAKEUP
 #ifdef CONFIG_IDF_TARGET_ESP32
-    // ESP_EXT1_WAKEUP_ALL_LOW has been deprecated since esp-idf v5.4 for any other target.
-    esp_sleep_enable_ext1_wakeup(gpioMask, ESP_EXT1_WAKEUP_ALL_LOW);
+        // ESP_EXT1_WAKEUP_ALL_LOW has been deprecated since esp-idf v5.4 for any other target.
+        esp_sleep_enable_ext1_wakeup(gpioMask, ESP_EXT1_WAKEUP_ALL_LOW);
 #else
-    esp_sleep_enable_ext1_wakeup(gpioMask, ESP_EXT1_WAKEUP_ANY_LOW);
+        esp_sleep_enable_ext1_wakeup(gpioMask, ESP_EXT1_WAKEUP_ANY_LOW);
 #endif
 #endif
 
 #endif // #end ESP32S3_WAKE_TYPE
+    }
 #endif
     variant_shutdown();
+
+    if (!shouldEnableExternalWakeInDeepSleep(wakePolicy)) {
+        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    }
 
 #if SOC_PM_SUPPORT_RTC_PERIPH_PD
     // We want RTC peripherals to stay on

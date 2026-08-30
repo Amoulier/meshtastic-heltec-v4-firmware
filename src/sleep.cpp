@@ -223,7 +223,7 @@ static void waitEnterSleep(bool skipPreflight, bool deepSleep)
     setBluetoothEnable(false); // has to be off before calling light sleep
 }
 
-void doDeepSleep(uint32_t msecToWake, bool skipPreflight = false, bool skipSaveNodeDb = false)
+void doDeepSleep(uint32_t msecToWake, bool skipPreflight, bool skipSaveNodeDb, DeepSleepWakePolicy wakePolicy)
 {
     if (INCLUDE_vTaskSuspend && (msecToWake == portMAX_DELAY)) {
         LOG_INFO("Enter deep sleep forever");
@@ -242,7 +242,8 @@ void doDeepSleep(uint32_t msecToWake, bool skipPreflight = false, bool skipSaveN
 #endif
 
 #ifdef ARCH_ESP32
-    if (!shouldLoraWake(msecToWake))
+    const bool keepLoraAwake = shouldLoraWake(msecToWake, wakePolicy);
+    if (!keepLoraAwake)
         notifyDeepSleep.notifyObservers(NULL);
 #else
     notifyDeepSleep.notifyObservers(NULL);
@@ -306,7 +307,7 @@ void doDeepSleep(uint32_t msecToWake, bool skipPreflight = false, bool skipSaveN
 #endif
 
 #ifdef ARCH_ESP32
-    if (shouldLoraWake(msecToWake)) {
+    if (keepLoraAwake) {
         enableLoraInterrupt();
     }
 #ifdef BUTTON_PIN
@@ -394,7 +395,7 @@ void doDeepSleep(uint32_t msecToWake, bool skipPreflight = false, bool skipSaveN
 #endif
 
     console->flush();
-    cpuDeepSleep(msecToWake);
+    cpuDeepSleep(msecToWake, wakePolicy);
 }
 
 #ifdef ARCH_ESP32
@@ -595,10 +596,11 @@ void enableModemSleep()
     LOG_DEBUG("Sleep request result %x", rv);
 }
 
-bool shouldLoraWake(uint32_t msecToWake)
+bool shouldLoraWake(uint32_t msecToWake, DeepSleepWakePolicy policy)
 {
-    return msecToWake < portMAX_DELAY && (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
-                                          config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE);
+    const bool isRouterRole = config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
+                              config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE;
+    return shouldKeepLoraAwakeInDeepSleep(msecToWake < portMAX_DELAY, isRouterRole, policy);
 }
 
 void enableLoraInterrupt()
