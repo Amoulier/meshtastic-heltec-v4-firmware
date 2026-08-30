@@ -62,12 +62,13 @@ This is different from **Sleep Screen**, which is temporary and may wake on norm
 - OLED and GPS controls remain independent.
 - GPS can be enabled normally when location services are required.
 
-### Battery reporting
+### Battery reporting and critical-write protection
 
 - Uses a voltage curve calibrated for the usable discharge range observed on the Heltec V4.3 test node.
 - Smooths the published battery percentage so brief LoRa transmission voltage sag does not create large temporary jumps.
 - The displayed and telemetered percentage changes by no more than one percentage point per minute.
 - Critical-voltage decisions continue to use the raw, unsmoothed voltage.
+- At each profile's own critical threshold, the shutdown path skips the optional NodeDB save to reduce brownout-related configuration risk.
 
 Battery percentage remains an estimate derived from voltage. Load, temperature, battery chemistry, cell condition, and charging state can affect the reading.
 
@@ -103,14 +104,13 @@ Neither profile changes:
 The `heltec-v4-solar-router` profile adds aggressive protection intended for an unattended node that must survive poor solar conditions:
 
 1. Three consecutive raw readings at or below **3.50 V** trigger protective deep sleep.
-2. The critical sleep path skips optional flash writes to reduce brownout-related configuration damage.
-3. External wake sources are disabled; recovery checks use a timer only.
-4. The OLED, GPS, LED, LoRa FEM, radio state, and retained power domains are forced into their lowest safe state.
-5. A bounded preflight prevents the shutdown path from hanging indefinitely on a busy subsystem.
-6. After a critical shutdown, early boot checks battery voltage before starting Meshtastic.
-7. The node remains in recovery sleep until the battery reaches approximately **3.65 V**, preventing rapid boot/sleep oscillation.
+2. External wake sources are disabled; recovery checks use a timer only.
+3. The OLED, GPS, LED, LoRa FEM, radio state, and retained power domains are forced into their lowest safe state.
+4. A bounded preflight prevents the shutdown path from hanging indefinitely on a busy subsystem.
+5. After a critical shutdown, early boot checks battery voltage before starting Meshtastic.
+6. The node remains in recovery sleep until the battery reaches approximately **3.65 V**, preventing rapid boot/sleep oscillation.
 
-These safeguards are intentionally excluded from `heltec-v4-standard`. A regular node therefore retains normal button/external-wake behavior and does not enter the Solar Router boot-recovery latch.
+The elevated cutoff, timer-only wake policy, forced peripheral isolation, and boot-recovery latch are intentionally excluded from `heltec-v4-standard`. A regular node therefore retains normal button/external-wake behavior and does not enter the Solar Router recovery loop.
 
 ## Validated behavior
 
