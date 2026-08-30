@@ -22,7 +22,19 @@ The firmware profile does **not** change the node role automatically. Select the
 
 Do not use an advanced routing role merely because a node is stationary. Most personal and mobile nodes should remain on a client role. Use the Solar Router profile only where the node is intentionally part of fixed routing infrastructure and has an appropriate antenna, location, battery, and solar supply.
 
-### Legacy build target
+### Default and legacy build targets
+
+Running PlatformIO without an explicit environment builds the safe regular-node profile:
+
+```bash
+pio run
+```
+
+which resolves to:
+
+```text
+heltec-v4-standard
+```
 
 The historical PlatformIO environment:
 
@@ -30,7 +42,7 @@ The historical PlatformIO environment:
 heltec-v4
 ```
 
-remains as a compatibility alias for `heltec-v4-solar-router`. New releases publish only the explicit `standard` and `solar-router` filenames so the installed behavior is unambiguous.
+remains as an explicit compatibility alias for `heltec-v4-solar-router`. New releases publish only the explicit `standard` and `solar-router` filenames so the installed behavior is unambiguous.
 
 ## Hardware scope
 
@@ -131,7 +143,7 @@ Profile isolation is additionally checked by host policy tests and by compiling 
 
 ## Installation
 
-Download the latest package from [Releases](https://github.com/Amoulier/meshtastic-heltec-v4-firmware/releases/latest).
+Open the repository's [Releases](https://github.com/Amoulier/meshtastic-heltec-v4-firmware/releases) page. Profile releases are initially marked as prereleases while the complete Solar Router discharge-and-recovery cycle is validated on hardware.
 
 ### Standard node
 
