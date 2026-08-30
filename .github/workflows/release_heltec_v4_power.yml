@@ -94,7 +94,8 @@ jobs:
             - Holding PRG for about one second restores the display.
             - GPS is disabled by default on a clean installation and is not probed while disabled.
             - Bluetooth remains discoverable and reconnectable without pressing PRG.
-            - Heltec-specific battery percentage curve and slew limiting.
+            - Profile-aligned battery curves: Standard represents the normal 3.10 V discharge tail, while Solar Router reaches 0% at its 3.50 V protective cutoff.
+            - Published battery percentage is slew-limited without delaying raw-voltage protection.
             - At each profile's own critical threshold, the optional NodeDB save is skipped to reduce brownout-related configuration risk.
             - Correct MQTT implicit acknowledgement handling without changing normal LoRa acknowledgements.
             - Regional settings, configured LoRa transmit power and RX Boosted Gain behavior remain unchanged.
