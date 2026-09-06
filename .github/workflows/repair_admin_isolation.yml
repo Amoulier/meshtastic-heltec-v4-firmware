@@ -1,0 +1,72 @@
+name: Repair remaining Heltec admin test isolation
+on:
+  push:
+    branches: [workbench/heltec-v4-audit-snapshot]
+    paths: [.github/workflows/repair_admin_isolation.yml]
+permissions:
+  contents: read
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 22a9c239ec0dacbfabef74e5f6f606afac6c4a40
+          persist-credentials: false
+      - name: Apply exact test-only fix
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 22a9c239ec0dacbfabef74e5f6f606afac6c4a40
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('test/test_admin_radio/test_main.cpp');s=p.read_text()
+          a='''        TEST_ASSERT_EQUAL_MEMORY(before.settings.psk.bytes, channels.getByIndex(0).settings.psk.bytes,
+                                   before.settings.psk.size);'''
+          b='''        TEST_ASSERT_EQUAL_UINT16(before.settings.psk.size, channels.getByIndex(0).settings.psk.size);
+                  // Compare storage too: a deliberately empty key has a zero logical length.
+                  TEST_ASSERT_EQUAL_MEMORY(before.settings.psk.bytes, channels.getByIndex(0).settings.psk.bytes,
+                                           sizeof(before.settings.psk.bytes));'''
+          assert s.count(a)==1;s=s.replace(a,b)
+          for name in ['test_toggleMutedNode_skipsRadioReload_butPersists','test_toggleNodeMuted_flipsBitAndSkipsRadioReload']:
+              a=f'''static void {name}()
+          {{
+              nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);'''
+              b=f'''static void {name}()
+          {{
+              auto *node = nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
+              TEST_ASSERT_NOT_NULL(node);
+              // Another test may have persisted a muted copy of this same fixture node.
+              nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_IS_MUTED_MASK, false);
+              TEST_ASSERT_FALSE(nodeInfoLiteIsMuted(node));'''
+              assert s.count(a)==1;s=s.replace(a,b)
+          a='''static void test_toggleNodeMuted_persistsOnlyNodeDatabase()
+          {
+              auto *node = nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
+              TEST_ASSERT_NOT_NULL(node);
+              nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_HAS_USER_MASK, true);'''
+          b=a+'''
+              nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_IS_MUTED_MASK, false);
+              TEST_ASSERT_FALSE(nodeInfoLiteIsMuted(node));'''
+          assert s.count(a)==1;s=s.replace(a,b);p.write_text(s)
+          PY
+          test "$(git hash-object test/test_admin_radio/test_main.cpp)" = 01d8a445da1a67ae81227df29c96a4d45b56f571
+          git diff --check
+          git add test/test_admin_radio/test_main.cpp
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'test(heltec-v4): isolate persisted mute state and assert empty-key integrity'
+          git rev-parse HEAD > /tmp/candidate-sha.txt
+          ref=refs/heads/workbench/heltec-v4-admin-fixtures
+          test -z "$(git ls-remote origin "$ref")"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin "HEAD:$ref"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: heltec-admin-fixtures-sha
+          path: /tmp/candidate-sha.txt
+          if-no-files-found: error
