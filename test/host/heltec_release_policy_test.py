@@ -106,6 +106,13 @@ require(
 )
 require(release.count('case "$match_status" in') == 2, "release inventory jq status must be handled explicitly")
 require("overwrite_files: false" in release, "release assets may overwrite an existing payload")
+require("cuts the shared OLED/VEXT rail" not in release, "release overstates VEXT shutdown behavior")
+require(
+    "VEXT/QuickLink rail is also turned off when the completed boot scan found no other I2C accessory" in release,
+    "release does not explain accessory-aware VEXT preservation",
+)
+menu_handler = read("src/graphics/draw/MenuHandler.cpp")
+require("Disable OLED?\\nVEXT off if no I2C\\nHold PRG to restore" in menu_handler, "OLED confirmation misstates VEXT behavior")
 
 # Keep every human-facing package version synchronized, while the firmware's
 # own 2.8.0.<git-sha> version remains independently derived by buildinfo.py.

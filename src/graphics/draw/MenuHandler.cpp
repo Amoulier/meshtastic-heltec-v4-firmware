@@ -2844,7 +2844,7 @@ void menuHandler::screenOptionsMenu()
 #if defined(HELTEC_V4_OLED)
 void menuHandler::disableDisplayConfirmMenu()
 {
-    showConfirmationBanner("Disable OLED + VEXT?\nHold PRG to restore", []() -> void {
+    showConfirmationBanner("Disable OLED?\nVEXT off if no I2C\nHold PRG to restore", []() -> void {
         if (!screen->setDisplayDisabled(true))
             screen->showSimpleBanner("Display setting\nnot saved", 3000);
     });

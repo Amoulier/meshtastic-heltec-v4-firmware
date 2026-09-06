@@ -350,7 +350,7 @@ jobs:
             Common improvements:
 
             - Persistent `Display Options -> Disable Display` control.
-            - The confirmation explicitly warns that persistent display-off also cuts the shared OLED/VEXT rail; timer wakes preserve VEXT when an I2C accessory was detected.
+            - Persistent display-off always holds the OLED in reset. The shared GPIO36 VEXT/QuickLink rail is also turned off when the completed boot scan found no other I2C accessory, but remains powered when one was detected. UART, analog and power-only accessories cannot be detected automatically and should not use this mode when they depend on VEXT.
             - Incoming messages and automatic events do not wake a persistently disabled OLED.
             - Geofence, motion/tap and remotely injected input events do not create hidden display-wake intervals while it is disabled.
             - Holding PRG for about one second restores the display.
