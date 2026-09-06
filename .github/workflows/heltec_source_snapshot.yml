@@ -1,0 +1,31 @@
+name: Export Heltec audit source
+on:
+  push:
+    branches: [workbench/heltec-v4-audit-snapshot]
+    paths: [.github/workflows/heltec_source_snapshot.yml]
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 042116c3c9a03bf2f0b8be782f32874574431585
+          submodules: recursive
+          persist-credentials: false
+      - name: Capture pinned source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 042116c3c9a03bf2f0b8be782f32874574431585
+          git submodule status --recursive > /tmp/submodules.txt
+          tar --exclude=.git -czf /tmp/heltec-source-042116c3.tar.gz .
+          sha256sum /tmp/heltec-source-042116c3.tar.gz > /tmp/source-sha256.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: heltec-source-042116c3
+          path: |
+            /tmp/heltec-source-042116c3.tar.gz
+            /tmp/submodules.txt
+            /tmp/source-sha256.txt
+          if-no-files-found: error
