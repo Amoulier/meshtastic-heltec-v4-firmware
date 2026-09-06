@@ -1,0 +1,66 @@
+name: Withdraw defective Heltec V4 v2.8.0.7
+
+on:
+  push:
+    branches: ["audit/heltec-v4-v2.8.0.8"]
+    paths: [".github/workflows/withdraw_heltec_v4_2807.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  withdraw:
+    if: github.repository == 'Amoulier/meshtastic-heltec-v4-firmware'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Withdraw only the explicitly rejected release; keep immutable source tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/git/ref/tags/heltec-v4-profiles-v2.8.0.7" > tag.json
+          jq -e '.object.type == "commit" and .object.sha == "65715edaa9ef915c0d927bd6107ebfe447632a4e"' tag.json
+          gh api "repos/$GH_REPO/releases/383518491" > withdrawn-release.json
+          jq -e '.id == 383518491 and .tag_name == "heltec-v4-profiles-v2.8.0.7" and .target_commitish == "65715edaa9ef915c0d927bd6107ebfe447632a4e"' withdrawn-release.json
+          gh api --method DELETE "repos/$GH_REPO/releases/383518491"
+          # Only a verified 404 establishes removal; transport/auth errors must fail.
+          status=$(curl --silent --show-error --output verification.json --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$GH_REPO/releases/383518491")
+          test "$status" = 404
+          echo 'Withdrawn release 383518491; source tag retained. No replacement published.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: withdrawn-release-2807-metadata
+          path: |
+            withdrawn-release.json
+            tag.json
+            verification.json
+          if-no-files-found: error
+  source-evidence:
+    if: github.repository == 'Amoulier/meshtastic-heltec-v4-firmware'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 65715edaa9ef915c0d927bd6107ebfe447632a4e
+          submodules: recursive
+          persist-credentials: false
+      - name: Archive exact audited source including submodules
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > /tmp/audited-sha.txt
+          git submodule status --recursive > /tmp/audited-submodules.txt
+          tar --exclude='./.git' --exclude='.git' -czf /tmp/heltec-audited-source.tar.gz .
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: heltec-audited-source-65715ed
+          path: |
+            /tmp/heltec-audited-source.tar.gz
+            /tmp/audited-sha.txt
+            /tmp/audited-submodules.txt
+          if-no-files-found: error
