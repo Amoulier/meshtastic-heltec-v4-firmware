@@ -2822,8 +2822,10 @@ static void test_pendingLifecycle_rejectsMutationWithoutChangingChannel()
         TEST_ASSERT_TRUE(decodeRoutingError(testAdmin->reply(), err));
         TEST_ASSERT_EQUAL(meshtastic_Routing_Error_BAD_REQUEST, err);
         TEST_ASSERT_EQUAL_STRING(before.settings.name, channels.getByIndex(0).settings.name);
+        TEST_ASSERT_EQUAL_UINT16(before.settings.psk.size, channels.getByIndex(0).settings.psk.size);
+        // Compare storage too: a deliberately empty key has a zero logical length.
         TEST_ASSERT_EQUAL_MEMORY(before.settings.psk.bytes, channels.getByIndex(0).settings.psk.bytes,
-                                 before.settings.psk.size);
+                                 sizeof(before.settings.psk.bytes));
         testAdmin->drainReply();
     }
 }
@@ -3042,7 +3044,11 @@ static void test_setIgnoredNode_skipsRadioReload_butPersists()
 
 static void test_toggleMutedNode_skipsRadioReload_butPersists()
 {
-    nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
+    auto *node = nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
+    TEST_ASSERT_NOT_NULL(node);
+    // Another test may have persisted a muted copy of this same fixture node.
+    nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_IS_MUTED_MASK, false);
+    TEST_ASSERT_FALSE(nodeInfoLiteIsMuted(node));
     ConfigChangedCounter &counter = installConfigChangedCounter();
 
     meshtastic_AdminMessage m = meshtastic_AdminMessage_init_zero;
@@ -3065,7 +3071,11 @@ static void test_toggleMutedNode_skipsRadioReload_butPersists()
 #if HAS_SCREEN
 static void test_toggleNodeMuted_flipsBitAndSkipsRadioReload()
 {
-    nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
+    auto *node = nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
+    TEST_ASSERT_NOT_NULL(node);
+    // Another test may have persisted a muted copy of this same fixture node.
+    nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_IS_MUTED_MASK, false);
+    TEST_ASSERT_FALSE(nodeInfoLiteIsMuted(node));
     ConfigChangedCounter &counter = installConfigChangedCounter();
 
     graphics::menuHandler::toggleNodeMuted(TEST_NODE_NUM);
@@ -3093,6 +3103,8 @@ static void test_toggleNodeMuted_persistsOnlyNodeDatabase()
     auto *node = nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
     TEST_ASSERT_NOT_NULL(node);
     nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_HAS_USER_MASK, true);
+    nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_IS_MUTED_MASK, false);
+    TEST_ASSERT_FALSE(nodeInfoLiteIsMuted(node));
     TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE |
                                        SEGMENT_CHANNELS | SEGMENT_NODEDATABASE));
     const char *otherFiles[] = {configFileName, moduleConfigFileName, deviceStateFileName, channelFileName};
