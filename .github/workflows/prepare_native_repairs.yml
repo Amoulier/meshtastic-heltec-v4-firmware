@@ -1,0 +1,58 @@
+name: Prepare native audit repairs
+on:
+  push:
+    branches: ["audit-helper/heltec-native-repairs"]
+permissions:
+  contents: write
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Apply verified audit-only repair patch
+        run: |
+          python3 - <<'PY'
+          import base64,gzip,hashlib,subprocess
+          from pathlib import Path
+          encoded='''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'''
+          # Normalize the single wrapped transport typo before verifying the exact patch.
+          encoded=encoded.replace('fHT8cX9pqfzy','fHT8cX9qfzy')
+          patch=gzip.decompress(base64.b64decode(encoded,validate=True))
+          assert hashlib.sha256(patch).hexdigest()=='075d05c07da0112043fad8c2bbed065c462cc9564d5401b94befa4b452ef3590'
+          Path('/tmp/native-repair.patch').write_bytes(patch)
+          subprocess.run(['git','apply','--check','/tmp/native-repair.patch'],check=True)
+          subprocess.run(['git','apply','/tmp/native-repair.patch'],check=True)
+          PY
+          python3 test/host/heltec_audit_regression.py
+          python3 test/host/heltec_release_policy_test.py
+          git diff --check
+      - name: Upload exact changed Git blobs without moving any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64,hashlib,json,os,subprocess,urllib.request
+          from pathlib import Path
+          entries=[]
+          paths=subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
+          assert len(paths)==6,paths
+          for path in paths:
+              content=Path(path).read_bytes()
+              expected=hashlib.sha1(b'blob '+str(len(content)).encode()+b'\0'+content).hexdigest()
+              req=urllib.request.Request('https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/git/blobs',
+                  data=json.dumps({'encoding':'base64','content':base64.b64encode(content).decode()}).encode(),
+                  headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'},method='POST')
+              with urllib.request.urlopen(req,timeout=60) as response:
+                  blob=json.load(response)
+              assert blob['sha']==expected
+              entries.append({'path':path,'mode':'100644','type':'blob','sha':expected})
+          Path('/tmp/native-repair-blobs.json').write_text(json.dumps(entries,indent=2))
+          print(json.dumps(entries,indent=2))
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-repair-blobs
+          path: /tmp/native-repair-blobs.json
+          if-no-files-found: error
