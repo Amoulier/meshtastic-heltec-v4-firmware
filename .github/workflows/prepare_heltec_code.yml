@@ -1,0 +1,51 @@
+name: Prepare Heltec code-only repair
+on:
+  push:
+    branches: [workbench/heltec-v4-audit-snapshot]
+    paths: [.github/workflows/prepare_heltec_code.yml]
+permissions:
+  contents: read
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 042116c3c9a03bf2f0b8be782f32874574431585
+          path: candidate
+          submodules: recursive
+          persist-credentials: false
+      - name: Reproduce verified code changes only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 audit/prepare_regression_repairs.py
+          python3 audit/prepare_storage_repairs.py
+          cd candidate
+          # Workflow authoring uses the connected authoring tool, not this token.
+          git restore .github/workflows/audit_native_heltec.yml
+          git add src/PreferenceRecoveryPolicy.h src/mesh/NodeDB.cpp bin/run-heltec-native-audit.py test/host/heltec_storage_audit.ini test/test_admin_radio/test_main.cpp test/test_nodedb_boot_recovery/test_main.cpp test/test_xmodem/test_main.cpp
+          test "$(git diff --cached --name-only | wc -l)" -eq 7
+          test -z "$(git diff --cached --name-only -- .github)"
+          git diff --cached --check
+          python3 test/host/heltec_audit_regression.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(heltec-v4): repair regression fixtures and test strict storage recovery'
+          git rev-parse HEAD | tee /tmp/candidate-sha.txt
+          ref=refs/heads/workbench/heltec-v4-regression-candidate
+          test -z "$(git ls-remote origin "$ref")"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin "HEAD:$ref"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: heltec-code-candidate-sha
+          path: /tmp/candidate-sha.txt
+          if-no-files-found: error
