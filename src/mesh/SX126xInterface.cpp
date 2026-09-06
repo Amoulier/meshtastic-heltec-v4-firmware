@@ -33,6 +33,7 @@ SX126xInterface<T>::SX126xInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs
 
 template <typename T> void SX126xInterface<T>::parkRadioHardware()
 {
+    radioSleepConfirmed.store(false, std::memory_order_release);
     isReceiving = false;
     activeReceiveStart = 0;
     disableInterrupt();
@@ -82,6 +83,7 @@ template <typename T> bool SX126xInterface<T>::init()
         loraFEMInterface.setLNAEnable(config.lora.fem_lna_mode != meshtastic_Config_LoRaConfig_FEM_LNA_Mode_DISABLED);
     }
 #endif
+    radioSleepConfirmed.store(false, std::memory_order_release);
     radioHardwareParked.store(false, std::memory_order_release);
 
 #ifdef RF95_FAN_EN
@@ -125,6 +127,7 @@ template <typename T> bool SX126xInterface<T>::reinitChip()
 {
     // The following sequence talks to and may power the chip; it is no longer
     // safe for sleep() to treat the previous fail-closed park as current.
+    radioSleepConfirmed.store(false, std::memory_order_release);
     radioHardwareParked.store(false, std::memory_order_release);
 #ifdef SX126X_POWER_EN
     // Sleep and fail-closed parking remove this rail; recovery must restore it first.
@@ -417,6 +420,7 @@ template <typename T> void SX126xInterface<T>::handleSoftwareLoraIrqPoll()
 
 template <typename T> int16_t SX126xInterface<T>::trySetStandby()
 {
+    radioSleepConfirmed.store(false, std::memory_order_release);
     checkNotification(); // handle any pending interrupts before we force standby
 
     int16_t err = lora.standby();
@@ -461,6 +465,7 @@ template <typename T> void SX126xInterface<T>::addReceiveMetadata(meshtastic_Mes
  */
 template <typename T> void SX126xInterface<T>::configHardwareForSend()
 {
+    radioSleepConfirmed.store(false, std::memory_order_release);
     radioHardwareParked.store(false, std::memory_order_release);
     setTransmitEnable(true);
     RadioLibInterface::configHardwareForSend();
@@ -502,6 +507,7 @@ template <typename T> void SX126xInterface<T>::startReceive()
     }
 #endif
 
+    radioSleepConfirmed.store(false, std::memory_order_release);
     radioHardwareParked.store(false, std::memory_order_release);
     setTransmitEnable(false);
 
@@ -614,7 +620,7 @@ template <typename T> bool SX126xInterface<T>::sleep()
         // A fail-closed park already disabled IRQ/accounting and shut down the
         // external FEM/rail. Do not probe an intentionally unresponsive chip.
         RadioLibInterface::setStandby();
-        return true;
+        return radioSleepConfirmed.load(std::memory_order_acquire);
     }
 
     // Not keeping config is busted - next time nrf52 board boots lora sending fails  tcxo related? - see datasheet
@@ -643,9 +649,11 @@ template <typename T> bool SX126xInterface<T>::sleep()
 #if HAS_LORA_FEM
     loraFEMInterface.setSleepModeEnable();
 #endif
+    const bool succeeded = standbyResult == RADIOLIB_ERR_NONE && sleepResult == RADIOLIB_ERR_NONE;
+    radioSleepConfirmed.store(succeeded, std::memory_order_release);
     radioHardwareParked.store(true, std::memory_order_release);
 
-    return standbyResult == RADIOLIB_ERR_NONE && sleepResult == RADIOLIB_ERR_NONE;
+    return succeeded;
 }
 
 template <typename T> void SX126xInterface<T>::resetAGC()
@@ -657,6 +665,7 @@ template <typename T> void SX126xInterface<T>::resetAGC()
     if (sendingPacket != NULL || (isReceiving && isActivelyReceiving()))
         return;
 
+    radioSleepConfirmed.store(false, std::memory_order_release);
     LOG_DEBUG("SX126x AGC reset: warm sleep + Calibrate(0x7F)");
 
     // 1. Warm sleep - powers down the entire analog frontend, resetting AGC state.

@@ -840,10 +840,7 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
 #if defined(T_WATCH_S3) // on T_WATCH_ULTRA, powering down this pin seems to goober the i2c bus.
             PMU->disablePowerOutput(XPOWERS_ALDO2);
 #endif
-            // runOnce() stops being scheduled as soon as enabled becomes false.
-            // Clear this snapshot here so Sleep Screen cannot leave a stale
-            // "message frame visible" value that suppresses the next wake.
-            textMessageFrameShown.store(false, std::memory_order_release);
+
             enabled = false;
         }
         screenOn = on;
@@ -1183,7 +1180,6 @@ bool Screen::setDisplayDisabled(bool disabled)
 {
     if (isDisplayDisabled() == disabled) {
         if (disabled) {
-            textMessageFrameShown.store(false, std::memory_order_release);
             enabled = false;
             setDisplayRailPower(false);
         }
@@ -1198,7 +1194,7 @@ bool Screen::setDisplayDisabled(bool disabled)
             LOG_ERROR("Display disable rejected because persistence failed");
             return false;
         }
-        textMessageFrameShown.store(false, std::memory_order_release);
+
         displayDisabled.store(true, std::memory_order_release);
         handleSetOn(false);
         dispdev->displayOff();
@@ -1309,13 +1305,11 @@ int32_t Screen::runOnce()
 {
     // If we don't have a screen, don't ever spend any CPU for us.
     if (!useDisplay) {
-        textMessageFrameShown.store(false, std::memory_order_release);
         enabled = false;
         return RUN_SAME;
     }
 
     if (isDisplayDisabled()) {
-        textMessageFrameShown.store(false, std::memory_order_release);
         enabled = false;
         setDisplayRailPower(false);
         return RUN_SAME;
@@ -1457,7 +1451,6 @@ int32_t Screen::runOnce()
 
     if (!screenOn) { // If we didn't just wake and the screen is still off, then
                      // stop updating until it is on again
-        textMessageFrameShown.store(false, std::memory_order_release);
         enabled = false;
         return 0;
     }
@@ -1469,10 +1462,6 @@ int32_t Screen::runOnce()
     // Switch to a low framerate (to save CPU) when we are not in transition
     // but we should only call setTargetFPS when framestate changes, because
     // otherwise that breaks animations.
-
-    textMessageFrameShown.store(showingNormalScreen && framesetInfo.positions.textMessage != 255 && ui &&
-                                    ui->getUiState()->currentFrame == framesetInfo.positions.textMessage,
-                                std::memory_order_release);
 
     uint32_t desiredFramerate = IDLE_FRAMERATE;
 #if HAS_GPS && !defined(USE_EINK)
@@ -2650,11 +2639,6 @@ int Screen::handleAdminMessage(AdminModule_ObserverData *arg)
 bool Screen::isOverlayBannerShowing()
 {
     return NotificationRenderer::isOverlayBannerShowing();
-}
-
-bool Screen::isTextMessageFrameShown() const
-{
-    return textMessageFrameShown.load(std::memory_order_acquire);
 }
 
 bool Screen::isGamesFrameShown()

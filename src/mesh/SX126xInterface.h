@@ -88,6 +88,8 @@ template <class T> class SX126xInterface : public RadioLibInterface
 
   private:
     std::atomic<bool> radioHardwareParked{false};
+    // A parked FEM is not evidence that the transceiver accepted sleep().
+    std::atomic<bool> radioSleepConfirmed{false};
 #ifdef LORA_DIO1_SOFTWARE_POLL
     bool irqPollingActive = false;
     bool pollTxMode = false;

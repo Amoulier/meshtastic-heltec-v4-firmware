@@ -48,6 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 test/host/heltec_release_policy_test.py
+          python3 test/host/heltec_audit_regression.py
           bash -n bin/device-install.sh bin/device-update.sh
 
       - name: Test Standard power policies

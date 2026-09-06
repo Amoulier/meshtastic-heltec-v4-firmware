@@ -6,6 +6,7 @@ on:
       - "main"
       - "feature/**"
       - "fix/**"
+      - "audit/heltec-v4-v2.8.0.8"
 
 permissions: read-all
 
@@ -14,17 +15,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  native-audit:
+    uses: ./.github/workflows/audit_native_heltec.yml
+
   build-standard:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: ${{ github.ref_name == 'main' && 'heltec-v4-standard-v2.8.0.7' || format('heltec-v4-standard-test-{0}', github.sha) }}
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-standard-v2.8.0.8' || format('heltec-v4-standard-test-{0}', github.sha) }}
       platform: esp32s3
       pio_env: heltec-v4-standard
 
   build-solar-router:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: ${{ github.ref_name == 'main' && 'heltec-v4-solar-router-v2.8.0.7' || format('heltec-v4-solar-router-test-{0}', github.sha) }}
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-solar-router-v2.8.0.8' || format('heltec-v4-solar-router-test-{0}', github.sha) }}
       platform: esp32s3
       pio_env: heltec-v4-solar-router
 
@@ -35,13 +39,14 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     needs:
+      - native-audit
       - build-standard
       - build-solar-router
     steps:
       - name: Verify release provenance
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: heltec-v4-profiles-v2.8.0.7
+          RELEASE_TAG: heltec-v4-profiles-v2.8.0.8
         run: |
           set -euo pipefail
 
@@ -108,13 +113,13 @@ jobs:
       - name: Download Standard firmware
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: firmware-esp32s3-heltec-v4-standard-heltec-v4-standard-v2.8.0.7
+          name: firmware-esp32s3-heltec-v4-standard-heltec-v4-standard-v2.8.0.8
           path: release-assets/standard
 
       - name: Download Solar Router firmware
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: firmware-esp32s3-heltec-v4-solar-router-heltec-v4-solar-router-v2.8.0.7
+          name: firmware-esp32s3-heltec-v4-solar-router-heltec-v4-solar-router-v2.8.0.8
           path: release-assets/solar-router
 
       - name: Verify and package profile assets
@@ -245,15 +250,15 @@ jobs:
 
           (
             cd release-assets/standard
-            zip -9 -r ../../publish/heltec-v4-standard-complete-v2.8.0.7.zip .
+            zip -9 -r ../../publish/heltec-v4-standard-complete-v2.8.0.8.zip .
           )
           (
             cd release-assets/solar-router
-            zip -9 -r ../../publish/heltec-v4-solar-router-complete-v2.8.0.7.zip .
+            zip -9 -r ../../publish/heltec-v4-solar-router-complete-v2.8.0.8.zip .
           )
 
-          standard_zip_listing=$(zipinfo -l publish/heltec-v4-standard-complete-v2.8.0.7.zip)
-          solar_zip_listing=$(zipinfo -l publish/heltec-v4-solar-router-complete-v2.8.0.7.zip)
+          standard_zip_listing=$(zipinfo -l publish/heltec-v4-standard-complete-v2.8.0.8.zip)
+          solar_zip_listing=$(zipinfo -l publish/heltec-v4-solar-router-complete-v2.8.0.8.zip)
           grep -E '^-rwxr-xr-x .* device-install\.sh$' <<<"$standard_zip_listing" >/dev/null
           grep -E '^-rwxr-xr-x .* device-update\.sh$' <<<"$standard_zip_listing" >/dev/null
           grep -E '^-rwxr-xr-x .* device-install\.sh$' <<<"$solar_zip_listing" >/dev/null
@@ -265,7 +270,7 @@ jobs:
       - name: Verify main still points to this release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: heltec-v4-profiles-v2.8.0.7
+          RELEASE_TAG: heltec-v4-profiles-v2.8.0.8
         run: |
           set -euo pipefail
           remote_main=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | awk '{print $1}')
@@ -328,9 +333,9 @@ jobs:
       - name: Publish Heltec V4 profile release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          tag_name: heltec-v4-profiles-v2.8.0.7
+          tag_name: heltec-v4-profiles-v2.8.0.8
           target_commitish: ${{ github.sha }}
-          name: Heltec V4 Standard and Solar Router v2.8.0.7
+          name: Heltec V4 Standard and Solar Router v2.8.0.8
           prerelease: false
           make_latest: true
           generate_release_notes: false
@@ -338,7 +343,7 @@ jobs:
           body: |
             Custom Meshtastic firmware exclusively for the Heltec V4 OLED, now distributed as two explicit profiles from one maintained codebase.
 
-            `v2.8.0.7` is the distribution revision. Manifests, firmware filenames and the Meshtastic client About view identify the exact build as `2.8.0.<7-character commit SHA>`; the compact OLED footer displays `2.8.0`. Those are expected representations of this same release.
+            `v2.8.0.8` is the distribution revision. Manifests, firmware filenames and the Meshtastic client About view identify the exact build as `2.8.0.<7-character commit SHA>`; the compact OLED footer displays `2.8.0`. Those are expected representations of this same release.
 
             Choose one profile:
 
@@ -375,10 +380,9 @@ jobs:
             - Legacy preferences are replaced with clean defaults without an early-boot directory erase; the cryptographic identity is preserved, four identity/config-bearing files are verified, then the old node cache and obsolete marker are removed in retry-safe order. An unreadable legacy identity fails closed without replacing or deleting it.
             - Correct MQTT implicit acknowledgement handling without changing normal LoRa acknowledgements.
             - MQTT configuration validation no longer opens a live TCP probe before committing a candidate configuration.
-            - A new incoming-message banner no longer replaces a text-message frame that is already being read; the message remains stored and unread.
             - SX1262 state-loss recovery no longer compounds the Heltec V4 FEM power conversion; failed CAD defers TX, failed reconfiguration rearms RX, and failed critical-sleep entry asserts radio reset.
             - Muted senders and channels do not wake the display or power state machine.
-            - Restored legacy low-entropy PKI keys are rejected and securely regenerated. Every valid existing keypair is preserved, although a legacy visible Node ID may be realigned to `CRC32(public_key)`; selecting the first region on a clean keyless node creates its initial identity.
+            - Candidate low-entropy PKI keys are rejected without replacing the current identity; stored weak identities are securely regenerated during recovery. Every valid existing keypair is preserved, although a legacy visible Node ID may be realigned to `CRC32(public_key)`; selecting the first region on a clean keyless node creates its initial identity.
             - Unified OTA transport and firmware hash are read back from NVS before the OTA loader is selected, preventing a persistence failure from stranding the node in app1.
             - BLE OTA cannot reactivate stale Wi-Fi credentials from an earlier Wi-Fi OTA, including during fail-closed storage recovery.
             - Abandoned multi-setting Admin transactions expire on the real idle deadline, persist their applied values, and retain any restart required for Bluetooth/power-state changes.

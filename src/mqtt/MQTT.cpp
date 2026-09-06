@@ -1,4 +1,5 @@
 #include "MQTT.h"
+#include "MqttAckHistory.h"
 #include "concurrency/LockGuard.h"
 #include "MeshService.h"
 #include "NodeDB.h"
@@ -60,26 +61,52 @@ static bool isConnected = false;
 static uint32_t lastPositionUnavailableWarning = 0;
 static const uint32_t POSITION_UNAVAILABLE_WARNING_INTERVAL_MS = 15000; // 15 seconds
 
-constexpr size_t MQTT_ACK_HISTORY_SIZE = 16;
-struct MqttAckHistoryEntry {
-    NodeNum from = 0;
-    PacketId id = 0;
-};
-static MqttAckHistoryEntry mqttAckHistory[MQTT_ACK_HISTORY_SIZE] = {};
-static size_t mqttAckHistoryNext = 0;
+static MqttAckHistory mqttAckHistory;
 static concurrency::Lock mqttAckHistoryLock;
 
-bool rememberMqttAck(NodeNum from, PacketId id)
+class MqttAckReservation
 {
-    if (id == 0)
-        return false;
-    concurrency::LockGuard guard(&mqttAckHistoryLock);
-    for (const auto &entry : mqttAckHistory) {
-        if (entry.from == from && entry.id == id)
-            return false;
+  public:
+    MqttAckReservation(NodeNum from, PacketId id) : from(from), id(id)
+    {
+        concurrency::LockGuard guard(&mqttAckHistoryLock);
+        reserved = mqttAckHistory.reserve(from, id);
     }
-    mqttAckHistory[mqttAckHistoryNext] = {.from = from, .id = id};
-    mqttAckHistoryNext = (mqttAckHistoryNext + 1) % MQTT_ACK_HISTORY_SIZE;
+    ~MqttAckReservation()
+    {
+        if (reserved) {
+            concurrency::LockGuard guard(&mqttAckHistoryLock);
+            mqttAckHistory.finish(from, id, admitted);
+        }
+    }
+    MqttAckReservation(const MqttAckReservation &) = delete;
+    MqttAckReservation &operator=(const MqttAckReservation &) = delete;
+    explicit operator bool() const { return reserved; }
+    void commit() { admitted = true; }
+
+  private:
+    NodeNum from;
+    PacketId id;
+    bool reserved = false;
+    bool admitted = false;
+};
+
+bool sendMqttImplicitAck(NodeNum from, PacketId id, ChannelIndex channel)
+{
+    MqttAckReservation reservation(from, id);
+    if (!reservation || !routingModule || !router)
+        return false;
+    auto pAck = routingModule->allocAckNak(meshtastic_Routing_Error_NONE, from, id, channel);
+    if (!pAck)
+        return false;
+    pAck->transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
+    const ErrorCode result = router->sendLocal(pAck);
+    if (result == ERRNO_SHOULD_RELEASE)
+        packetPool.release(pAck);
+    // Other return values consume pAck but do not confirm local admission.
+    if (result != ERRNO_OK && result != ERRNO_SHOULD_RELEASE)
+        return false;
+    reservation.commit();
     return true;
 }
 
@@ -144,13 +171,8 @@ inline void onReceiveProto(char *topic, byte *payload, size_t length)
         // We do this because packets are not rebroadcasted back into MQTT anymore and we assume that at least one node
         // receives it when we get our own packet back. ReliableRouter surfaces that evidence to the client while preserving
         // the independent LoRa retry/fallback path.
-        if (isFromUs(e.packet) && rememberMqttAck(getFrom(e.packet), e.packet->id)) {
-            auto pAck = routingModule->allocAckNak(meshtastic_Routing_Error_NONE, getFrom(e.packet), e.packet->id, ch.index);
-            if (!pAck)
-                return;
-            pAck->transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
-            if (router->sendLocal(pAck) == ERRNO_SHOULD_RELEASE)
-                packetPool.release(pAck);
+        if (isFromUs(e.packet)) {
+            sendMqttImplicitAck(getFrom(e.packet), e.packet->id, ch.index);
         } else {
             LOG_INFO("Ignore downlink msg we sent");
         }

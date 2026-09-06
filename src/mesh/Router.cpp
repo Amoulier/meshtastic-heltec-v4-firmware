@@ -523,7 +523,10 @@ ErrorCode Router::sendLocal(meshtastic_MeshPacket *p, RxSource src)
         printPacket("Enqueued local", p);
         // Preserve the trusted origin explicitly. Queueing used to erase src and make a local
         // phone/module packet indistinguishable from remote already-decoded ingress.
-        deliverLocal(p, src);
+        if (!deliverLocal(p, src)) {
+            packetPool.release(p);
+            return ERRNO_UNKNOWN;
+        }
         return ERRNO_SHOULD_RELEASE;
     } else if (!iface) {
         // We must be sending to remote nodes also, fail if no interface found
@@ -1486,7 +1489,7 @@ bool Router::dequeueDeferredLocal(DeferredLocal &out)
     return true;
 }
 
-void Router::deliverLocal(meshtastic_MeshPacket *p, RxSource src)
+bool Router::deliverLocal(meshtastic_MeshPacket *p, RxSource src)
 {
     // Top level: handle synchronously, exactly as before the depth guard existed.
     bool nested;
@@ -1496,7 +1499,7 @@ void Router::deliverLocal(meshtastic_MeshPacket *p, RxSource src)
     }
     if (!nested) {
         handleReceived(p, src);
-        return;
+        return true;
     }
 
     // Nested: a module sent this from inside callModules(). Defer a copy so the outermost
@@ -1514,25 +1517,25 @@ void Router::deliverLocal(meshtastic_MeshPacket *p, RxSource src)
                 queued = enqueueDeferredLocal(copy, src);
         }
         if (queued)
-            return;
+            return true;
         if (!stillNested) {
             // The drain finished first, so nothing would pick this up. Go through handleReceived()
             // rather than dispatchReceived() so a loopback from its modules still defers.
             handleReceived(copy, src);
             packetPool.release(copy);
-            return;
+            return true;
         }
     }
 
-    // Pool exhausted or queue full: drop the deferral. Leak-free and degraded but safe - the
-    // packet still followed its normal non-loopback path (SHOULD_RELEASE, or the TX path for a
-    // broadcast). Mirrors sendToPhone()'s degrade-on-exhaustion behavior.
+    // A local unicast must report this admission failure to its producer. A broadcast
+    // still follows its independent TX path even if its optional loopback is dropped.
     if (copy)
         packetPool.release(copy);
     LOG_WARN("Deferred local queue full/alloc failed, drop loopback of 0x%08x", p->id);
 #ifdef PIO_UNIT_TESTING
     deferredLocalDropped++;
 #endif
+    return false;
 }
 
 /**

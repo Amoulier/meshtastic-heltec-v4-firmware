@@ -1605,7 +1605,7 @@ bool AdminModule::handleSetConfig(const meshtastic_Config &c, bool fromOthers)
             memcpy(incoming.public_key.bytes, derivedPublicKey, 32);
             if (nodeDB->checkLowEntropyPublicKey(incoming.public_key)) {
                 LOG_WARN("Security set rejected: keypair is known to be compromised");
-                sendWarning(LOW_ENTROPY_RESTORE_WARNING);
+                sendWarning(LOW_ENTROPY_REJECT_WARNING);
                 return false;
             }
         } else if (incoming.public_key.size != 0) {

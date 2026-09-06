@@ -70,11 +70,11 @@ require(not any("factory.bin" in line or ".mt.json" in line for line in copy_lin
 # producer piped to an early-exiting matcher can turn an otherwise valid bundle
 # into a SIGPIPE-dependent result.
 require(
-    "standard_zip_listing=$(zipinfo -l publish/heltec-v4-standard-complete-v2.8.0.7.zip)" in release,
+    "standard_zip_listing=$(zipinfo -l publish/heltec-v4-standard-complete-v2.8.0.8.zip)" in release,
     "Standard ZIP listing is not captured before validation",
 )
 require(
-    "solar_zip_listing=$(zipinfo -l publish/heltec-v4-solar-router-complete-v2.8.0.7.zip)" in release,
+    "solar_zip_listing=$(zipinfo -l publish/heltec-v4-solar-router-complete-v2.8.0.8.zip)" in release,
     "Solar Router ZIP listing is not captured before validation",
 )
 require(re.search(r"zipinfo[^\n]*\|\s*grep", release) is None, "ZIP permission validation reintroduced a producer pipeline")
@@ -118,9 +118,9 @@ require("Disable OLED?\\nVEXT off if no I2C\\nHold PRG to restore" in menu_handl
 # own 2.8.0.<git-sha> version remains independently derived by buildinfo.py.
 package_versions = set(re.findall(r"v\d+\.\d+\.\d+\.\d+", release))
 require(len(package_versions) == 1, f"release package versions disagree: {sorted(package_versions)}")
-require(package_versions == {"v2.8.0.7"}, f"unexpected planned package version: {sorted(package_versions)}")
+require(package_versions == {"v2.8.0.8"}, f"unexpected planned package version: {sorted(package_versions)}")
 require(
-    release.count("heltec-v4-profiles-v2.8.0.7") == 3,
+    release.count("heltec-v4-profiles-v2.8.0.8") == 3,
     "release tag must match in both provenance gates and the publisher",
 )
 require('firmware_version="2.8.0.${GITHUB_SHA::7}"' in release, "internal firmware version contract changed")
@@ -356,4 +356,10 @@ require(
     "canned-message ACK status is no longer matched to its exact outgoing packet",
 )
 
+# Required complete native suites and real-body fault injection are publication gates.
+require("- native-audit" in release, "release does not depend on native integration audit")
+require("test/host/heltec_audit_regression.py" in build, "real-body fault injection is not a build gate")
+audit_workflow = read(".github/workflows/audit_native_heltec.yml")
+require("run-heltec-native-audit.py" in audit_workflow, "native suites are not executed")
+require("continue-on-error" not in audit_workflow, "native audit is allowed to fail")
 print("Heltec V4 release policy: PASS")

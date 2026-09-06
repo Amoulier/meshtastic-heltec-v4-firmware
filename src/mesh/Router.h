@@ -219,7 +219,8 @@ class Router : protected concurrency::OSThread, protected PacketHistory
      * nRF52 task stack on a config save. Does not consume p; the caller's existing free path is
      * unchanged.
      */
-    void deliverLocal(meshtastic_MeshPacket *p, RxSource src);
+    // False means the nested copy was not admitted; this method never consumes p.
+    bool deliverLocal(meshtastic_MeshPacket *p, RxSource src);
 
     /// Depth of handleReceived() frames currently on the stack. >0 means a module is dispatching,
     /// so a locally-sent loopback packet must be deferred rather than handled synchronously.

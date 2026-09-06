@@ -193,7 +193,7 @@ Profile isolation is additionally checked by host policy tests and by compiling 
 
 Open the repository's [Releases](https://github.com/Amoulier/meshtastic-heltec-v4-firmware/releases) page and select the latest stable profile release.
 
-The distribution revision is `v2.8.0.7` (full tag: `heltec-v4-profiles-v2.8.0.7`). Its manifests, firmware filenames, and Meshtastic client **About** view identify the exact compiled image as `2.8.0.<7-character commit SHA>`; the compact OLED footer displays `2.8.0`. These are expected representations of the same release, not evidence that the wrong image was installed.
+The distribution revision is `v2.8.0.8` (full tag: `heltec-v4-profiles-v2.8.0.8`). Its manifests, firmware filenames, and Meshtastic client **About** view identify the exact compiled image as `2.8.0.<7-character commit SHA>`; the compact OLED footer displays `2.8.0`. These are expected representations of the same release, not evidence that the wrong image was installed.
 
 ### Standard node
 
