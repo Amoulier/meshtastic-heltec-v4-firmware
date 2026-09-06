@@ -98,7 +98,7 @@ Battery percentage remains an estimate derived from voltage. Load, temperature, 
 - Preference saves do not report success until the temporary file passes readback and the atomic replacement completes.
 - A transient write failure is retried without formatting or wiping the preferences filesystem.
 - Configuration, channel, module, and device-state files preserve the previous verified generation until their replacement is committed.
-- At boot, the complete core generation is inventoried before any migration or automatic save. If a config, channel, module, device-state, or node-database file is missing while any peer file or pending temporary exists, the node enters local recovery instead of manufacturing and persisting a mixed generation.
+- At boot, the complete core generation is inventoried before any migration or automatic save. Config, channel, module, and device-state files must form one complete generation. `nodes.proto` may be absent only for a new keyless, unlicensed node; once private/config public key material, an owner public key, or licensed identity exists, it is required as well. A missing required peer or pending temporary therefore enters local recovery instead of manufacturing and persisting a mixed generation.
 - A legacy preferences marker no longer causes an early-boot directory erase. The firmware prepares the same clean defaults in RAM, preserves the cryptographic identity, verifies all four identity/config-bearing replacement files, then clears the old node cache and removes the obsolete marker last. If the old identity file cannot be decoded, migration fails closed and leaves every file for a later recovery attempt.
 - A failed LittleFS mount never triggers an automatic format on Heltec V4. The node instead starts fail-closed with LoRa transmission and GPS disabled, while Bluetooth remains available for diagnosis and an explicit full factory reset.
 - While storage is unavailable, settings changes, preference writes, and PKI identity generation are rejected rather than being acknowledged only in RAM.
@@ -106,7 +106,7 @@ Battery percentage remains an estimate derived from voltage. Load, temperature, 
 - Recovery mode accepts only local administrative traffic over Bluetooth or USB. Its bounded recovery allowlist includes reboot/shutdown, DFU, supported BLE OTA, compatible preference restore and factory reset operations, plus NodeDB reset when the surviving state permits it. Destructive recovery operations require an active USB data-host connection or an initialized raw battery reading of at least 3.65 V. The raw ADC/USB condition is refreshed immediately before each destructive boundary. A charge-only cable with no detectable battery is deliberately insufficient; use a data-capable USB connection or the complete clean-install bundle. The PRG long-press display gesture does not format storage.
 - Full reset removes unrelated files before the preference generation; once an explicitly authorized `/prefs` removal has begun, an incomplete directory cleanup falls back to a verified filesystem format instead of leaving a half-deleted generation.
 - A config-only reset atomically replaces each identity/config-bearing file before deleting auxiliary preferences, so a failed write cannot first erase the persisted identity it promises to preserve. It requires a fresh verified node cache when identity is initialized and otherwise explicitly removes the old cache. Because the files are committed individually, a failed multi-file reset reports an error, keeps Bluetooth available, and may require a retry.
-- Normal OTA updates preserve the existing configuration and cryptographic identity. A restored legacy low-entropy PKI key is the deliberate exception: it is rejected and replaced for compatibility and security.
+- Normal OTA updates preserve the existing configuration and every valid keypair. A legacy visible Node ID that does not match `CRC32(public_key)` may be realigned without replacing that valid keypair; selecting the first region on a clean keyless node creates its initial identity. A restored legacy low-entropy key is rejected and replaced for compatibility and security.
 - Before entering the unified OTA loader, the requested transport and firmware hash must pass NVS readback verification; a persistence failure leaves the normal application selected.
 - BLE OTA never restores stale Wi-Fi credentials from an earlier Wi-Fi OTA, including while recovering from unavailable storage.
 - Message and waypoint persistence is fenced and drained before a factory reset touches LittleFS. A clear/autosave operation queued immediately before reset cannot resume inside the destructive transaction, and the reset verifies the empty stores before committing.
@@ -193,6 +193,8 @@ Profile isolation is additionally checked by host policy tests and by compiling 
 
 Open the repository's [Releases](https://github.com/Amoulier/meshtastic-heltec-v4-firmware/releases) page and select the latest stable profile release.
 
+The distribution revision is `v2.8.0.7` (full tag: `heltec-v4-profiles-v2.8.0.7`). Its manifests, firmware filenames, and Meshtastic client **About** view identify the exact compiled image as `2.8.0.<7-character commit SHA>`; the compact OLED footer displays `2.8.0`. These are expected representations of the same release, not evidence that the wrong image was installed.
+
 ### Standard node
 
 Use files beginning with:
@@ -211,7 +213,7 @@ firmware-heltec-v4-solar-router-
 
 ### OTA update — recommended
 
-Use the normal `.bin` image that does not contain `.factory` in its filename. An OTA or normal firmware update preserves the node configuration, cryptographic identity, keys, Bluetooth bonds, and persistent display setting.
+Use the normal `.bin` image that does not contain `.factory` in its filename. An OTA or normal firmware update preserves the node configuration, every valid keypair, Bluetooth bonds, and persistent display setting. The visible Node ID exceptions described above still apply to a legacy mismatched identity, a clean keyless node, or a rejected low-entropy key.
 
 ### Wired update
 

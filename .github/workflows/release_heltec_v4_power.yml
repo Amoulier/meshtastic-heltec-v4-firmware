@@ -64,7 +64,7 @@ jobs:
           fi
 
           verify_release_tag_absent_including_drafts() {
-            local page=1 payload count
+            local page=1 payload count match_status
             while true; do
               if ! payload=$(curl --fail --silent --show-error \
                 --header "Accept: application/vnd.github+json" \
@@ -74,14 +74,25 @@ jobs:
                 echo "Refusing release: unable to inventory existing releases and drafts" >&2
                 return 1
               fi
-              if ! jq -e 'type == "array"' <<<"$payload" >/dev/null; then
-                echo "Refusing release: GitHub release inventory was not an array" >&2
+              if ! jq -e 'type == "array" and all(.[]; (type == "object") and (.tag_name | type == "string"))' \
+                <<<"$payload" >/dev/null; then
+                echo "Refusing release: GitHub release inventory had an invalid schema" >&2
                 return 1
               fi
-              if jq -e --arg tag "$RELEASE_TAG" 'any(.[]; .tag_name == $tag)' <<<"$payload" >/dev/null; then
-                echo "Refusing release: an existing release or draft already uses ${RELEASE_TAG}" >&2
-                return 1
-              fi
+              match_status=0
+              jq -e --arg tag "$RELEASE_TAG" 'any(.[]; .tag_name == $tag)' \
+                <<<"$payload" >/dev/null || match_status=$?
+              case "$match_status" in
+                0)
+                  echo "Refusing release: an existing release or draft already uses ${RELEASE_TAG}" >&2
+                  return 1
+                  ;;
+                1) ;;
+                *)
+                  echo "Refusing release: unable to validate the GitHub release inventory" >&2
+                  return 1
+                  ;;
+              esac
               if ! count=$(jq -er 'length' <<<"$payload"); then
                 echo "Refusing release: unable to count the GitHub release inventory" >&2
                 return 1
@@ -274,7 +285,7 @@ jobs:
           fi
 
           verify_release_tag_absent_including_drafts() {
-            local page=1 payload count
+            local page=1 payload count match_status
             while true; do
               if ! payload=$(curl --fail --silent --show-error \
                 --header "Accept: application/vnd.github+json" \
@@ -284,14 +295,25 @@ jobs:
                 echo "Refusing release: unable to inventory existing releases and drafts" >&2
                 return 1
               fi
-              if ! jq -e 'type == "array"' <<<"$payload" >/dev/null; then
-                echo "Refusing release: GitHub release inventory was not an array" >&2
+              if ! jq -e 'type == "array" and all(.[]; (type == "object") and (.tag_name | type == "string"))' \
+                <<<"$payload" >/dev/null; then
+                echo "Refusing release: GitHub release inventory had an invalid schema" >&2
                 return 1
               fi
-              if jq -e --arg tag "$RELEASE_TAG" 'any(.[]; .tag_name == $tag)' <<<"$payload" >/dev/null; then
-                echo "Refusing release: an existing release or draft appeared before publish for ${RELEASE_TAG}" >&2
-                return 1
-              fi
+              match_status=0
+              jq -e --arg tag "$RELEASE_TAG" 'any(.[]; .tag_name == $tag)' \
+                <<<"$payload" >/dev/null || match_status=$?
+              case "$match_status" in
+                0)
+                  echo "Refusing release: an existing release or draft appeared before publish for ${RELEASE_TAG}" >&2
+                  return 1
+                  ;;
+                1) ;;
+                *)
+                  echo "Refusing release: unable to validate the GitHub release inventory" >&2
+                  return 1
+                  ;;
+              esac
               if ! count=$(jq -er 'length' <<<"$payload"); then
                 echo "Refusing release: unable to count the GitHub release inventory" >&2
                 return 1
@@ -315,6 +337,8 @@ jobs:
           overwrite_files: false
           body: |
             Custom Meshtastic firmware exclusively for the Heltec V4 OLED, now distributed as two explicit profiles from one maintained codebase.
+
+            `v2.8.0.7` is the distribution revision. Manifests, firmware filenames and the Meshtastic client About view identify the exact build as `2.8.0.<7-character commit SHA>`; the compact OLED footer displays `2.8.0`. Those are expected representations of this same release.
 
             Choose one profile:
 
@@ -344,7 +368,7 @@ jobs:
             - Preference writes report verification failures and retry without formatting or wiping the filesystem.
             - A failed LittleFS mount never auto-formats Heltec V4: the node boots fail-closed with LoRa TX and GPS off, accepts only local BLE/USB administration (including supported BLE OTA) for recovery, and rejects identity/settings writes.
             - A mounted but unreadable identity/config file remains protected after boot: LoRa stays silent, ordinary Admin mutations and identity-bearing writes are rejected, and config-only reset cannot replace the unavailable key.
-            - A partial core generation is detected before any boot migration or automatic save: if any config/channel/module/device/node file or pending temporary exists while a peer file is missing, the node remains radio-silent and preserves the surviving files for local recovery.
+            - A partial core generation is detected before any boot migration or automatic save. Config, channel, module and device-state files must form one complete generation. `nodes.proto` may be absent only for a new keyless, unlicensed node; once private/config public key material, an owner public key or licensed identity exists, it is required too. A missing required peer or pending temporary keeps the node radio-silent and preserves the surviving files for local recovery.
             - Recovery exposes only a bounded local BLE/USB allowlist: reboot/shutdown, DFU, supported BLE OTA, compatible preference restore and factory reset operations, plus NodeDB reset when the surviving state permits it. Destructive operations require an active USB data-host connection or an initialized raw battery reading of at least 3.65 V, refreshed immediately before each destructive boundary.
             - Full reset clears unrelated files before `/prefs`; if its explicitly authorized preference removal becomes partial, it completes through a verified filesystem format instead of returning with a half-deleted generation.
             - Config-only reset replaces each identity-bearing core file atomically before auxiliary preferences are removed, and cannot retain a stale node cache when no initialized identity can produce a fresh one; an incomplete multi-file reset reports failure and keeps recovery connectivity available for retry.
@@ -354,7 +378,7 @@ jobs:
             - A new incoming-message banner no longer replaces a text-message frame that is already being read; the message remains stored and unread.
             - SX1262 state-loss recovery no longer compounds the Heltec V4 FEM power conversion; failed CAD defers TX, failed reconfiguration rearms RX, and failed critical-sleep entry asserts radio reset.
             - Muted senders and channels do not wake the display or power state machine.
-            - Restored legacy low-entropy PKI keys are rejected and securely regenerated; ordinary existing keys and node identity remain unchanged.
+            - Restored legacy low-entropy PKI keys are rejected and securely regenerated. Every valid existing keypair is preserved, although a legacy visible Node ID may be realigned to `CRC32(public_key)`; selecting the first region on a clean keyless node creates its initial identity.
             - Unified OTA transport and firmware hash are read back from NVS before the OTA loader is selected, preventing a persistence failure from stranding the node in app1.
             - BLE OTA cannot reactivate stale Wi-Fi credentials from an earlier Wi-Fi OTA, including during fail-closed storage recovery.
             - Abandoned multi-setting Admin transactions expire on the real idle deadline, persist their applied values, and retain any restart required for Bluetooth/power-state changes.

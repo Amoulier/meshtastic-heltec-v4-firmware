@@ -100,6 +100,11 @@ require(release.count("/releases?per_page=100&page=${page}") == 2, "draft-inclus
 require("/releases/tags/" not in release, "draft-blind release lookup was reintroduced")
 require(release.count("if ! remote_tag=$(git ls-remote") == 2, "tag-ref checks must fail closed on transport errors")
 require(release.count('if [[ -n "$remote_tag" ]]') == 2, "tag-ref checks must reject an existing tag")
+require(
+    release.count('type == "array" and all(.[]; (type == "object") and (.tag_name | type == "string"))') == 2,
+    "release inventories must validate every release entry",
+)
+require(release.count('case "$match_status" in') == 2, "release inventory jq status must be handled explicitly")
 require("overwrite_files: false" in release, "release assets may overwrite an existing payload")
 
 # Keep every human-facing package version synchronized, while the firmware's
@@ -127,6 +132,12 @@ for line in release.splitlines() + build.splitlines():
 require(
     re.search(r"ghcr\.io/meshtastic/gh-action-firmware@sha256:[0-9a-f]{64}", build) is not None,
     "firmware build container is not digest-pinned",
+)
+esp32_platform = read("variants/esp32/esp32-common.ini")
+require("archive/refs/heads/" not in esp32_platform, "ESP32 build platform uses a mutable branch archive")
+require(
+    "pioarduino-platform-espressif32/archive/f89295f6a617a8ec611f4bd4eb2f998799dc5dc8.zip" in esp32_platform,
+    "ESP32 build platform is not pinned to the audited revision",
 )
 require("persist-credentials: false" in build, "checkout credentials remain exposed to the build container")
 require("< <(" not in build + release, "workflow masks a producer failure behind process substitution")
