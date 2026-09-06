@@ -286,7 +286,7 @@ IF NOT "!ESPTOOL_EXIT!"=="0" (
 )
 %ESPTOOL_CMD% version 2>&1 | powershell -NoProfile -NonInteractive -Command ^
     "$text = [Console]::In.ReadToEnd(); " ^
-    "$match = [regex]::Match($text, '(?<![0-9])([0-9]+\.[0-9]+(?:\.[0-9]+)?)(?![0-9])'); " ^
+    "$match = [regex]::Match($text, '(?:^|[^0-9])([0-9]+\.[0-9]+(?:\.[0-9]+)?)(?:$|[^0-9])'); " ^
     "if (-not $match.Success -or [version]$match.Groups[1].Value -lt [version]'4.5.1') { exit 1 }"
 IF !ERRORLEVEL! NEQ 0 (
     CALL :LOG_MESSAGE ERROR "esptool 4.5.1 or newer is required."

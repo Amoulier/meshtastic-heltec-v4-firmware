@@ -47,6 +47,10 @@ jobs:
       - name: Test Heltec-only release policy
         run: |
           set -euo pipefail
+          python3 test/host/version_identity_test.py
+          python3 test/host/battery_calibration_regression.py
+          python3 test/host/battery_adc_regression.py
+          python3 test/host/battery_pipeline_regression.py
           python3 test/host/heltec_release_policy_test.py
           python3 test/host/heltec_audit_regression.py
           bash -n bin/device-install.sh bin/device-update.sh
@@ -133,12 +137,13 @@ jobs:
           test -s "$OTA_FILE"
           test "$(stat -c%s "$OTA_FILE")" -eq 636544
 
-          # Calculate MD5 and size
+          # Calculate digests and size
           if command -v md5sum &> /dev/null; then
             OTA_MD5=$(md5sum "$OTA_FILE" | cut -d' ' -f1)
           else
             OTA_MD5=$(md5 -q "$OTA_FILE")
           fi
+          OTA_SHA256=$(sha256sum "$OTA_FILE" | cut -d' ' -f1)
           OTA_SIZE=$(stat -f%z "$OTA_FILE" 2>/dev/null || stat -c%s "$OTA_FILE")
 
           shopt -s nullglob
@@ -152,9 +157,9 @@ jobs:
           echo "Updating $manifest with $OTA_FILE (md5: $OTA_MD5, size: $OTA_SIZE)"
           jq -e '.files | type == "array"' "$manifest" >/dev/null
           # Replace any stale OTA entry so the manifest always matches the pinned payload.
-          jq --arg name "$OTA_FILE" --arg md5 "$OTA_MD5" --argjson bytes "$OTA_SIZE" --arg part "app1" \
+          jq --arg name "$OTA_FILE" --arg md5 "$OTA_MD5" --arg sha256 "$OTA_SHA256" --argjson bytes "$OTA_SIZE" --arg part "app1" \
             '.files = ([.files[] | select(.name != $name)] +
-              [{"name": $name, "md5": $md5, "bytes": $bytes, "part_name": $part}])' \
+              [{"name": $name, "md5": $md5, "sha256": $sha256, "bytes": $bytes, "part_name": $part}])' \
             "$manifest" > "${manifest}.tmp"
           mv "${manifest}.tmp" "$manifest"
 

@@ -26,6 +26,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "Throttle.h"
 #include "configuration.h"
 #include "meshUtils.h"
+#include <algorithm>
+#include <limits>
 #if HAS_SCREEN
 #include "EInkParallelDisplay.h"
 #include <OLEDDisplay.h>
@@ -64,8 +66,8 @@ extern NicheGraphics::BaseUIEInkDisplay *setupNicheGraphicsBaseUI();
 #include "MeshService.h"
 #include "MessageStore.h"
 #include "RadioLibInterface.h"
-#include "SafeFile.h"
 #include "SPILock.h"
+#include "SafeFile.h"
 #include "error.h"
 #include "gps/GeoCoord.h"
 #include "gps/RTC.h"
@@ -349,7 +351,8 @@ void Screen::showOverlayBanner(BannerOverlayOptions banner_overlay_options)
         (banner_overlay_options.durationMs == 0) ? 0 : millis() + banner_overlay_options.durationMs;
     NotificationRenderer::optionsArrayPtr = banner_overlay_options.optionsArrayPtr;
     NotificationRenderer::optionsEnumPtr = banner_overlay_options.optionsEnumPtr;
-    NotificationRenderer::alertBannerOptions = banner_overlay_options.optionsCount;
+    NotificationRenderer::alertBannerOptions =
+        std::min<size_t>(banner_overlay_options.optionsCount, std::numeric_limits<int>::max());
     NotificationRenderer::alertBannerCallback = banner_overlay_options.bannerCallback;
     NotificationRenderer::curSelected = banner_overlay_options.InitialSelected;
     NotificationRenderer::pauseBanner = false;
@@ -1254,7 +1257,7 @@ void Screen::forceDisplay(bool forceUiUpdate)
     if (isDisplayDisabled())
         return;
 
-    // Nasty hack to force epaper updates for 'key' frames.  FIXME, cleanup.
+        // Nasty hack to force epaper updates for 'key' frames.  FIXME, cleanup.
 #ifdef USE_EINK
     // If requested, make sure queued commands are run, and UI has rendered a new frame
     if (forceUiUpdate) {

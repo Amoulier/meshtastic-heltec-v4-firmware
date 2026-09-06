@@ -36,6 +36,7 @@ template <typename T> void SX126xInterface<T>::parkRadioHardware()
     radioSleepConfirmed.store(false, std::memory_order_release);
     isReceiving = false;
     activeReceiveStart = 0;
+    configHeaderDetectedAt.store(0, std::memory_order_release);
     disableInterrupt();
     abortSending();
     RadioLibInterface::setStandby();
@@ -433,6 +434,7 @@ template <typename T> int16_t SX126xInterface<T>::trySetStandby()
 #endif
     isReceiving = false; // If we were receiving, not any more
     activeReceiveStart = 0;
+    configHeaderDetectedAt.store(0, std::memory_order_release);
     disableInterrupt();
     abortSending(); // Forced standby is not proof that an in-flight packet was sent.
     RadioLibInterface::setStandby();
@@ -493,6 +495,7 @@ template <typename T> void SX126xInterface<T>::startReceive()
             // new receive window before beginPreferenceEdit() parks the chip.
             isReceiving = false;
             activeReceiveStart = 0;
+            configHeaderDetectedAt.store(0, std::memory_order_release);
             // Cancellation resumes this deliberately suppressed RX window via
             // RadioLibInterface::resumeQueuedTransmissions().
             rxOffline = true;
@@ -575,8 +578,7 @@ template <typename T> bool SX126xInterface<T>::isChannelActive()
     };
 
     int16_t result = scanChannel();
-    ChannelScanAction action =
-        channelScanAction(result == RADIOLIB_LORA_DETECTED, result == RADIOLIB_CHANNEL_FREE, false);
+    ChannelScanAction action = channelScanAction(result == RADIOLIB_LORA_DETECTED, result == RADIOLIB_CHANNEL_FREE, false);
     if (action == ChannelScanAction::TRANSMIT)
         return false;
     if (action == ChannelScanAction::DEFER)
@@ -609,9 +611,40 @@ template <typename T> bool SX126xInterface<T>::isActivelyReceiving()
 {
     if (radioHardwareParked.load(std::memory_order_acquire))
         return false;
-    // The IRQ status will be cleared when we start our read operation. Check if we've started a header, but haven't yet
-    // received and handled the interrupt for reading the packet/handling errors.
     return receiveDetected(lora.getIrqFlags(), RADIOLIB_SX126X_IRQ_HEADER_VALID, RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED);
+}
+
+template <typename T> bool SX126xInterface<T>::isActivelyReceivingForConfig(uint32_t &expiredIrqFlags)
+{
+    expiredIrqFlags = 0;
+    if (radioHardwareParked.load(std::memory_order_acquire))
+        return false;
+    const uint16_t irq = lora.getIrqFlags();
+    bool receiving = receiveDetected(irq, RADIOLIB_SX126X_IRQ_HEADER_VALID, RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED, false);
+    if (irq & RADIOLIB_SX126X_IRQ_HEADER_VALID) {
+        uint32_t headerDetectedAt = configHeaderDetectedAt.load(std::memory_order_acquire);
+        if (!headerDetectedAt) {
+            headerDetectedAt = millis();
+            uint32_t expected = 0;
+            if (!configHeaderDetectedAt.compare_exchange_strong(expected, headerDetectedAt, std::memory_order_acq_rel))
+                headerDetectedAt = expected;
+        }
+        // A header first observed after an expired preamble still gets a complete receive window.
+        receiving = receiving ||
+                    Throttle::isWithinTimespanMs(
+                        headerDetectedAt, getPacketTime(meshtastic_Constants_DATA_PAYLOAD_LEN + sizeof(PacketHeader), false));
+    } else {
+        configHeaderDetectedAt.store(0, std::memory_order_release);
+    }
+    const uint16_t detectionMask = RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED | RADIOLIB_SX126X_IRQ_HEADER_VALID;
+    if (!receiving && !(irq & ~detectionMask))
+        expiredIrqFlags = irq & detectionMask;
+    return receiving;
+}
+
+template <typename T> bool SX126xInterface<T>::isIRQPendingForConfig(uint32_t expiredIrqFlags)
+{
+    return !radioHardwareParked.load(std::memory_order_acquire) && (lora.getIrqFlags() & ~expiredIrqFlags) != 0;
 }
 
 template <typename T> bool SX126xInterface<T>::sleep()

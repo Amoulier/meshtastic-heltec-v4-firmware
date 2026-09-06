@@ -5,6 +5,8 @@
 #include "esp_sleep.h"
 #include "power/BatteryCriticalPolicy.h"
 #include "power/DeepSleepPolicy.h"
+#include "power/HeltecV4BatteryAdc.h"
+#include "power/HeltecV4BatteryCalibration.h"
 #if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
 #include <HWCDC.h>
 #endif
@@ -87,25 +89,6 @@ static void releaseBatteryRecoveryHolds()
     gpio_deep_sleep_hold_dis();
 }
 
-static uint16_t readBatteryMillivolts()
-{
-    pinMode(ADC_CTRL, OUTPUT);
-    digitalWrite(ADC_CTRL, ADC_CTRL_ENABLED);
-    delay(10);
-
-    analogReadResolution(12);
-    analogSetPinAttenuation(BATTERY_PIN, ADC_2_5db);
-
-    uint32_t millivolts = 0;
-    constexpr uint8_t samples = 15;
-    for (uint8_t i = 0; i < samples; i++) {
-        millivolts += analogReadMilliVolts(BATTERY_PIN);
-    }
-
-    digitalWrite(ADC_CTRL, !ADC_CTRL_ENABLED);
-    return static_cast<uint16_t>((millivolts / samples) * (ADC_MULTIPLIER));
-}
-
 static bool hasActiveUsbDataHost()
 {
 #if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
@@ -166,8 +149,7 @@ static void prepareBatteryRecoveryHardware(bool forceRadioReset)
 __attribute__((noinline)) void variant_shutdown(bool radioSleepSucceeded)
 {
     if (batteryCriticalLatched) {
-        prepareBatteryRecoveryHardware(
-            shouldForceRadioResetForCriticalSleep(batteryCriticalLatched, radioSleepSucceeded));
+        prepareBatteryRecoveryHardware(shouldForceRadioResetForCriticalSleep(batteryCriticalLatched, radioSleepSucceeded));
     }
 }
 
@@ -180,16 +162,29 @@ static void enterBatteryRecoverySleep(bool forceRadioReset)
     esp_deep_sleep_start();
 }
 
+#endif
+
+#if defined(HELTEC_V4_OLED)
 void earlyInitVariant()
 {
+    const auto calibration = readHeltecV4BatteryCalibration(static_cast<float>(ADC_MULTIPLIER));
+    const bool calibrationAvailable = calibration.status == HeltecV4BatteryCalibrationStatus::VALID ||
+                                      calibration.status == HeltecV4BatteryCalibrationStatus::MISSING;
+    if (calibrationAvailable)
+        setActiveHeltecV4AdcMultiplier(calibration.multiplier);
+    else
+        invalidateHeltecV4AdcCalibration();
+#if defined(HELTEC_V4_SOLAR_ROUTER_PROFILE) && HELTEC_V4_SOLAR_ROUTER_PROFILE
     const bool recoveryWasLatched = batteryCriticalLatched;
     releaseEarlyPinHold(ADC_CTRL);
     releaseEarlyPinHold(BATTERY_PIN);
 
-    const uint16_t batteryMillivolts = readBatteryMillivolts();
-    if (shouldUseCriticalBatteryRecovery(batteryMillivolts, recoveryWasLatched, BATTERY_BOOT_GUARD_MIN_MILLIVOLTS,
-                                         BATTERY_CRITICAL_MILLIVOLTS, BATTERY_CRITICAL_RECOVERY_MILLIVOLTS,
-                                         hasActiveUsbDataHost())) {
+    uint16_t batteryMillivolts = 0;
+    const bool validReading = readHeltecV4BatteryMillivolts(calibration.multiplier, batteryMillivolts);
+    const bool usbDataHost = hasActiveUsbDataHost();
+    if ((!usbDataHost && (!validReading || !calibrationAvailable)) ||
+        shouldUseCriticalBatteryRecovery(batteryMillivolts, recoveryWasLatched, BATTERY_BOOT_GUARD_MIN_MILLIVOLTS,
+                                         BATTERY_CRITICAL_MILLIVOLTS, BATTERY_CRITICAL_RECOVERY_MILLIVOLTS, usbDataHost)) {
         batteryCriticalLatched = true;
         const bool radioStateIsKnownSafe =
             isBatteryRecoveryRadioStateKnownSafe(recoveryWasLatched, esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER);
@@ -202,6 +197,7 @@ void earlyInitVariant()
     }
 
     batteryCriticalLatched = false;
+#endif
 }
 
 #endif

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 # trunk-ignore-all(ruff/F821)
 # trunk-ignore-all(flake8/F821): For SConstruct imports
-import sys
-from os.path import join
-import subprocess
 import json
 import re
-from datetime import datetime
+import subprocess
+import sys
+from os.path import join
 from typing import Dict
 
-from readprops import readProps
+from readprops import file_sha256, readProps
 
 Import("env")
 platform = env.PioPlatform()
 progname = env.get("PROGNAME")
 lfsbin = f"{progname.replace('firmware-', 'littlefs-')}.bin"
 manifest_ran = False
+
 
 def infer_architecture(board_cfg):
     try:
@@ -45,6 +45,7 @@ def infer_architecture(board_cfg):
         return "stm32"
     return None
 
+
 def run_size_tool(env, flag, purpose):
     """Run the toolchain size tool against the built ELF and return its output.
 
@@ -65,6 +66,7 @@ def run_size_tool(env, flag, purpose):
     except Exception as exc:
         print(f"mtjson: skipping {purpose} ({size_tool} failed: {exc})")
         return None
+
 
 def compute_ram_bytes(env):
     """Static RAM usage (.data + .bss) of the ELF, via the toolchain size tool.
@@ -91,13 +93,18 @@ def compute_ram_bytes(env):
         # .tdata never match.
         if name.startswith(".rtc"):
             continue
-        if name in (".data", ".bss", ".sdata", ".sbss") or name.endswith(".data") or name.endswith(".bss"):
+        if (
+            name in (".data", ".bss", ".sdata", ".sbss")
+            or name.endswith(".data")
+            or name.endswith(".bss")
+        ):
             try:
                 ram += int(parts[1])
                 found = True
             except ValueError:
                 continue
     return ram if found else None
+
 
 def compute_flash_bytes(env):
     """Flash footprint (text + data) of the ELF via the toolchain size tool.
@@ -117,14 +124,21 @@ def compute_flash_bytes(env):
             return int(parts[0]) + int(parts[1])
     return None
 
+
 def manifest_gather(source, target, env):
     global manifest_ran
     if manifest_ran:
         return
+    if readProps(prefsLoc) != verObj:
+        raise RuntimeError(
+            "Firmware sources changed during the build; rebuild before packaging"
+        )
     # Skip manifest generation if we cannot determine architecture (host/native builds)
     board_arch = infer_architecture(env.BoardConfig())
     if not board_arch:
-        print(f"Skipping mtjson generation for unknown architecture (env={env.get('PIOENV')})")
+        print(
+            f"Skipping mtjson generation for unknown architecture (env={env.get('PIOENV')})"
+        )
         manifest_ran = True
         return
     manifest_ran = True
@@ -132,14 +146,14 @@ def manifest_gather(source, target, env):
     board_platform = env.BoardConfig().get("platform")
     board_mcu = env.BoardConfig().get("build.mcu").lower()
     needs_ota_suffix = board_platform == "nordicnrf52"
-    
+
     # Mapping of bin files to their target partition names
     # Maps the filename pattern to the partition name where it should be flashed
     partition_map = {
-        f"{progname}.bin": "app0",              # primary application slot (app0 / OTA_0)
-        lfsbin: "spiffs",                        # filesystem image flashed to spiffs
+        f"{progname}.bin": "app0",  # primary application slot (app0 / OTA_0)
+        lfsbin: "spiffs",  # filesystem image flashed to spiffs
     }
-    
+
     check_paths = [
         progname,
         f"{progname}.elf",
@@ -152,7 +166,7 @@ def manifest_gather(source, target, env):
         f"{progname}.zip",
         lfsbin,
         f"mt-{board_mcu}-ota.bin",
-        "bleota-c3.bin"
+        "bleota-c3.bin",
     ]
     for p in check_paths:
         f = env.File(env.subst(f"$BUILD_DIR/{p}"))
@@ -162,8 +176,9 @@ def manifest_gather(source, target, env):
                 manifest_name = f"{progname}-ota.zip"
             d = {
                 "name": manifest_name,
-                "md5": f.get_content_hash(), # Returns MD5 hash
-                "bytes": f.get_size() # Returns file size in bytes
+                "md5": f.get_content_hash(),  # Returns MD5 hash
+                "sha256": file_sha256(f.get_abspath()),
+                "bytes": f.get_size(),  # Returns file size in bytes
             }
             # Add part_name if this file represents a partition that should be flashed
             if p in partition_map:
@@ -171,6 +186,7 @@ def manifest_gather(source, target, env):
             out.append(d)
             print(d)
     manifest_write(out, env, compute_ram_bytes(env), compute_flash_bytes(env))
+
 
 def manifest_write(files, env, ram_bytes=None, flash_bytes=None):
     # Defensive: also skip manifest writing if we cannot determine architecture
@@ -201,6 +217,10 @@ def manifest_write(files, env, ram_bytes=None, flash_bytes=None):
 
     manifest = {
         "version": verObj["long"],
+        "upstream_version": verObj["upstream"],
+        "fork_revision": verObj["fork_revision"],
+        "source": verObj["source"],
+        "identity_sha256": verObj["identity_sha256"],
         "build_epoch": build_epoch,
         "platformioTarget": env.get("PIOENV"),
         "mcu": env.get("BOARD_MCU"),
@@ -246,7 +266,6 @@ def manifest_write(files, env, ram_bytes=None, flash_bytes=None):
         ("variant", ["custom_meshtastic_variant"], str),
     ]
 
-
     for manifest_key, option_keys, caster in device_meta_fields:
         raw_val = get_project_option_any(option_keys)
         if raw_val is None:
@@ -256,9 +275,13 @@ def manifest_write(files, env, ram_bytes=None, flash_bytes=None):
             device_meta[manifest_key] = parsed
 
     # Determine architecture once; if we can't infer it, skip manifest generation
-    board_arch = device_meta.get("architecture") or infer_architecture(env.BoardConfig())
+    board_arch = device_meta.get("architecture") or infer_architecture(
+        env.BoardConfig()
+    )
     if not board_arch:
-        print(f"Skipping mtjson write for unknown architecture (env={env.get('PIOENV')})")
+        print(
+            f"Skipping mtjson write for unknown architecture (env={env.get('PIOENV')})"
+        )
         return
 
     device_meta["architecture"] = board_arch
@@ -277,18 +300,31 @@ def manifest_write(files, env, ram_bytes=None, flash_bytes=None):
     with open(env.subst("$BUILD_DIR/${PROGNAME}.mt.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
+
 Import("projenv")
 
 prefsLoc = projenv["PROJECT_DIR"] + "/version.properties"
-verObj = readProps(prefsLoc)
-print(f"Using meshtastic platformio-custom.py, firmware version {verObj['long']} on {env.get('PIOENV')}")
+verObj = env.get("MESHTASTIC_VERSION") or readProps(prefsLoc)
+print(
+    f"Using meshtastic platformio-custom.py, firmware version {verObj['long']} on {env.get('PIOENV')}"
+)
 
 # get repository owner if git is installed
 try:
     r_owner = (
-        subprocess.check_output(["git", "config", "--get", "remote.origin.url"])
+        subprocess.check_output(
+            [
+                "git",
+                "-C",
+                projenv["PROJECT_DIR"],
+                "config",
+                "--get",
+                "remote.origin.url",
+            ]
+        )
         .decode("utf-8")
-        .strip().split("/")
+        .strip()
+        .split("/")
     )
     repo_owner = r_owner[-2] + "/" + r_owner[-1].replace(".git", "")
 except subprocess.CalledProcessError:
@@ -296,7 +332,7 @@ except subprocess.CalledProcessError:
 
 jsonLoc = env["PROJECT_DIR"] + "/userPrefs.jsonc"
 with open(jsonLoc) as f:
-    jsonStr = re.sub("//.*","", f.read(), flags=re.MULTILINE)
+    jsonStr = re.sub("//.*", "", f.read(), flags=re.MULTILINE)
     userPrefs = json.loads(jsonStr)
 
 # Channels::initDefaultChannel() applies a configured index as a whole, so resolve per-field
@@ -311,7 +347,9 @@ CHANNEL_FIELD_DEFAULTS = {
     "DOWNLINK_ENABLED": "false",
 }
 channelsToWriteRaw = userPrefs.get("USERPREFS_CHANNELS_TO_WRITE", "1")
-channelsToWrite = int(channelsToWriteRaw, 16 if channelsToWriteRaw.lower().startswith("0x") else 10)
+channelsToWrite = int(
+    channelsToWriteRaw, 16 if channelsToWriteRaw.lower().startswith("0x") else 10
+)
 if channelsToWrite > MAX_NUM_CHANNELS:
     sys.exit(
         f"userPrefs.jsonc: USERPREFS_CHANNELS_TO_WRITE is {channelsToWrite}, "
@@ -341,17 +379,15 @@ for pref in userPrefs:
         pref_flags.append("-D" + pref + "=" + env.StringifyMacro(userPrefs[pref]) + "")
 
 # General options that are passed to the C and C++ compilers
-# Calculate unix epoch for current day (midnight)
-current_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-build_epoch = int(current_date.timestamp())
+build_epoch = verObj["build_epoch"]
 
 flags = [
-        "-DAPP_VERSION=" + verObj["long"],
-        "-DAPP_VERSION_SHORT=" + verObj["short"],
-        "-DAPP_ENV=" + env.get("PIOENV"),
-        "-DAPP_REPO=" + repo_owner,
-        "-DBUILD_EPOCH=" + str(build_epoch),
-    ] + pref_flags
+    "-DAPP_VERSION=" + verObj["long"],
+    "-DAPP_VERSION_SHORT=" + verObj["short"],
+    "-DAPP_ENV=" + env.get("PIOENV"),
+    "-DAPP_REPO=" + repo_owner,
+    "-DBUILD_EPOCH=" + str(build_epoch),
+] + pref_flags
 
 print("Using flags:")
 for flag in flags:
@@ -369,7 +405,8 @@ for lb in env.GetLibBuilders():
 # DEBUG_MUTE already compiles every LOG_* call out entirely; nanopb's own error-message
 # strings are a separate mechanism it doesn't touch, so mirror the same intent into nanopb.
 debug_mute_defined = any(
-    d == "DEBUG_MUTE" or (isinstance(d, tuple) and d[0] == "DEBUG_MUTE") for d in env.get("CPPDEFINES", [])
+    d == "DEBUG_MUTE" or (isinstance(d, tuple) and d[0] == "DEBUG_MUTE")
+    for d in env.get("CPPDEFINES", [])
 )
 if debug_mute_defined:
     projenv.Append(CPPDEFINES=[("PB_NO_ERRMSG", 1)])
@@ -377,6 +414,7 @@ if debug_mute_defined:
         if lb.name == "Nanopb":
             lb.env.Append(CPPDEFINES=[("PB_NO_ERRMSG", 1)])
             break
+
 
 # Get the display resolution from macros
 def get_display_resolution(build_flags):
@@ -387,6 +425,7 @@ def get_display_resolution(build_flags):
             return screen_width, screen_height
     print("No screen resolution defined in build_flags. Please define DISPLAY_SIZE.")
     exit(1)
+
 
 def load_boot_logo(source, target, env):
     build_flags = env.get("CPPDEFINES", [])
@@ -403,6 +442,7 @@ def load_boot_logo(source, target, env):
         env.Execute(f"mkdir -p {dest_dir} && rm -f {dest_path}")
         # Copy the logo to the `data/boot` directory
         env.Execute(f"cp {source_path} {dest_path}")
+
 
 # Load the boot logo on TFT builds
 if ("HAS_TFT", 1) in env.get("CPPDEFINES", []):
@@ -425,6 +465,7 @@ if platform.name == "espressif32":
     mtjson_deps.append(target_lfs)
 
 if should_skip_manifest:
+
     def skip_manifest(source, target, env):
         print(f"mtjson: skipped for native environment: {env.get('PIOENV')}")
 

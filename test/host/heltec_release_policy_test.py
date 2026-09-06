@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Fail closed if the Heltec-only build or release contract drifts."""
 
-from pathlib import Path
 import re
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -54,7 +53,10 @@ require(
 for expected in ("heltec-v4-standard", "heltec-v4-solar-router"):
     require(expected in build, f"build workflow does not allow {expected}")
 for forbidden in ("superbase", "heltec-v4-r8", "heltec-v4-tft"):
-    require(forbidden not in release.lower(), f"release workflow contains forbidden target {forbidden}")
+    require(
+        forbidden not in release.lower(),
+        f"release workflow contains forbidden target {forbidden}",
+    )
 
 # Publication is intentionally four assets: two normal OTA images and two
 # complete clean-install bundles. Factory images must stay inside the bundles.
@@ -62,29 +64,40 @@ require(
     'test "$(find publish -maxdepth 1 -type f | wc -l)" -eq 4' in release,
     "release asset-count gate is not exactly four",
 )
-require("files: publish/*" in release, "release action is not limited to the verified publish directory")
+require(
+    "files: publish/*" in release,
+    "release action is not limited to the verified publish directory",
+)
 copy_lines = [line for line in release.splitlines() if re.match(r"\s*cp\s", line)]
-require(not any("factory.bin" in line or ".mt.json" in line for line in copy_lines), "standalone recovery assets are published")
+require(
+    not any("factory.bin" in line or ".mt.json" in line for line in copy_lines),
+    "standalone recovery assets are published",
+)
 
 # Capture ZIP listings before matching permissions. Under `set -o pipefail`, a
 # producer piped to an early-exiting matcher can turn an otherwise valid bundle
 # into a SIGPIPE-dependent result.
 require(
-    "standard_zip_listing=$(zipinfo -l publish/heltec-v4-standard-complete-v2.8.0.8.zip)" in release,
+    'standard_zip_listing=$(zipinfo -l "publish/heltec-v4-standard-complete-${firmware_version}.zip")'
+    in release,
     "Standard ZIP listing is not captured before validation",
 )
 require(
-    "solar_zip_listing=$(zipinfo -l publish/heltec-v4-solar-router-complete-v2.8.0.8.zip)" in release,
+    'solar_zip_listing=$(zipinfo -l "publish/heltec-v4-solar-router-complete-${firmware_version}.zip")'
+    in release,
     "Solar Router ZIP listing is not captured before validation",
 )
-require(re.search(r"zipinfo[^\n]*\|\s*grep", release) is None, "ZIP permission validation reintroduced a producer pipeline")
+require(
+    re.search(r"zipinfo[^\n]*\|\s*grep", release) is None,
+    "ZIP permission validation reintroduced a producer pipeline",
+)
 for listing in ("standard_zip_listing", "solar_zip_listing"):
     require(
-        f'grep -E \'^-rwxr-xr-x .* device-install\\.sh$\' <<<"${listing}"' in release,
+        f"grep -E '^-rwxr-xr-x .* device-install\\.sh$' <<<\"${listing}\"" in release,
         f"{listing} does not verify device-install.sh permissions",
     )
     require(
-        f'grep -E \'^-rwxr-xr-x .* device-update\\.sh$\' <<<"${listing}"' in release,
+        f"grep -E '^-rwxr-xr-x .* device-update\\.sh$' <<<\"${listing}\"" in release,
         f"{listing} does not verify device-update.sh permissions",
     )
 
@@ -95,39 +108,86 @@ require(
     "startsWith(github.event.head_commit.message, 'release(heltec-v4):')" in release,
     "release commit-prefix gate is missing",
 )
-require(release.count("verify_release_tag_absent_including_drafts") == 4, "draft-inclusive tag gate must run twice")
-require(release.count("/releases?per_page=100&page=${page}") == 2, "draft-inclusive release inventory must run twice")
-require("/releases/tags/" not in release, "draft-blind release lookup was reintroduced")
-require(release.count("if ! remote_tag=$(git ls-remote") == 2, "tag-ref checks must fail closed on transport errors")
-require(release.count('if [[ -n "$remote_tag" ]]') == 2, "tag-ref checks must reject an existing tag")
 require(
-    release.count('type == "array" and all(.[]; (type == "object") and (.tag_name | type == "string"))') == 2,
+    release.count("verify_release_tag_absent_including_drafts") == 4,
+    "draft-inclusive tag gate must run twice",
+)
+require(
+    release.count("/releases?per_page=100&page=${page}") == 2,
+    "draft-inclusive release inventory must run twice",
+)
+require("/releases/tags/" not in release, "draft-blind release lookup was reintroduced")
+require(
+    release.count("if ! remote_tag=$(git ls-remote") == 2,
+    "tag-ref checks must fail closed on transport errors",
+)
+require(
+    release.count('if [[ -n "$remote_tag" ]]') == 2,
+    "tag-ref checks must reject an existing tag",
+)
+require(
+    release.count(
+        'type == "array" and all(.[]; (type == "object") and (.tag_name | type == "string"))'
+    )
+    == 2,
     "release inventories must validate every release entry",
 )
-require(release.count('case "$match_status" in') == 2, "release inventory jq status must be handled explicitly")
-require("overwrite_files: false" in release, "release assets may overwrite an existing payload")
-require("cuts the shared OLED/VEXT rail" not in release, "release overstates VEXT shutdown behavior")
 require(
-    "VEXT/QuickLink rail is also turned off when the completed boot scan found no other I2C accessory" in release,
+    release.count('case "$match_status" in') == 2,
+    "release inventory jq status must be handled explicitly",
+)
+require(
+    "overwrite_files: false" in release,
+    "release assets may overwrite an existing payload",
+)
+require(
+    "cuts the shared OLED/VEXT rail" not in release,
+    "release overstates VEXT shutdown behavior",
+)
+require(
+    "VEXT/QuickLink rail is also turned off when the completed boot scan found no other I2C accessory"
+    in release,
     "release does not explain accessory-aware VEXT preservation",
 )
 menu_handler = read("src/graphics/draw/MenuHandler.cpp")
-require("Disable OLED?\\nVEXT off if no I2C\\nHold PRG to restore" in menu_handler, "OLED confirmation misstates VEXT behavior")
+require(
+    "Disable OLED?\\nVEXT off if no I2C\\nHold PRG to restore" in menu_handler,
+    "OLED confirmation misstates VEXT behavior",
+)
 
 # Keep every human-facing package version synchronized, while the firmware's
-# own 2.8.0.<git-sha> version remains independently derived by buildinfo.py.
+# own compact fork/source version remains independently derived by buildinfo.py.
 package_versions = set(re.findall(r"v\d+\.\d+\.\d+\.\d+", release))
-require(len(package_versions) == 1, f"release package versions disagree: {sorted(package_versions)}")
-require(package_versions == {"v2.8.0.8"}, f"unexpected planned package version: {sorted(package_versions)}")
 require(
-    release.count("heltec-v4-profiles-v2.8.0.8") == 3,
+    len(package_versions) == 1,
+    f"release package versions disagree: {sorted(package_versions)}",
+)
+require(
+    package_versions == {"v2.8.0.9"},
+    f"unexpected planned package version: {sorted(package_versions)}",
+)
+require(
+    release.count("heltec-v4-profiles-v2.8.0.9") == 3,
     "release tag must match in both provenance gates and the publisher",
 )
-require('firmware_version="2.8.0.${GITHUB_SHA::7}"' in release, "internal firmware version contract changed")
+require(
+    "version_json=$(python3 bin/buildinfo.py json)" in release
+    and 'firmware_version="$FIRMWARE_VERSION"' in release
+    and ".source.sha256 == $source_sha256" in release
+    and ".identity_sha256 == $identity_sha256" in release
+    and "expected_sha256" in release,
+    "release does not bind source identity and image SHA256 to the compiled version",
+)
 base_version = read("version.properties")
-for component, value in (("major", "2"), ("minor", "8"), ("build", "0")):
+for component, value in (
+    ("major", "2"),
+    ("minor", "8"),
+    ("build", "0"),
+    ("fork_revision", "9"),
+):
     require(
-        re.search(rf"^\s*{component}\s*=\s*{value}\s*$", base_version, re.MULTILINE) is not None,
+        re.search(rf"^\s*{component}\s*=\s*{value}\s*$", base_version, re.MULTILINE)
+        is not None,
         f"version.properties {component} no longer matches the 2.8.0 release base",
     )
 
@@ -135,43 +195,117 @@ for component, value in (("major", "2"), ("minor", "8"), ("build", "0")):
 for line in release.splitlines() + build.splitlines():
     match = re.match(r"\s*(?:-\s*)?uses:\s*([^\s#]+)", line)
     if match and not match.group(1).startswith("./"):
-        require(re.search(r"@[0-9a-f]{40}$", match.group(1)) is not None, f"GitHub Action is not SHA-pinned: {match.group(1)}")
+        require(
+            re.search(r"@[0-9a-f]{40}$", match.group(1)) is not None,
+            f"GitHub Action is not SHA-pinned: {match.group(1)}",
+        )
 require(
-    re.search(r"ghcr\.io/meshtastic/gh-action-firmware@sha256:[0-9a-f]{64}", build) is not None,
+    re.search(r"ghcr\.io/meshtastic/gh-action-firmware@sha256:[0-9a-f]{64}", build)
+    is not None,
     "firmware build container is not digest-pinned",
 )
 esp32_platform = read("variants/esp32/esp32-common.ini")
-require("archive/refs/heads/" not in esp32_platform, "ESP32 build platform uses a mutable branch archive")
 require(
-    "pioarduino-platform-espressif32/archive/f89295f6a617a8ec611f4bd4eb2f998799dc5dc8.zip" in esp32_platform,
+    "archive/refs/heads/" not in esp32_platform,
+    "ESP32 build platform uses a mutable branch archive",
+)
+require(
+    "pioarduino-platform-espressif32/archive/f89295f6a617a8ec611f4bd4eb2f998799dc5dc8.zip"
+    in esp32_platform,
     "ESP32 build platform is not pinned to the audited revision",
 )
-require("persist-credentials: false" in build, "checkout credentials remain exposed to the build container")
-require("< <(" not in build + release, "workflow masks a producer failure behind process substitution")
+require(
+    "persist-credentials: false" in build,
+    "checkout credentials remain exposed to the build container",
+)
+require(
+    "< <(" not in build + release,
+    "workflow masks a producer failure behind process substitution",
+)
 
 # Installer accept-lists must match the same two profiles and exclude lookalike
 # board names. This checks release inputs, not just build selection.
-for relative in ("bin/device-install.sh", "bin/device-update.sh", "bin/device-install.bat", "bin/device-update.bat"):
+for relative in (
+    "bin/device-install.sh",
+    "bin/device-update.sh",
+    "bin/device-install.bat",
+    "bin/device-update.bat",
+):
     installer = read(relative).lower()
     require("heltec-v4-standard" in installer, f"{relative} does not accept Standard")
-    require("heltec-v4-solar-router" in installer, f"{relative} does not accept Solar Router")
-    require("4.5.1" in installer, f"{relative} does not enforce the minimum supported esptool version")
+    require(
+        "heltec-v4-solar-router" in installer,
+        f"{relative} does not accept Solar Router",
+    )
+    require(
+        "4.5.1" in installer,
+        f"{relative} does not enforce the minimum supported esptool version",
+    )
     for forbidden in ("superbase", "heltec-v4-r8", "heltec-v4-tft"):
-        require(forbidden not in installer, f"{relative} accepts or references forbidden target {forbidden}")
+        require(
+            forbidden not in installer,
+            f"{relative} accepts or references forbidden target {forbidden}",
+        )
 
 for relative, exact_name in (
-    ("bin/device-install.sh", 'EXPECTED_FACTORY_BASENAME="firmware-${TARGET}-${VERSION}.factory.bin"'),
-    ("bin/device-update.sh", 'EXPECTED_FIRMWARE_BASENAME="firmware-${TARGET}-${VERSION}.bin"'),
+    (
+        "bin/device-install.sh",
+        'EXPECTED_FACTORY_BASENAME="firmware-${TARGET}-${VERSION}.factory.bin"',
+    ),
+    (
+        "bin/device-update.sh",
+        'EXPECTED_FIRMWARE_BASENAME="firmware-${TARGET}-${VERSION}.bin"',
+    ),
 ):
     installer = read(relative)
-    require(exact_name in installer, f"{relative} does not bind the selected filename to manifest target/version")
-    require("ESPTOOL_VERSION_MAJOR" in installer, f"{relative} does not parse and compare the esptool version")
-    require('grep --quiet write-flash <<<"$ESPTOOL_HELP"' in installer, f"{relative} lost its esptool v4/v5 syntax probe")
+    require(
+        exact_name in installer,
+        f"{relative} does not bind the selected filename to manifest target/version",
+    )
+    require(
+        "ESPTOOL_VERSION_MAJOR" in installer,
+        f"{relative} does not parse and compare the esptool version",
+    )
+    require(
+        'grep --quiet write-flash <<<"$ESPTOOL_HELP"' in installer,
+        f"{relative} lost its esptool v4/v5 syntax probe",
+    )
 
 for relative in ("bin/device-install.bat", "bin/device-update.bat"):
     raw = (ROOT / relative).read_bytes()
-    require(b"\r\n" in raw and raw.replace(b"\r\n", b"").find(b"\n") == -1, f"{relative} must use consistent CRLF")
-    require(b"[Version 2.7.0]" not in raw, f"{relative} reports the obsolete upstream script version")
+    require(
+        b"\r\n" in raw and raw.replace(b"\r\n", b"").find(b"\n") == -1,
+        f"{relative} must use consistent CRLF",
+    )
+    require(
+        b"[Version 2.7.0]" not in raw,
+        f"{relative} reports the obsolete upstream script version",
+    )
+    version_pattern = re.search(
+        r"\[regex\]::Match\(\$text, '([^']+)'\)", raw.decode("utf-8")
+    )
+    require(
+        version_pattern is not None,
+        f"{relative} does not parse esptool's version output",
+    )
+    # CMD consumes exclamation marks before PowerShell when delayed expansion is enabled.
+    require(
+        "!" not in version_pattern.group(1),
+        f"{relative} version regex is corrupted by CMD delayed expansion",
+    )
+    for output, expected in (
+        ("esptool.py v4.5.1\r\n4.5.1\r\n", "4.5.1"),
+        ("esptool.py v4.5\r\n", "4.5"),
+        ("5.2.0\r\n", "5.2.0"),
+        ("esptool v5.2.0-dev", "5.2.0"),
+        ("esptool unavailable", None),
+    ):
+        match = re.search(version_pattern.group(1), output)
+        actual = match.group(1) if match else None
+        require(
+            actual == expected,
+            f"{relative} parsed {output!r} as {actual!r}, expected {expected!r}",
+        )
 
 # A settings generation is changed only after the radio and Router have
 # handed off all old-generation work. These source-order checks pin the
@@ -187,72 +321,99 @@ on_notify = function_body(radio_lib, "void RadioLibInterface::onNotify(")
 start_send = function_body(radio_lib, "bool RadioLibInterface::startSend(")
 can_park = function_body(radio_lib, "bool RadioLibInterface::canParkForConfig(")
 radio_send = function_body(radio_lib, "ErrorCode RadioLibInterface::send(")
-pending_tx = function_body(radio_lib, "bool RadioLibInterface::hasPendingTransmissionsForConfig(")
-maintenance = function_body(radio_lib, "void RadioLibInterface::periodicRadioMaintenance(")
+pending_tx = function_body(
+    radio_lib, "bool RadioLibInterface::hasPendingTransmissionsForConfig("
+)
+maintenance = function_body(
+    radio_lib, "void RadioLibInterface::periodicRadioMaintenance("
+)
 begin_edit = function_body(nodedb_source, "bool NodeDB::beginPreferenceEdit(")
 cancel_edit = function_body(nodedb_source, "bool NodeDB::cancelPreferenceEdit(")
-finish_activation = function_body(nodedb_source, "bool NodeDB::finishPreferenceEditActivation(")
-park_destructive = function_body(nodedb_source, "bool parkHeltecRadioForStorageMutation(")
+finish_activation = function_body(
+    nodedb_source, "bool NodeDB::finishPreferenceEditActivation("
+)
+park_destructive = function_body(
+    nodedb_source, "bool parkHeltecRadioForStorageMutation("
+)
 router_run = function_body(router_source, "int32_t Router::runOnce(")
 
 require(
-    "enum class PreferenceEditState : uint8_t { NONE, QUIESCING, OPEN, COMMITTING, ACTIVATING }" in nodedb_header,
+    "enum class PreferenceEditState : uint8_t { NONE, QUIESCING, OPEN, COMMITTING, ACTIVATING }"
+    in nodedb_header,
     "settings edit no longer has an explicit quiescing generation fence",
 )
 require(
-    on_notify.index("radioNotificationDepth.fetch_add") < on_notify.index("startSend(txp)")
+    on_notify.index("radioNotificationDepth.fetch_add")
+    < on_notify.index("startSend(txp)")
     < on_notify.rindex("radioNotificationDepth.fetch_sub"),
     "radio worker ownership no longer spans dequeue through hardware start",
 )
-require(on_notify.count("startSend(txp)") == 1, "unexpected startSend call count inside the radio worker")
+require(
+    on_notify.count("startSend(txp)") == 1,
+    "unexpected startSend call count inside the radio worker",
+)
 dequeue = on_notify.index("txp = txQueue.dequeue()")
 require(
     on_notify.rfind("isPreferenceEditTransactionActive()", 0, dequeue) >= 0,
     "radio worker no longer rechecks the transaction immediately before dequeue",
 )
 require(
-    start_send.index("isPreferenceEditTransactionActive()") < start_send.index("configDeferredPacket = txp")
+    start_send.index("isPreferenceEditTransactionActive()")
+    < start_send.index("configDeferredPacket = txp")
     < start_send.index("configHardwareForSend()"),
     "a dequeued packet can cross the settings fence or be lost before hardware start",
 )
 require(
     can_park.count("radioNotificationDepth.load") >= 2
     and can_park.count("isSending()") >= 2
-    and can_park.count("isIRQPending()") >= 2,
+    and can_park.index("isActivelyReceivingForConfig(")
+    < can_park.rindex("isIRQPendingForConfig("),
     "radio parking lost its stable post-probe ownership recheck",
 )
 require(
-    ("hasConfigDeferredPacket()" in pending_tx or "configDeferredPacket != nullptr" in pending_tx)
+    (
+        "hasConfigDeferredPacket()" in pending_tx
+        or "configDeferredPacket != nullptr" in pending_tx
+    )
     and "!txQueue.empty()" in pending_tx
     and "std::atomic<bool> configResumeRequested" in radio_lib_header,
     "deferred TX ownership or durable resume tracking is missing",
 )
 require(
-    radio_send.index("sendAdmissionDepth.fetch_add") < radio_send.index("isPreferenceEditTransactionActive()")
+    radio_send.index("sendAdmissionDepth.fetch_add")
+    < radio_send.index("isPreferenceEditTransactionActive()")
     < radio_send.index("txQueue.enqueue"),
     "a producer can enqueue old-generation ciphertext outside the radio admission depth",
 )
 require(
-    "sendAdmissionDepth.load" in can_park and can_park.count("sendAdmissionDepth.load") >= 2,
+    "sendAdmissionDepth.load" in can_park
+    and can_park.count("sendAdmissionDepth.load") >= 2,
     "radio parking can pass while a pre-fence producer still owns send admission",
 )
 require(
-    "isPreferenceEditQuiescing()" in radio_send and "hasCurrentExternalStateAccess()" in radio_send,
+    "isPreferenceEditQuiescing()" in radio_send
+    and "hasCurrentExternalStateAccess()" in radio_send,
     "QUIESCING does not distinguish an admitted old-generation producer from new work",
 )
 require(
-    "isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive()" in maintenance,
+    "isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive()"
+    in maintenance,
     "radio maintenance can rearm hardware while storage owns the generation",
 )
 
 quiescing = begin_edit.index("PreferenceEditState::QUIESCING")
-first_wait = begin_edit.index("waitForRadioQuiesce()", quiescing)
+first_wait = begin_edit.index("radioIsQuiescent()", quiescing)
 sleep = begin_edit.index("radio->sleep()", first_wait)
-post_sleep_wait = begin_edit.index("waitForRadioQuiesce()", sleep)
+post_sleep_wait = begin_edit.index("radioIsQuiescent()", sleep)
 open_state = begin_edit.rindex("PreferenceEditState::OPEN")
 require(
     quiescing < first_wait < sleep < post_sleep_wait < open_state,
     "settings edit no longer drains radio ownership before exposing mutable RAM",
+)
+require(
+    "delay(1)" not in begin_edit
+    and begin_edit.index("preferenceEditRadioParked.store(true") > first_wait,
+    "settings edit blocks the cooperative worker or marks radio asleep before checking idleness",
 )
 require(
     begin_edit.count("hasPendingTransmissionsForConfig()") >= 2
@@ -262,18 +423,25 @@ require(
 for body, operation in ((cancel_edit, "cancel"), (finish_activation, "finish")):
     none = body.rindex("PreferenceEditState::NONE")
     require(
-        none < body.index("resumeQueuedTransmissions()", none) < body.index("setReceivedMessage()", none),
+        none
+        < body.index("resumeQueuedTransmissions()", none)
+        < body.index("setReceivedMessage()", none),
         f"settings {operation} wakes queues before publishing the NONE generation",
     )
 
 require(
-    router_run.index("radioPacketRunDepth.fetch_add") < router_run.index("fromRadioQueue.dequeuePtr")
-    and router_run.index("fromRadioQueue.dequeuePtr") < router_run.index("configDeferredReceivedPacket.compare_exchange_strong"),
+    router_run.index("radioPacketRunDepth.fetch_add")
+    < router_run.index("fromRadioQueue.dequeuePtr")
+    and router_run.index("fromRadioQueue.dequeuePtr")
+    < router_run.index("configDeferredReceivedPacket.compare_exchange_strong"),
     "Router no longer fences or preserves a packet dequeued across QUIESCING",
 )
 require(
     router_run.index("perhapsHandleReceived(mp)")
-    < router_run.index("configDeferredReceivedPacket.load", router_run.index("perhapsHandleReceived(mp)")),
+    < router_run.index(
+        "configDeferredReceivedPacket.load",
+        router_run.index("perhapsHandleReceived(mp)"),
+    ),
     "Router can dequeue a second packet after reader admission filled its sole deferred slot",
 )
 require(
@@ -284,20 +452,27 @@ require(
     "Router parking predicate omits an old-generation packet owner",
 )
 require(
-    router_source.index("radioPacketRunOwnerTask.store", router_source.index("int32_t Router::runOnce("))
-    < router_source.index("perhapsHandleReceived(mp)", router_source.index("int32_t Router::runOnce(")),
+    router_source.index(
+        "radioPacketRunOwnerTask.store", router_source.index("int32_t Router::runOnce(")
+    )
+    < router_source.index(
+        "perhapsHandleReceived(mp)", router_source.index("int32_t Router::runOnce(")
+    ),
     "remote admin cannot identify its own in-flight Router worker during BEGIN",
 )
 router_send = function_body(router_source, "ErrorCode Router::send(")
 require(
     router_source.count("iface->send(p)") == 1
-    and router_send.index("ExternalStateAccessScope stateAccess") < router_send.index("iface->send(p)"),
+    and router_send.index("ExternalStateAccessScope stateAccess")
+    < router_send.index("iface->send(p)"),
     "a direct or periodic LoRa producer bypasses the external-state admission fence",
 )
 require(
-    park_destructive.count("waitForIdle()") >= 2
-    and park_destructive.index("waitForIdle()") < park_destructive.index("radio->sleep()")
-    < park_destructive.rindex("waitForIdle()"),
+    park_destructive.count("canParkForConfig()") >= 2
+    and park_destructive.index("canParkForConfig()")
+    < park_destructive.index("radio->sleep()")
+    < park_destructive.rindex("canParkForConfig()")
+    and "delay(1)" not in park_destructive,
     "destructive storage can truncate an active radio operation",
 )
 
@@ -318,7 +493,10 @@ require(
     "SafeFile no longer carries the destructive-power requirement",
 )
 require(
-    safe_file_source.count("requireDestructivePower ? heltecDestructiveStoragePowerIsSafe()") >= 2,
+    safe_file_source.count(
+        "requireDestructivePower ? heltecDestructiveStoragePowerIsSafe()"
+    )
+    >= 2,
     "SafeFile must enforce destructive power both at open and final commit",
 )
 require(
@@ -330,7 +508,8 @@ require(
     "encrypted preference writes lose the destructive-power requirement",
 )
 require(
-    "SafeFile(warmFileName, keepPreviousGeneration, requireDestructivePower)" in warm_store,
+    "SafeFile(warmFileName, keepPreviousGeneration, requireDestructivePower)"
+    in warm_store,
     "warm.dat does not preserve its generation/power contract",
 )
 require(
@@ -346,20 +525,29 @@ require(
     "TransmitHistory lost its concurrent snapshot/generation fence",
 )
 require(
-    "writeHeltecResetPendingMarker(HeltecResetPendingKind::EDIT, editRequiresDestructivePower)" in nodedb_source,
+    "writeHeltecResetPendingMarker(HeltecResetPendingKind::EDIT, editRequiresDestructivePower)"
+    in nodedb_source,
     "the settings transaction marker lost its profile-aware power requirement",
 )
 require(
     "it->sender != localNode || it->packetId != packetId" in message_store
     and "sm.packetId = this->lastRequestId" in canned_messages
-    and "updateOwnMessageAck(nodeDB->getNodeNum(), mp.decoded.request_id, storedStatus)" in canned_messages,
+    and "updateOwnMessageAck(nodeDB->getNodeNum(), mp.decoded.request_id, storedStatus)"
+    in canned_messages,
     "canned-message ACK status is no longer matched to its exact outgoing packet",
 )
 
 # Required complete native suites and real-body fault injection are publication gates.
-require("- native-audit" in release, "release does not depend on native integration audit")
-require("test/host/heltec_audit_regression.py" in build, "real-body fault injection is not a build gate")
+require(
+    "- native-audit" in release, "release does not depend on native integration audit"
+)
+require(
+    "test/host/heltec_audit_regression.py" in build,
+    "real-body fault injection is not a build gate",
+)
 audit_workflow = read(".github/workflows/audit_native_heltec.yml")
-require("run-heltec-native-audit.py" in audit_workflow, "native suites are not executed")
+require(
+    "run-heltec-native-audit.py" in audit_workflow, "native suites are not executed"
+)
 require("continue-on-error" not in audit_workflow, "native audit is allowed to fail")
 print("Heltec V4 release policy: PASS")

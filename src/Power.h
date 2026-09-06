@@ -105,8 +105,7 @@ class Power : public concurrency::OSThread
     void powerCommandsCheck();
     void readPowerStatus();
 #if defined(HELTEC_V4_OLED)
-    bool readDestructiveStoragePowerSnapshot(bool &batteryPresent, bool &externalPowerPresent,
-                                             int32_t &batteryVoltageRawMv);
+    bool readDestructiveStoragePowerSnapshot(bool &batteryPresent, bool &externalPowerPresent, int32_t &batteryVoltageRawMv);
 #endif
     void logHeapUsage();
     virtual bool setup();
@@ -156,6 +155,9 @@ class Power : public concurrency::OSThread
     // open circuit voltage lookup table
     uint8_t low_voltage_counter;
     uint32_t lastLogTime = 0;
+#if defined(HELTEC_V4_OLED)
+    float reportedAdcMultiplier = 0;
+#endif
 #ifdef BATTERY_PERCENT_SLEW_INTERVAL_MSEC
     int8_t reportedBatteryPercent = -1;
     uint32_t lastBatteryPercentChangeMs = 0;
@@ -174,8 +176,6 @@ class Power : public concurrency::OSThread
     uint32_t lastheap;
 #endif
 };
-
-void battery_adcEnable();
 
 extern Power *power;
 

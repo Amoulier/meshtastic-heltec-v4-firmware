@@ -18,6 +18,7 @@
 #endif
 #include "main.h"
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <vector>
 #if HAS_TRACKBALL
@@ -44,10 +45,10 @@ namespace graphics
 {
 int bannerSignalBars = -1;
 InputEvent NotificationRenderer::inEvent;
-int8_t NotificationRenderer::curSelected = 0;
+int NotificationRenderer::curSelected = 0;
 char NotificationRenderer::alertBannerMessage[256] = {0};
-uint32_t NotificationRenderer::alertBannerUntil = 0;  // 0 is a special case meaning forever
-uint8_t NotificationRenderer::alertBannerOptions = 0; // last x lines are selectable options
+uint32_t NotificationRenderer::alertBannerUntil = 0; // 0 is a special case meaning forever
+int NotificationRenderer::alertBannerOptions = 0;    // last x lines are selectable options
 const char **NotificationRenderer::optionsArrayPtr = nullptr;
 const int *NotificationRenderer::optionsEnumPtr = nullptr;
 std::function<void(int)> NotificationRenderer::alertBannerCallback = NULL;
@@ -357,7 +358,7 @@ void NotificationRenderer::drawNumberPicker(OLEDDisplay *display, OLEDDisplayUiS
         resetBanner();
         return;
     }
-    if (curSelected == static_cast<int8_t>(numDigits)) {
+    if (curSelected == static_cast<int>(numDigits)) {
         alertBannerCallback(currentNumber);
         resetBanner();
         return;
@@ -440,7 +441,7 @@ void NotificationRenderer::drawHexPicker(OLEDDisplay *display, OLEDDisplayUiStat
         resetBanner();
         return;
     }
-    if (curSelected == static_cast<int8_t>(numDigits)) {
+    if (curSelected == static_cast<int>(numDigits)) {
         alertBannerCallback(currentNumber);
         resetBanner();
         return;
@@ -548,7 +549,7 @@ void NotificationRenderer::drawAlphanumericPicker(OLEDDisplay *display, OLEDDisp
 
     if (curSelected < 0)
         curSelected = 0;
-    if (curSelected == static_cast<int8_t>(numDigits)) {
+    if (curSelected == static_cast<int>(numDigits)) {
         auto callback = textInputCallback; // capture before clearing to avoid re-entrancy surprises
         std::string result(alphanumericValue, numDigits);
         textInputCallback = nullptr;
@@ -572,7 +573,7 @@ void NotificationRenderer::drawAlphanumericPicker(OLEDDisplay *display, OLEDDisp
     std::string arrowPointer = " ";
     for (uint16_t i = 0; i < numDigits; i++) {
         chars += std::string(1, alphanumericValue[i]) + " ";
-        arrowPointer += (curSelected == static_cast<int8_t>(i)) ? "^ " : "_ ";
+        arrowPointer += (curSelected == static_cast<int>(i)) ? "^ " : "_ ";
     }
 
     linePointers[lineCount++] = chars.c_str();
@@ -587,7 +588,8 @@ void NotificationRenderer::drawNodePicker(OLEDDisplay *display, OLEDDisplayUiSta
 
     // === Layout Configuration ===
     constexpr uint16_t vPadding = 2;
-    alertBannerOptions = nodeDB->getNumMeshNodes() - 1;
+    const size_t nodeCount = nodeDB->getNumMeshNodes();
+    alertBannerOptions = std::min<size_t>(nodeCount > 0 ? nodeCount - 1 : 0, std::numeric_limits<int>::max());
 
     // let the box drawing function calculate the widths?
 
@@ -606,15 +608,20 @@ void NotificationRenderer::drawNodePicker(OLEDDisplay *display, OLEDDisplayUiSta
     }
 
     // Handle input
-    if (inEvent.inputEvent == INPUT_BROKER_UP || inEvent.inputEvent == INPUT_BROKER_LEFT ||
-        inEvent.inputEvent == INPUT_BROKER_ALT_PRESS || inEvent.inputEvent == INPUT_BROKER_UP_LONG) {
-        curSelected--;
+    if (curSelected < 0 || curSelected >= alertBannerOptions)
+        curSelected = 0;
+    if (alertBannerOptions > 0 && (inEvent.inputEvent == INPUT_BROKER_UP || inEvent.inputEvent == INPUT_BROKER_LEFT ||
+                                   inEvent.inputEvent == INPUT_BROKER_ALT_PRESS || inEvent.inputEvent == INPUT_BROKER_UP_LONG)) {
+        curSelected = (curSelected == 0) ? alertBannerOptions - 1 : curSelected - 1;
     } else if (inEvent.inputEvent == INPUT_BROKER_DOWN || inEvent.inputEvent == INPUT_BROKER_RIGHT ||
                inEvent.inputEvent == INPUT_BROKER_USER_PRESS || inEvent.inputEvent == INPUT_BROKER_DOWN_LONG) {
-        curSelected++;
-    } else if (inEvent.inputEvent == INPUT_BROKER_SELECT) {
-        alertBannerCallback(selectedNodenum);
+        curSelected = (curSelected >= alertBannerOptions - 1) ? 0 : curSelected + 1;
+    } else if (inEvent.inputEvent == INPUT_BROKER_SELECT && alertBannerOptions > 0) {
+        const uint32_t selected = selectedNodenum;
+        auto callback = alertBannerCallback;
         resetBanner();
+        if (callback)
+            callback(selected);
         return;
     } else if ((inEvent.inputEvent == INPUT_BROKER_CANCEL || inEvent.inputEvent == INPUT_BROKER_ALT_LONG) &&
                alertBannerUntil != 0) {
@@ -622,36 +629,30 @@ void NotificationRenderer::drawNodePicker(OLEDDisplay *display, OLEDDisplayUiSta
         return;
     }
 
-    if (curSelected == -1)
-        curSelected = alertBannerOptions - 1;
-    if (curSelected == alertBannerOptions)
-        curSelected = 0;
-
     inEvent.inputEvent = INPUT_BROKER_NONE;
     if (alertBannerMessage[0] == '\0')
         return;
 
-    uint16_t totalLines = lineCount + alertBannerOptions;
+    const size_t totalLines = static_cast<size_t>(lineCount) + alertBannerOptions;
     uint16_t screenHeight = display->height();
     uint8_t effectiveLineHeight = FONT_HEIGHT_SMALL - 3;
-    uint8_t visibleTotalLines = std::min<uint8_t>(totalLines, (screenHeight - vPadding * 2) / effectiveLineHeight);
-    uint8_t linesShown = lineCount;
+    const uint16_t availableHeight = screenHeight > vPadding * 2 ? screenHeight - vPadding * 2 : 0;
+    const uint16_t visibleTotalLines = std::min<size_t>(totalLines, availableHeight / effectiveLineHeight);
+    uint16_t linesShown = std::min(lineCount, visibleTotalLines);
     const char *linePointers[visibleTotalLines + 1] = {0}; // this is sort of a dynamic allocation
 
     // copy the linestarts to display to the linePointers holder
-    for (int i = 0; i < lineCount; i++) {
+    for (uint16_t i = 0; i < linesShown; i++) {
         linePointers[i] = lineStarts[i];
     }
-    char scratchLineBuffer[visibleTotalLines - lineCount][64];
+    const int visibleOptions = visibleTotalLines - linesShown;
+    char scratchLineBuffer[std::max(visibleOptions, 1)][64];
 
-    uint8_t firstOptionToShow = 0;
-    if (curSelected > 1 && alertBannerOptions > visibleTotalLines - lineCount) {
-        if (curSelected > alertBannerOptions - visibleTotalLines + lineCount)
-            firstOptionToShow = alertBannerOptions - visibleTotalLines + lineCount;
-        else
-            firstOptionToShow = curSelected - 1;
-    } else {
-        firstOptionToShow = 0;
+    int firstOptionToShow = 0;
+    if (visibleOptions == 1) {
+        firstOptionToShow = curSelected;
+    } else if (visibleOptions > 1 && curSelected > 1 && alertBannerOptions > visibleOptions) {
+        firstOptionToShow = std::min(curSelected - 1, alertBannerOptions - visibleOptions);
     }
     int scratchLineNum = 0;
     for (int i = firstOptionToShow; i < alertBannerOptions && linesShown < visibleTotalLines; i++, linesShown++) {
@@ -711,11 +712,8 @@ void NotificationRenderer::drawAlertBannerOverlay(OLEDDisplay *display, OLEDDisp
     // === Layout Configuration ===
     constexpr uint16_t vPadding = 2;
 
-    uint16_t optionWidths[alertBannerOptions] = {0};
     uint16_t maxWidth = 0;
     uint16_t arrowsWidth = display->getStringWidth(">  <", 4, true);
-    uint16_t lineWidths[MAX_LINES] = {0};
-    uint16_t lineLengths[MAX_LINES] = {0};
     const char *lineStarts[MAX_LINES + 1] = {0};
     uint16_t lineCount = 0;
     char lineBuffer[40] = {0};
@@ -727,11 +725,11 @@ void NotificationRenderer::drawAlertBannerOverlay(OLEDDisplay *display, OLEDDisp
         lineCount = std::min<uint8_t>(alertBannerLineCount, MAX_LINES);
         for (uint16_t i = 0; i < lineCount; i++) {
             lineStarts[i] = alertBannerLines[i];
-            lineLengths[i] = strlen(lineStarts[i]);
+            const uint16_t lineLength = strlen(lineStarts[i]);
             display->setFont(fontForBannerLine(alertBannerLineFonts[i]));
-            lineWidths[i] = display->getStringWidth(lineStarts[i], lineLengths[i], true);
-            if (lineWidths[i] > maxWidth)
-                maxWidth = lineWidths[i];
+            const uint16_t lineWidth = display->getStringWidth(lineStarts[i], lineLength, true);
+            if (lineWidth > maxWidth)
+                maxWidth = lineWidth;
         }
     } else {
         char *alertEnd = alertBannerMessage + strnlen(alertBannerMessage, sizeof(alertBannerMessage));
@@ -739,12 +737,12 @@ void NotificationRenderer::drawAlertBannerOverlay(OLEDDisplay *display, OLEDDisp
 
         while ((lineCount < MAX_LINES) && (lineStarts[lineCount] < alertEnd)) {
             lineStarts[lineCount + 1] = std::find((char *)lineStarts[lineCount], alertEnd, '\n');
-            lineLengths[lineCount] = lineStarts[lineCount + 1] - lineStarts[lineCount];
+            const uint16_t lineLength = lineStarts[lineCount + 1] - lineStarts[lineCount];
             if (lineStarts[lineCount + 1][0] == '\n')
                 lineStarts[lineCount + 1] += 1;
-            lineWidths[lineCount] = display->getStringWidth(lineStarts[lineCount], lineLengths[lineCount], true);
-            if (lineWidths[lineCount] > maxWidth)
-                maxWidth = lineWidths[lineCount];
+            const uint16_t lineWidth = display->getStringWidth(lineStarts[lineCount], lineLength, true);
+            if (lineWidth > maxWidth)
+                maxWidth = lineWidth;
             lineCount++;
         }
     }
@@ -752,40 +750,34 @@ void NotificationRenderer::drawAlertBannerOverlay(OLEDDisplay *display, OLEDDisp
     // Measure option widths
     display->setFont(FONT_SMALL);
     for (int i = 0; i < alertBannerOptions; i++) {
-        optionWidths[i] = display->getStringWidth(optionsArrayPtr[i], strlen(optionsArrayPtr[i]), true);
-        if (optionWidths[i] > maxWidth)
-            maxWidth = optionWidths[i];
-        if (optionWidths[i] + arrowsWidth > maxWidth)
-            maxWidth = optionWidths[i] + arrowsWidth;
+        const uint16_t optionWidth = display->getStringWidth(optionsArrayPtr[i], strlen(optionsArrayPtr[i]), true);
+        if (optionWidth + arrowsWidth > maxWidth)
+            maxWidth = optionWidth + arrowsWidth;
     }
 
     // Handle input
     if (alertBannerOptions > 0) {
+        if (curSelected < 0 || curSelected >= alertBannerOptions)
+            curSelected = 0;
         if (inEvent.inputEvent == INPUT_BROKER_UP || inEvent.inputEvent == INPUT_BROKER_LEFT ||
             inEvent.inputEvent == INPUT_BROKER_ALT_PRESS || inEvent.inputEvent == INPUT_BROKER_UP_LONG) {
-            curSelected--;
+            curSelected = (curSelected == 0) ? alertBannerOptions - 1 : curSelected - 1;
         } else if (inEvent.inputEvent == INPUT_BROKER_DOWN || inEvent.inputEvent == INPUT_BROKER_RIGHT ||
                    inEvent.inputEvent == INPUT_BROKER_USER_PRESS || inEvent.inputEvent == INPUT_BROKER_DOWN_LONG) {
-            curSelected++;
+            curSelected = (curSelected == alertBannerOptions - 1) ? 0 : curSelected + 1;
         } else if (inEvent.inputEvent == INPUT_BROKER_SELECT) {
-            if (optionsEnumPtr != nullptr) {
-                alertBannerCallback(optionsEnumPtr[curSelected]);
-                optionsEnumPtr = nullptr;
-            } else {
-                alertBannerCallback(curSelected);
-            }
+            const int selected = optionsEnumPtr ? optionsEnumPtr[curSelected] : curSelected;
+            auto callback = alertBannerCallback;
+            // A callback may display another banner and redraw immediately.
             resetBanner();
+            if (callback)
+                callback(selected);
             return;
         } else if ((inEvent.inputEvent == INPUT_BROKER_CANCEL || inEvent.inputEvent == INPUT_BROKER_ALT_LONG) &&
                    alertBannerUntil != 0) {
             resetBanner();
             return;
         }
-
-        if (curSelected == -1)
-            curSelected = alertBannerOptions - 1;
-        if (curSelected == alertBannerOptions)
-            curSelected = 0;
     } else {
         if (inEvent.inputEvent == INPUT_BROKER_SELECT || inEvent.inputEvent == INPUT_BROKER_ALT_LONG ||
             inEvent.inputEvent == INPUT_BROKER_CANCEL) {
@@ -798,12 +790,13 @@ void NotificationRenderer::drawAlertBannerOverlay(OLEDDisplay *display, OLEDDisp
     if (alertBannerMessage[0] == '\0')
         return;
 
-    uint16_t totalLines = lineCount + alertBannerOptions;
+    const size_t totalLines = static_cast<size_t>(lineCount) + alertBannerOptions;
 
     uint16_t screenHeight = display->height();
     uint8_t effectiveLineHeight = FONT_HEIGHT_SMALL - 3;
-    uint8_t visibleTotalLines = std::min<uint8_t>(totalLines, (screenHeight - vPadding * 2) / effectiveLineHeight);
-    uint8_t linesShown = lineCount;
+    const uint16_t availableHeight = screenHeight > vPadding * 2 ? screenHeight - vPadding * 2 : 0;
+    const uint16_t visibleTotalLines = std::min<size_t>(totalLines, availableHeight / effectiveLineHeight);
+    uint16_t linesShown = std::min(lineCount, visibleTotalLines);
     const char *linePointers[visibleTotalLines + 1] = {0}; // this is sort of a dynamic allocation
 
     // copy the linestarts to display to the linePointers holder
@@ -811,35 +804,24 @@ void NotificationRenderer::drawAlertBannerOverlay(OLEDDisplay *display, OLEDDisp
         linePointers[i] = lineStarts[i];
     }
 
-    uint8_t firstOptionToShow = 0;
-    if (alertBannerOptions > 0) {
-        if (visibleTotalLines - lineCount == 1) {
+    int firstOptionToShow = 0;
+    const int visibleOptions = visibleTotalLines - linesShown;
+    if (alertBannerOptions > 0 && visibleOptions > 0) {
+        if (visibleOptions == 1) {
             firstOptionToShow = curSelected;
-        } else if (curSelected > 1 && alertBannerOptions > visibleTotalLines - lineCount) {
-            if (curSelected > alertBannerOptions - visibleTotalLines + lineCount)
-                firstOptionToShow = alertBannerOptions - visibleTotalLines + lineCount;
-            else
-                firstOptionToShow = curSelected - 1;
-        } else {
-            firstOptionToShow = 0;
+        } else if (curSelected > 1 && alertBannerOptions > visibleOptions) {
+            firstOptionToShow = std::min(curSelected - 1, alertBannerOptions - visibleOptions);
         }
     }
-    // Useful log line for troubleshooting:
-    /* LOG_WARN("alertBannerOptions: %u, curSelected: %u, visibleTotalLines: %u, lineCount: %u, firstOptionToShow: %u",
-             alertBannerOptions, curSelected, visibleTotalLines, lineCount, firstOptionToShow); */
 
     for (int i = firstOptionToShow; i < alertBannerOptions && linesShown < visibleTotalLines; i++, linesShown++) {
         if (i == curSelected) {
             if (currentResolution == ScreenResolution::High) {
-                strncpy(lineBuffer, "> ", 3);
-                strncpy(lineBuffer + 2, optionsArrayPtr[i], 36);
-                strncpy(lineBuffer + strlen(optionsArrayPtr[i]) + 2, " <", 3);
+                snprintf(lineBuffer, sizeof(lineBuffer), "> %.*s <", static_cast<int>(sizeof(lineBuffer)) - 5,
+                         optionsArrayPtr[i]);
             } else {
-                strncpy(lineBuffer, ">", 2);
-                strncpy(lineBuffer + 1, optionsArrayPtr[i], 37);
-                strncpy(lineBuffer + strlen(optionsArrayPtr[i]) + 1, "<", 2);
+                snprintf(lineBuffer, sizeof(lineBuffer), ">%.*s<", static_cast<int>(sizeof(lineBuffer)) - 3, optionsArrayPtr[i]);
             }
-            lineBuffer[39] = '\0';
             linePointers[linesShown] = lineBuffer;
         } else {
             linePointers[linesShown] = optionsArrayPtr[i];
@@ -853,7 +835,7 @@ void NotificationRenderer::drawAlertBannerOverlay(OLEDDisplay *display, OLEDDisp
 }
 
 void NotificationRenderer::drawNotificationBox(OLEDDisplay *display, OLEDDisplayUiState *state, const char *lines[],
-                                               uint16_t totalLines, uint8_t firstOptionToShow, uint16_t maxWidth)
+                                               size_t totalLines, int firstOptionToShow, uint16_t maxWidth)
 {
 
     bool is_picker = false;
@@ -862,11 +844,16 @@ void NotificationRenderer::drawNotificationBox(OLEDDisplay *display, OLEDDisplay
     constexpr uint16_t hPadding = 5;
     constexpr uint16_t vPadding = 2;
     bool needs_bell = false;
-    uint16_t lineWidths[totalLines] = {0};
-    uint16_t lineLengths[totalLines] = {0};
-    BannerFont lineFonts[totalLines] = {};
-    uint8_t lineEffectiveHeights[totalLines] = {0};
-    const char *renderLines[totalLines] = {0};
+    while (lines[lineCount] != nullptr)
+        lineCount++;
+    // Only the visible window needs scratch space, regardless of the menu size.
+    const uint16_t cachedLines = std::max<uint16_t>(lineCount, 1);
+    uint16_t lineWidths[cachedLines] = {0};
+    uint16_t lineLengths[cachedLines] = {0};
+    BannerFont lineFonts[cachedLines] = {};
+    uint8_t lineEffectiveHeights[cachedLines] = {0};
+    const char *renderLines[cachedLines] = {0};
+    lineCount = 0;
 
     if (maxWidth != 0)
         is_picker = true;
@@ -938,10 +925,10 @@ void NotificationRenderer::drawNotificationBox(OLEDDisplay *display, OLEDDisplay
 
     uint16_t screenHeight = display->height();
     uint8_t effectiveLineHeight = FONT_HEIGHT_SMALL - 3;
-    uint8_t visibleTotalLines = 0;
+    uint16_t visibleTotalLines = 0;
     uint16_t contentHeight = 0;
     const uint16_t availableHeight = (screenHeight > (vPadding * 2)) ? (screenHeight - vPadding * 2) : 0;
-    for (uint8_t i = 0; i < lineCount; i++) {
+    for (uint16_t i = 0; i < lineCount; i++) {
         uint8_t thisLineHeight = lineEffectiveHeights[i] ? lineEffectiveHeights[i] : effectiveLineHeight;
         if (contentHeight + thisLineHeight > availableHeight) {
             break;
@@ -1061,8 +1048,6 @@ void NotificationRenderer::drawNotificationBox(OLEDDisplay *display, OLEDDisplay
                 const int barSpacing = 2;
                 const int barHeightStep = 2;
                 const int gap = 6;
-                const int maxBarHeight = totalBars * barHeightStep;
-
                 int textWidth = display->getStringWidth(lineBuffer, strlen(lineBuffer), true);
                 int barsWidth = totalBars * barWidth + (totalBars - 1) * barSpacing + gap;
                 int totalWidth = textWidth + barsWidth;
@@ -1078,6 +1063,7 @@ void NotificationRenderer::drawNotificationBox(OLEDDisplay *display, OLEDDisplay
                 int baseY = lineY + effectiveLineHeight - 1;
 #if GRAPHICS_TFT_COLORING_ENABLED
                 if (graphics::bannerSignalBars > 0) {
+                    const int maxBarHeight = totalBars * barHeightStep;
                     uint16_t signalBarsColor = TFTPalette::Medium;
                     if (graphics::bannerSignalBars <= 1) {
                         signalBarsColor = TFTPalette::Bad;
@@ -1121,7 +1107,8 @@ void NotificationRenderer::drawNotificationBox(OLEDDisplay *display, OLEDDisplay
 
         float ratio = (float)visibleTotalLines / totalLines;
         uint16_t indicatorHeight = std::max((int)(scrollBarHeight * ratio), 4);
-        float scrollRatio = (float)(firstOptionToShow + lineCount - visibleTotalLines) / (totalLines - visibleTotalLines);
+        float scrollRatio =
+            (float)(static_cast<size_t>(firstOptionToShow) + lineCount - visibleTotalLines) / (totalLines - visibleTotalLines);
         uint16_t indicatorY = scrollBarY + scrollRatio * (scrollBarHeight - indicatorHeight);
 
         display->drawRect(scrollBarX, scrollBarY, scrollBarWidth, scrollBarHeight);

@@ -332,7 +332,11 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
   protected:
     uint32_t activeReceiveStart = 0;
 
-    bool receiveDetected(uint16_t irq, unsigned long syncWordHeaderValidFlag, unsigned long preambleDetectedFlag);
+    bool receiveDetected(uint16_t irq, unsigned long syncWordHeaderValidFlag, unsigned long preambleDetectedFlag,
+                         bool resetOnExpiry = true);
+
+    virtual bool isActivelyReceivingForConfig(uint32_t &expiredIrqFlags);
+    virtual bool isIRQPendingForConfig(uint32_t expiredIrqFlags);
 
     /** Do any hardware setup needed on entry into send configuration for the radio.
      * Subclasses can customize, but must also call this base method */

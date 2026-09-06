@@ -21,11 +21,17 @@
 // keygen.
 #if defined(FSCom) && !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
 
+#include "mesh/Channels.h"
 #include "mesh/NodeDB.h"
+#include "mesh/RadioInterface.h"
 #include "mesh/TypeConversions.h"
+#if ARCH_PORTDUINO
+#include "platform/portduino/PortduinoGlue.h"
+#endif
 #include <ErriezCRC32.h>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -162,6 +168,27 @@ void tearDown(void) {}
 
 // --- Healthy-boot identity ---
 
+static void test_pristineUnsetFirstBoot_persistsCompleteGeneration(void)
+{
+    TEST_ASSERT_FALSE(nodeDB->requiresConfigRecovery());
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RegionCode_UNSET, config.lora.region);
+    TEST_ASSERT_EQUAL(0, config.security.private_key.size);
+    TEST_ASSERT_EQUAL(0, owner.public_key.size);
+    for (const char *path : {configFileName, moduleConfigFileName, deviceStateFileName, channelFileName})
+        TEST_ASSERT_TRUE_MESSAGE(FSCom.exists(path), path);
+    TEST_ASSERT_FALSE(FSCom.exists(nodeDatabaseFileName));
+
+    const uint32_t initialNodeNum = nodeDB->getNodeNum();
+    rebootNodeDB();
+
+    TEST_ASSERT_FALSE(nodeDB->requiresConfigRecovery());
+    TEST_ASSERT_EQUAL_UINT32(0, NodeDBTestShim::unreadableSegments(nodeDB));
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RegionCode_UNSET, config.lora.region);
+    TEST_ASSERT_EQUAL(0, config.security.private_key.size);
+    TEST_ASSERT_EQUAL(0, owner.public_key.size);
+    TEST_ASSERT_EQUAL_UINT32(initialNodeNum, nodeDB->getNodeNum());
+}
+
 // A real Heltec does not mint a PKI identity until the operator selects a
 // region. Core autosaves can therefore create config/module/device/channels
 // while saveNodeDatabaseToDisk() intentionally leaves nodes.proto absent.
@@ -223,6 +250,139 @@ static void test_healthyReboot_preservesIdentity(void)
     TEST_ASSERT_EQUAL_UINT64(fpBefore, fileFingerprint(configFileName));
 }
 
+static void test_customPrimaryFrequencyOffset_survivesColdBootAndSave(void)
+{
+    const meshtastic_Channel primary = channels.getByIndex(channels.getPrimaryIndex());
+    for (ChannelIndex primaryIndex : {ChannelIndex(0), ChannelIndex(3)}) {
+        config.lora.use_preset = true;
+        config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_TURBO;
+        config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+        config.lora.channel_num = 0;
+        config.lora.override_frequency = 0;
+        config.lora.frequency_offset = -7.0f;
+        for (auto &channel : channelFile.channels)
+            channel.role = meshtastic_Channel_Role_DISABLED;
+        channelFile.channels[primaryIndex] = primary;
+        channelFile.channels[primaryIndex].index = primaryIndex;
+        channelFile.channels[primaryIndex].role = meshtastic_Channel_Role_PRIMARY;
+        strcpy(channelFile.channels[primaryIndex].settings.name, "X38");
+        channels.onConfigChanged(false);
+
+        // X38 selects 922.25 MHz in US/LongTurbo; the offset leaves the occupied band safely inside US.
+        TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(config.lora));
+        TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG | SEGMENT_CHANNELS));
+        const uint64_t configFingerprint = fileFingerprint(configFileName);
+        const uint64_t channelFingerprint = fileFingerprint(channelFileName);
+
+        for (int boot = 0; boot < 2; ++boot) {
+            // Model cold-start globals, including an uncached/nonzero primary index.
+            channelFile = meshtastic_ChannelFile_init_zero;
+            channels = Channels();
+            rebootNodeDB();
+
+            TEST_ASSERT_FALSE(nodeDB->requiresConfigRecovery());
+            TEST_ASSERT_EQUAL(primaryIndex, channels.getPrimaryIndex());
+            TEST_ASSERT_EQUAL_STRING("X38", channels.getName(primaryIndex));
+            TEST_ASSERT_EQUAL_FLOAT(-7.0f, config.lora.frequency_offset);
+            TEST_ASSERT_EQUAL_UINT32(0, config.lora.channel_num);
+            TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_ModemPreset_LONG_TURBO, config.lora.modem_preset);
+            TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(config.lora));
+            assertIdentityMatchesBaseline();
+            TEST_ASSERT_EQUAL_UINT64(configFingerprint, fileFingerprint(configFileName));
+            TEST_ASSERT_EQUAL_UINT64(channelFingerprint, fileFingerprint(channelFileName));
+            TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG));
+            TEST_ASSERT_EQUAL_UINT64(configFingerprint, fileFingerprint(configFileName));
+        }
+    }
+
+    writeFileBytes(configFileName, goodConfigBytes.data(), goodConfigBytes.size());
+    writeFileBytes(channelFileName, goodChannelBytes.data(), goodChannelBytes.size());
+    rebootNodeDB();
+    assertIdentityMatchesBaseline();
+}
+
+static void test_restorePreferences_validatesEffectiveConfigAndChannels(void)
+{
+    // A production Router installs this lock before runtime restore is available.
+    static concurrency::Lock restoreCryptoLock;
+    if (!cryptLock)
+        cryptLock = &restoreCryptoLock;
+    const auto setRadioProfile = [](const char *name, float offset) {
+        config.lora.use_preset = true;
+        config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_TURBO;
+        config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+        config.lora.channel_num = 0;
+        config.lora.override_frequency = 0;
+        config.lora.frequency_offset = offset;
+        strcpy(channelFile.channels[channels.getPrimaryIndex()].settings.name, name);
+        channels.onConfigChanged(false);
+    };
+
+    setRadioProfile("X38", -7.0f);
+    TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(config.lora));
+    TEST_ASSERT_TRUE(nodeDB->backupPreferences(meshtastic_AdminMessage_BackupLocation_FLASH));
+    setRadioProfile("", 0.0f);
+    TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG | SEGMENT_CHANNELS));
+
+    TEST_ASSERT_TRUE(nodeDB->restorePreferences(meshtastic_AdminMessage_BackupLocation_FLASH, SEGMENT_CONFIG | SEGMENT_CHANNELS));
+    TEST_ASSERT_EQUAL_STRING("X38", channels.getName(channels.getPrimaryIndex()));
+    TEST_ASSERT_EQUAL_FLOAT(-7.0f, config.lora.frequency_offset);
+    TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(config.lora));
+    rebootNodeDB();
+    TEST_ASSERT_EQUAL_FLOAT(-7.0f, config.lora.frequency_offset);
+    assertIdentityMatchesBaseline();
+
+    setRadioProfile("X39", -7.0f);
+    TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(config.lora));
+    TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG | SEGMENT_CHANNELS));
+    const uint64_t partialRestoreConfigFingerprint = fileFingerprint(configFileName);
+    TEST_ASSERT_TRUE(nodeDB->restorePreferences(meshtastic_AdminMessage_BackupLocation_FLASH, SEGMENT_CHANNELS));
+    TEST_ASSERT_EQUAL_STRING("X38", channels.getName(channels.getPrimaryIndex()));
+    TEST_ASSERT_EQUAL_FLOAT(-7.0f, config.lora.frequency_offset);
+    TEST_ASSERT_EQUAL_UINT64(partialRestoreConfigFingerprint, fileFingerprint(configFileName));
+
+    setRadioProfile("", 19.0f);
+    TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(config.lora));
+    TEST_ASSERT_TRUE(nodeDB->backupPreferences(meshtastic_AdminMessage_BackupLocation_FLASH));
+    setRadioProfile("", 0.0f);
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    channels.onConfigChanged(false);
+    TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG | SEGMENT_CHANNELS));
+    const uint64_t configOnlyChannelFingerprint = fileFingerprint(channelFileName);
+    TEST_ASSERT_TRUE(nodeDB->restorePreferences(meshtastic_AdminMessage_BackupLocation_FLASH, SEGMENT_CONFIG));
+    TEST_ASSERT_EQUAL_FLOAT(19.0f, config.lora.frequency_offset);
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_ModemPreset_LONG_TURBO, config.lora.modem_preset);
+    TEST_ASSERT_EQUAL_UINT64(configOnlyChannelFingerprint, fileFingerprint(channelFileName));
+    TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(config.lora));
+    rebootNodeDB();
+    TEST_ASSERT_EQUAL_FLOAT(19.0f, config.lora.frequency_offset);
+
+    for (const char *backupName : {"", "Default"}) {
+        setRadioProfile("", 0.0f);
+        strcpy(channelFile.channels[channels.getPrimaryIndex()].settings.name, backupName);
+        TEST_ASSERT_TRUE(nodeDB->backupPreferences(meshtastic_AdminMessage_BackupLocation_FLASH));
+        setRadioProfile("X38", -7.0f);
+        TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG | SEGMENT_CHANNELS));
+        const auto configBefore = config.lora;
+        const auto channelsBefore = channelFile;
+        const uint64_t configFingerprint = fileFingerprint(configFileName);
+        const uint64_t channelFingerprint = fileFingerprint(channelFileName);
+
+        TEST_ASSERT_FALSE(nodeDB->restorePreferences(meshtastic_AdminMessage_BackupLocation_FLASH, SEGMENT_CHANNELS));
+        TEST_ASSERT_EQUAL_MEMORY(&configBefore, &config.lora, sizeof(configBefore));
+        TEST_ASSERT_EQUAL_MEMORY(&channelsBefore, &channelFile, sizeof(channelsBefore));
+        TEST_ASSERT_EQUAL_UINT64(configFingerprint, fileFingerprint(configFileName));
+        TEST_ASSERT_EQUAL_UINT64(channelFingerprint, fileFingerprint(channelFileName));
+        assertIdentityMatchesBaseline();
+    }
+
+    TEST_ASSERT_TRUE(FSCom.remove(backupFileName));
+    writeFileBytes(configFileName, goodConfigBytes.data(), goodConfigBytes.size());
+    writeFileBytes(channelFileName, goodChannelBytes.data(), goodChannelBytes.size());
+    rebootNodeDB();
+    assertIdentityMatchesBaseline();
+}
+
 static void test_repeatedReload_replacesRatherThanAppendsNodeDatabase(void)
 {
     constexpr NodeNum diskOnlyNode = 0xA55AA55A;
@@ -245,6 +405,61 @@ static void test_repeatedReload_replacesRatherThanAppendsNodeDatabase(void)
     TEST_ASSERT_NOT_NULL_MESSAGE(nodeDB->getMeshNode(diskOnlyNode), "a second reload must not append or truncate disk rows");
 
     TEST_ASSERT_TRUE(nodeDB->removeNodeByNum(diskOnlyNode, true));
+}
+
+static void test_batteryCalibration_persistsAndRejectsInvalidGenerations(void)
+{
+    for (float multiplier : {0.0f, 5.5f}) {
+        config.power.adc_multiplier_override = multiplier;
+        TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG));
+        const uint64_t fingerprint = fileFingerprint(configFileName);
+        for (unsigned boot = 0; boot < 2; ++boot) {
+            rebootNodeDB();
+            TEST_ASSERT_FALSE(nodeDB->requiresConfigRecovery());
+            TEST_ASSERT_EQUAL_FLOAT(multiplier, config.power.adc_multiplier_override);
+            TEST_ASSERT_EQUAL_UINT64(fingerprint, fileFingerprint(configFileName));
+            assertIdentityMatchesBaseline();
+        }
+    }
+    TEST_ASSERT_TRUE(nodeDB->backupPreferences(meshtastic_AdminMessage_BackupLocation_FLASH));
+    config.power.adc_multiplier_override = 0;
+    TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG));
+    TEST_ASSERT_TRUE(nodeDB->restorePreferences(meshtastic_AdminMessage_BackupLocation_FLASH, SEGMENT_CONFIG));
+    rebootNodeDB();
+    TEST_ASSERT_EQUAL_FLOAT(5.5f, config.power.adc_multiplier_override);
+
+    for (float invalid : {-1.0f, std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
+                          std::numeric_limits<float>::quiet_NaN()}) {
+        const meshtastic_LocalConfig healthy = config;
+        const uint64_t healthyFingerprint = fileFingerprint(configFileName);
+        config.power.adc_multiplier_override = invalid;
+        TEST_ASSERT_FALSE(nodeDB->saveToDisk(SEGMENT_CONFIG));
+        TEST_ASSERT_EQUAL_UINT64(healthyFingerprint, fileFingerprint(configFileName));
+
+        TEST_ASSERT_TRUE(nodeDB->backupPreferences(meshtastic_AdminMessage_BackupLocation_FLASH));
+        config = healthy;
+        TEST_ASSERT_FALSE(nodeDB->restorePreferences(meshtastic_AdminMessage_BackupLocation_FLASH, SEGMENT_CONFIG));
+        TEST_ASSERT_EQUAL_MEMORY(&healthy, &config, sizeof(config));
+        TEST_ASSERT_EQUAL_UINT64(healthyFingerprint, fileFingerprint(configFileName));
+
+        meshtastic_LocalConfig damaged = healthy;
+        damaged.power.adc_multiplier_override = invalid;
+        TEST_ASSERT_TRUE(
+            nodeDB->saveProto(configFileName, meshtastic_LocalConfig_size, &meshtastic_LocalConfig_msg, &damaged, true));
+        const uint64_t damagedFingerprint = fileFingerprint(configFileName);
+        rebootNodeDB();
+        TEST_ASSERT_TRUE(nodeDB->requiresConfigRecovery());
+        TEST_ASSERT_TRUE(NodeDBTestShim::unreadableSegments(nodeDB) & SEGMENT_CONFIG);
+        TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RegionCode_UNSET, config.lora.region);
+        TEST_ASSERT_FALSE(config.lora.tx_enabled);
+        TEST_ASSERT_EQUAL_UINT64(damagedFingerprint, fileFingerprint(configFileName));
+        TEST_ASSERT_EQUAL_UINT32(baseNodeNum, myNodeInfo.my_node_num);
+        TEST_ASSERT_EQUAL_MEMORY(basePublicKey, owner.public_key.bytes, 32);
+        writeFileBytes(configFileName, goodConfigBytes.data(), goodConfigBytes.size());
+        rebootNodeDB();
+        assertIdentityMatchesBaseline();
+    }
+    TEST_ASSERT_TRUE(FSCom.remove(backupFileName));
 }
 
 // --- Degraded boot: present-but-undecodable config ---
@@ -616,21 +831,31 @@ static void test_oldModuleConfig_discardClearsTailSubmessages(void)
     TEST_ASSERT_EQUAL_STRING_MESSAGE("", moduleConfig.statusmessage.node_status,
                                      "statusmessage survived the moduleConfig discard");
 
-    FSCom.remove(moduleConfigFileName); // leave the sandbox as we found it
+    TEST_ASSERT_TRUE(FSCom.exists(moduleConfigFileName));
     rebootNodeDB();
+    TEST_ASSERT_FALSE(nodeDB->requiresConfigRecovery());
+    TEST_ASSERT_EQUAL_STRING("", moduleConfig.statusmessage.node_status);
 }
 
 NBR_TEST_ENTRY void setup()
 {
     initializeTestEnvironment();
+#if ARCH_PORTDUINO
+    // Exercise the physical board's region gate instead of simradio's keygen bypass.
+    portduino_config.lora_module = use_sx1262;
+#endif
     nodeDB = new NodeDB(); // first boot on the pristine per-suite sandbox
 
     UNITY_BEGIN();
 
     printf("\n=== Healthy-boot identity ===\n");
+    RUN_TEST(test_pristineUnsetFirstBoot_persistsCompleteGeneration);
     RUN_TEST(test_keylessUnsetGeneration_withoutNodeDatabaseIsHealthy);
     RUN_TEST(test_firstBoot_establishesKeyedIdentity);
     RUN_TEST(test_healthyReboot_preservesIdentity);
+    RUN_TEST(test_customPrimaryFrequencyOffset_survivesColdBootAndSave);
+    RUN_TEST(test_restorePreferences_validatesEffectiveConfigAndChannels);
+    RUN_TEST(test_batteryCalibration_persistsAndRejectsInvalidGenerations);
     RUN_TEST(test_repeatedReload_replacesRatherThanAppendsNodeDatabase);
 
     printf("\n=== Degraded boot (corrupt config) ===\n");

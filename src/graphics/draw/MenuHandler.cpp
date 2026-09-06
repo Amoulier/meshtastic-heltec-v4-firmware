@@ -69,7 +69,7 @@ BannerOverlayOptions createStaticBannerOptions(const char *message, const MenuOp
     BannerOverlayOptions bannerOptions;
     bannerOptions.message = message;
     bannerOptions.optionsArrayPtr = labels.data();
-    bannerOptions.optionsCount = static_cast<uint8_t>(N);
+    bannerOptions.optionsCount = N;
     bannerOptions.bannerCallback = [optionsPtr, callback](int selected) -> void { callback(optionsPtr[selected], selected); };
     return bannerOptions;
 }
@@ -99,8 +99,7 @@ template <typename Mutation> bool persistMenuConfigMutation(int saveWhat, Mutati
 template <typename Mutation> bool persistValidatedMenuConfigMutation(int saveWhat, Mutation &&mutation)
 {
 #if defined(HELTEC_V4_OLED)
-    const bool saved = adminModule &&
-                       adminModule->runExternalValidatedConfigMutation(saveWhat, std::forward<Mutation>(mutation));
+    const bool saved = adminModule && adminModule->runExternalValidatedConfigMutation(saveWhat, std::forward<Mutation>(mutation));
     if (!saved) {
         LOG_WARN("Menu selection became invalid before it could be committed");
         if (screen)
@@ -120,8 +119,8 @@ template <typename Mutation> bool persistMenuUIConfigMutation(Mutation &&mutatio
     bool stored = false;
     const auto operation = [&]() {
         mutation();
-        stored = nodeDB && nodeDB->saveProto(uiconfigFileName, meshtastic_DeviceUIConfig_size,
-                                             &meshtastic_DeviceUIConfig_msg, &uiconfig);
+        stored = nodeDB &&
+                 nodeDB->saveProto(uiconfigFileName, meshtastic_DeviceUIConfig_size, &meshtastic_DeviceUIConfig_msg, &uiconfig);
     };
 #if defined(HELTEC_V4_OLED)
     const bool serialized = adminModule ? adminModule->runExternalConfigMutation(operation)
@@ -296,20 +295,12 @@ void menuHandler::OnboardMessage()
     screen->showOverlayBanner(bannerOptions);
 }
 
-// Out-of-box US setup starts on LongTurbo rather than the region table's LongFast. Menu-only: the
-// US entry in `regions[]` keeps LongFast, so no other route onto US changes. Anything that already
-// states a preset - a pinned userpref, or a preset moved off the install default - outranks it.
 meshtastic_Config_LoRaConfig_ModemPreset menuHandler::presetForRegionSelection(const meshtastic_Config_LoRaConfig &lora,
                                                                                meshtastic_Config_LoRaConfig_RegionCode selected)
 {
-#ifdef USERPREFS_LORACONFIG_MODEM_PRESET
-    (void)selected; // the pinned preset wins outright; nothing to decide
-#else
-    if (lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET && selected == meshtastic_Config_LoRaConfig_RegionCode_US &&
-        lora.use_preset && lora.modem_preset == meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST) {
-        return meshtastic_Config_LoRaConfig_ModemPreset_LONG_TURBO;
-    }
-#endif
+    const RegionInfo *newRegion = getRegion(selected);
+    if (lora.use_preset && !newRegion->supportsPreset(lora.modem_preset))
+        return newRegion->getDefaultPreset();
     return lora.modem_preset;
 }
 
@@ -321,8 +312,7 @@ static void applyLoraRegion(meshtastic_Config_LoRaConfig_RegionCode region, bool
         return;
     }
 #endif
-    const int saveWhat =
-        SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS | SEGMENT_NODEDATABASE;
+    const int saveWhat = SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS | SEGMENT_NODEDATABASE;
     persistMenuConfigMutation(saveWhat, [&]() {
         if (revertLicensed) {
             owner.is_licensed = false;
@@ -330,29 +320,17 @@ static void applyLoraRegion(meshtastic_Config_LoRaConfig_RegionCode region, bool
             service->reloadOwner(false, false);
         }
 
-        // Decided first: it keys off the *outgoing* region being UNSET.
         const meshtastic_Config_LoRaConfig_ModemPreset selectionPreset =
             menuHandler::presetForRegionSelection(config.lora, region);
         if (selectionPreset != config.lora.modem_preset) {
-            LOG_INFO("First region is %s, default preset to %s", getRegion(region)->name,
+            LOG_INFO("Preset %s unavailable in %s, use default %s",
+                     DisplayFormatters::getModemPresetDisplayName(config.lora.modem_preset, false, true), getRegion(region)->name,
                      DisplayFormatters::getModemPresetDisplayName(selectionPreset, false, true));
             config.lora.modem_preset = selectionPreset;
         }
 
         config.lora.region = region;
         config.lora.channel_num = 0; // Reset to default channel
-
-    // Reconcile the preset with the explicitly chosen region: a preset locked to another
-    // region would leave config.lora invalid until applyModemConfig() repairs it with
-    // error/critical-error side effects - or, for the swappable EU trio, the clamp would
-    // flip the region right back. The user picked the region, so the preset follows it.
-        const RegionInfo *newRegion = getRegion(region);
-        if (config.lora.use_preset && !newRegion->supportsPreset(config.lora.modem_preset)) {
-            LOG_INFO("Preset %s unavailable in %s, use default %s",
-                     DisplayFormatters::getModemPresetDisplayName(config.lora.modem_preset, false, true), newRegion->name,
-                     DisplayFormatters::getModemPresetDisplayName(newRegion->getDefaultPreset(), false, true));
-            config.lora.modem_preset = newRegion->getDefaultPreset();
-        }
 
         if (isHam && adminModule) {
             meshtastic_HamParameters hamParams = meshtastic_HamParameters_init_zero;
@@ -513,9 +491,7 @@ void menuHandler::licensedToNormalConfirmMenu()
     confirmBanner.message = "Revert licensed\nmode? This will\nre-enable encryption.";
     confirmBanner.optionsArrayPtr = confirmOptions;
     confirmBanner.optionsCount = 2;
-    confirmBanner.bannerCallback = [](int selected) {
-        applyLoraRegion(pendingRegion, false, selected == 1);
-    };
+    confirmBanner.bannerCallback = [](int selected) { applyLoraRegion(pendingRegion, false, selected == 1); };
     screen->showOverlayBanner(confirmBanner);
 }
 
@@ -555,7 +531,7 @@ void menuHandler::deviceRolePicker()
                     config.device.role = selectedRole;
                     nodeDB->installRoleDefaults(selectedRole, previousRole);
                 }
-        });
+            });
         if (saved)
             rebootAtMsec = (millis() + DEFAULT_REBOOT_SECONDS * 1000);
     };
@@ -585,8 +561,8 @@ void menuHandler::FrequencySlotPicker()
     meshtastic_Config_LoRaConfig &loraConfig = config.lora;
     const float bw = loraConfig.use_preset ? modemPresetToBwKHz(loraConfig.modem_preset, myRegion->wideLora)
                                            : bwCodeToKHz(loraConfig.bandwidth);
-    uint32_t numChannels = usableFrequencySlotCount(myRegion->freqStart, myRegion->freqEnd, bw,
-                                                    myRegion->profile->spacing, myRegion->profile->padding);
+    uint32_t numChannels = usableFrequencySlotCount(myRegion->freqStart, myRegion->freqEnd, bw, myRegion->profile->spacing,
+                                                    myRegion->profile->padding);
 
     if (numChannels > (uint32_t)(MAX_CHANNEL_OPTIONS - 2))
         numChannels = (uint32_t)(MAX_CHANNEL_OPTIONS - 2);
@@ -613,8 +589,8 @@ void menuHandler::FrequencySlotPicker()
     const bool displayedUsePreset = config.lora.use_preset;
     const auto displayedPreset = config.lora.modem_preset;
     const uint32_t displayedBandwidth = config.lora.bandwidth;
-    bannerOptions.bannerCallback =
-        [displayedRegion, displayedUsePreset, displayedPreset, displayedBandwidth, numChannels](int selected) -> void {
+    bannerOptions.bannerCallback = [displayedRegion, displayedUsePreset, displayedPreset, displayedBandwidth,
+                                    numChannels](int selected) -> void {
         if (selected == Back) {
             menuHandler::menuQueue = menuHandler::LoraMenu;
             screen->runNow();
@@ -675,7 +651,7 @@ static BannerOverlayOptions buildRegionPresetBanner()
     bannerOptions.message = "Radio Preset";
     bannerOptions.optionsArrayPtr = optionsArray;
     bannerOptions.optionsEnumPtr = optionsEnumArray;
-    bannerOptions.optionsCount = static_cast<uint8_t>(count);
+    bannerOptions.optionsCount = count;
     bannerOptions.InitialSelected = initialSelection;
     const auto displayedRegion = config.lora.region;
     bannerOptions.bannerCallback = [displayedRegion](int selected) -> void {
@@ -694,7 +670,7 @@ static BannerOverlayOptions buildRegionPresetBanner()
             auto candidate = config.lora;
             candidate.use_preset = true;
             candidate.modem_preset = selectedPreset;
-            candidate.channel_num = 0;         // Reset to default channel for the preset
+            candidate.channel_num = 0;        // Reset to default channel for the preset
             candidate.override_frequency = 0; // Clear any custom frequency
             char regionError[160] = {};
             if (!RadioInterface::checkConfigRegion(candidate, regionError, sizeof(regionError))) {
@@ -785,26 +761,25 @@ void menuHandler::clockFacePicker()
     constexpr size_t clockFaceCount = sizeof(clockFaceOptions) / sizeof(clockFaceOptions[0]);
     static std::array<const char *, clockFaceCount> clockFaceLabels{};
 
-    auto bannerOptions = createStaticBannerOptions("Which Face?", clockFaceOptions, clockFaceLabels,
-                                                   [](const ClockFaceOption &option, int) -> void {
-                                                       if (option.action == OptionsAction::Back) {
-                                                           menuHandler::menuQueue = menuHandler::ClockMenu;
-                                                           screen->runNow();
-                                                           return;
-                                                       }
+    auto bannerOptions = createStaticBannerOptions(
+        "Which Face?", clockFaceOptions, clockFaceLabels, [](const ClockFaceOption &option, int) -> void {
+            if (option.action == OptionsAction::Back) {
+                menuHandler::menuQueue = menuHandler::ClockMenu;
+                screen->runNow();
+                return;
+            }
 
-                                                       if (!option.hasValue) {
-                                                           return;
-                                                       }
+            if (!option.hasValue) {
+                return;
+            }
 
-                                                       if (uiconfig.is_clockface_analog == option.value) {
-                                                           return;
-                                                       }
+            if (uiconfig.is_clockface_analog == option.value) {
+                return;
+            }
 
-                                                       if (persistMenuUIConfigMutation(
-                                                               [&option]() { uiconfig.is_clockface_analog = option.value; }))
-                                                           screen->setFrames(Screen::FOCUS_CLOCK);
-                                                   });
+            if (persistMenuUIConfigMutation([&option]() { uiconfig.is_clockface_analog = option.value; }))
+                screen->setFrames(Screen::FOCUS_CLOCK);
+        });
 
     bannerOptions.InitialSelected = uiconfig.is_clockface_analog ? 2 : 1;
     screen->showOverlayBanner(bannerOptions);
@@ -1940,27 +1915,25 @@ void menuHandler::nodeNameLengthMenu()
     constexpr size_t nodeNameCount = sizeof(nodeNameOptions) / sizeof(nodeNameOptions[0]);
     static std::array<const char *, nodeNameCount> nodeNameLabels{};
 
-    auto bannerOptions = createStaticBannerOptions("Node Name Length", nodeNameOptions, nodeNameLabels,
-                                                   [](const NodeNameOption &option, int) -> void {
-                                                       if (option.action == OptionsAction::Back) {
-                                                           menuQueue = NodeBaseMenu;
-                                                           screen->runNow();
-                                                           return;
-                                                       }
+    auto bannerOptions = createStaticBannerOptions(
+        "Node Name Length", nodeNameOptions, nodeNameLabels, [](const NodeNameOption &option, int) -> void {
+            if (option.action == OptionsAction::Back) {
+                menuQueue = NodeBaseMenu;
+                screen->runNow();
+                return;
+            }
 
-                                                       if (!option.hasValue) {
-                                                           return;
-                                                       }
+            if (!option.hasValue) {
+                return;
+            }
 
-                                                       if (config.display.use_long_node_name == option.value) {
-                                                           return;
-                                                       }
+            if (config.display.use_long_node_name == option.value) {
+                return;
+            }
 
-                                                       if (persistMenuConfigMutation(SEGMENT_CONFIG, [&option]() {
-                                                               config.display.use_long_node_name = option.value;
-                                                           }))
-                                                           LOG_INFO("Setting names to %s", option.value ? "long" : "short");
-                                                   });
+            if (persistMenuConfigMutation(SEGMENT_CONFIG, [&option]() { config.display.use_long_node_name = option.value; }))
+                LOG_INFO("Setting names to %s", option.value ? "long" : "short");
+        });
 
     int initialSelection = config.display.use_long_node_name ? 1 : 2;
     bannerOptions.InitialSelected = initialSelection;
@@ -2017,26 +1990,25 @@ void menuHandler::compassNorthMenu()
     constexpr size_t compassCount = sizeof(compassOptions) / sizeof(compassOptions[0]);
     static std::array<const char *, compassCount> compassLabels{};
 
-    auto bannerOptions = createStaticBannerOptions("North Directions?", compassOptions, compassLabels,
-                                                   [](const CompassOption &option, int) -> void {
-                                                       if (option.action == OptionsAction::Back) {
-                                                           menuQueue = PositionBaseMenu;
-                                                           screen->runNow();
-                                                           return;
-                                                       }
+    auto bannerOptions = createStaticBannerOptions(
+        "North Directions?", compassOptions, compassLabels, [](const CompassOption &option, int) -> void {
+            if (option.action == OptionsAction::Back) {
+                menuQueue = PositionBaseMenu;
+                screen->runNow();
+                return;
+            }
 
-                                                       if (!option.hasValue) {
-                                                           return;
-                                                       }
+            if (!option.hasValue) {
+                return;
+            }
 
-                                                       if (uiconfig.compass_mode == option.value) {
-                                                           return;
-                                                       }
+            if (uiconfig.compass_mode == option.value) {
+                return;
+            }
 
-                                                       if (persistMenuUIConfigMutation(
-                                                               [&option]() { uiconfig.compass_mode = option.value; }))
-                                                           screen->setFrames(graphics::Screen::FOCUS_PRESERVE);
-                                                   });
+            if (persistMenuUIConfigMutation([&option]() { uiconfig.compass_mode = option.value; }))
+                screen->setFrames(graphics::Screen::FOCUS_PRESERVE);
+        });
 
     int initialSelection = 0;
     for (size_t i = 0; i < compassCount; ++i) {
@@ -2078,8 +2050,7 @@ void menuHandler::GPSToggleMenu()
                 return;
             }
 
-            if (persistMenuConfigMutation(SEGMENT_CONFIG,
-                                          [&option]() { config.position.gps_mode = option.value; })) {
+            if (persistMenuConfigMutation(SEGMENT_CONFIG, [&option]() { config.position.gps_mode = option.value; })) {
                 if (option.value == meshtastic_Config_PositionConfig_GpsMode_ENABLED) {
                     playGPSEnableBeep();
                     if (!gps->isEnabled())
@@ -2191,9 +2162,8 @@ void menuHandler::GPSSmartPositionMenu()
             return;
         } else if (selected == 1 || selected == 2) {
             const bool enabled = selected == 1;
-            if (persistMenuConfigMutation(SEGMENT_CONFIG, [enabled]() {
-                    config.position.position_broadcast_smart_enabled = enabled;
-                }))
+            if (persistMenuConfigMutation(SEGMENT_CONFIG,
+                                          [enabled]() { config.position.position_broadcast_smart_enabled = enabled; }))
                 rebootAtMsec = (millis() + DEFAULT_REBOOT_SECONDS * 1000);
         }
     };
@@ -2219,8 +2189,8 @@ void menuHandler::GPSUpdateIntervalMenu()
             return;
         }
         const bool saved = persistMenuConfigMutation(SEGMENT_CONFIG, [selected]() {
-            static const uint32_t intervals[] = {0,     8,     20,    40,    60,    80,      120,       300,
-                                                 600,   900,   1800,  3600,  21600, 43200,   86400,     2147483647};
+            static const uint32_t intervals[] = {0,   8,   20,   40,   60,    80,    120,   300,
+                                                 600, 900, 1800, 3600, 21600, 43200, 86400, 2147483647};
             config.position.gps_update_interval = intervals[selected];
         });
         if (saved)
@@ -2281,7 +2251,7 @@ void menuHandler::GPSPositionBroadcastMenu()
             return;
         }
         const bool saved = persistMenuConfigMutation(SEGMENT_CONFIG, [selected]() {
-            static const uint32_t intervals[] = {0,     60,    90,    300,   900,   3600,  7200,   10800, 14400,
+            static const uint32_t intervals[] = {0,     60,    90,    300,   900,   3600,   7200,   10800, 14400,
                                                  18000, 21600, 43200, 64800, 86400, 129600, 172800, 259200};
             config.position.position_broadcast_secs = intervals[selected];
         });
@@ -2392,7 +2362,7 @@ void menuHandler::BrightnessPickerMenu()
             const uint8_t brightness = selected == 1 ? 64 : (selected == 2 ? 128 : 255);
             if (!persistMenuUIConfigMutation([brightness]() { uiconfig.screen_brightness = brightness; }))
                 return;
-                             // Apply brightness immediately
+                // Apply brightness immediately
 #if defined(HELTEC_MESH_NODE_T114) || defined(HELTEC_VISION_MASTER_T190)
             // For HELTEC devices, use analogWrite to control backlight
             analogWrite(VTFT_LEDA, uiconfig.screen_brightness);
@@ -2439,11 +2409,8 @@ void menuHandler::rebootMenu()
     bannerOptions.optionsCount = 2;
     bannerOptions.bannerCallback = [](int selected) -> void {
         if (selected == 1) {
-            InputEvent event = {.source = "Menu",
-                                .inputEvent = INPUT_BROKER_NONE,
-                                .kbchar = INPUT_BROKER_MSG_REBOOT,
-                                .touchX = 0,
-                                .touchY = 0};
+            InputEvent event = {
+                .source = "Menu", .inputEvent = INPUT_BROKER_NONE, .kbchar = INPUT_BROKER_MSG_REBOOT, .touchX = 0, .touchY = 0};
             inputBroker->injectInputEvent(&event);
         } else {
             menuQueue = PowerMenu;
@@ -2577,8 +2544,7 @@ void menuHandler::geofenceOptionsMenu()
     labels[0] = "Back";
     labels[1] = std::string("Enter Alerts: ") + (entry.notificationEnabled(WAYPOINT_NOTIFY_ENTER) ? "On" : "Off");
     labels[2] = std::string("Exit Alerts: ") + (entry.notificationEnabled(WAYPOINT_NOTIFY_EXIT) ? "On" : "Off");
-    labels[3] =
-        std::string("Favorites Only: ") + (entry.notificationEnabled(WAYPOINT_NOTIFY_FAVORITES_ONLY) ? "On" : "Off");
+    labels[3] = std::string("Favorites Only: ") + (entry.notificationEnabled(WAYPOINT_NOTIFY_FAVORITES_ONLY) ? "On" : "Off");
     for (size_t i = 0; i < 4; ++i)
         optionsArray[i] = labels[i].c_str();
 
@@ -3066,8 +3032,9 @@ void menuHandler::frameTogglesMenu()
             menuHandler::menuQueue = menuHandler::FrameToggles;
             screen->runNow();
         } else if (selected == show_power) {
-            persistMenuConfigMutation(SEGMENT_MODULECONFIG,
-                                      []() { moduleConfig.telemetry.power_screen_enabled = !moduleConfig.telemetry.power_screen_enabled; });
+            persistMenuConfigMutation(SEGMENT_MODULECONFIG, []() {
+                moduleConfig.telemetry.power_screen_enabled = !moduleConfig.telemetry.power_screen_enabled;
+            });
             menuHandler::menuQueue = menuHandler::FrameToggles;
             screen->runNow();
         }
@@ -3090,13 +3057,11 @@ void menuHandler::displayUnitsMenu()
         bannerOptions.InitialSelected = 1;
     bannerOptions.bannerCallback = [](int selected) -> void {
         if (selected == MetricUnits) {
-            persistMenuConfigMutation(SEGMENT_CONFIG, []() {
-                config.display.units = meshtastic_Config_DisplayConfig_DisplayUnits_METRIC;
-            });
+            persistMenuConfigMutation(SEGMENT_CONFIG,
+                                      []() { config.display.units = meshtastic_Config_DisplayConfig_DisplayUnits_METRIC; });
         } else if (selected == ImperialUnits) {
-            persistMenuConfigMutation(SEGMENT_CONFIG, []() {
-                config.display.units = meshtastic_Config_DisplayConfig_DisplayUnits_IMPERIAL;
-            });
+            persistMenuConfigMutation(SEGMENT_CONFIG,
+                                      []() { config.display.units = meshtastic_Config_DisplayConfig_DisplayUnits_IMPERIAL; });
         } else {
             menuHandler::menuQueue = menuHandler::ScreenOptionsMenu;
             screen->runNow();
@@ -3160,8 +3125,7 @@ void menuHandler::LoRaFEMLNAToggleMenu()
             }
 #endif
             const bool enabled = option.value != meshtastic_Config_LoRaConfig_FEM_LNA_Mode_DISABLED;
-            if (persistMenuConfigMutation(SEGMENT_CONFIG,
-                                          [&option]() { config.lora.fem_lna_mode = option.value; })) {
+            if (persistMenuConfigMutation(SEGMENT_CONFIG, [&option]() { config.lora.fem_lna_mode = option.value; })) {
                 loraFEMInterface.setLNAEnable(enabled);
                 LOG_INFO("FEM LNA %s", enabled ? "enabled" : "disabled");
             }
@@ -3217,8 +3181,7 @@ void menuHandler::themeMenu()
             if (visibleIdx < getVisibleThemeCount()) {
                 // Persist the theme's uniqueIdentifier so boot-time
                 // resolveThemeIndex() can restore this theme on next startup.
-                const uint16_t themeColor =
-                    COLOR565(255, 255, (getVisibleThemeByIndex(visibleIdx).uniqueIdentifier & 0x1F) << 3);
+                const uint16_t themeColor = COLOR565(255, 255, (getVisibleThemeByIndex(visibleIdx).uniqueIdentifier & 0x1F) << 3);
                 if (persistMenuUIConfigMutation([themeColor]() {
                         uiconfig.screen_rgb_color = themeColor;
                         loadThemeDefaults();
@@ -3430,14 +3393,15 @@ void menuHandler::toggleNodeMuted(uint32_t nodeNum)
 {
     bool found = false;
     bool wasMuted = false;
-    if (persistMenuConfigMutation(SEGMENT_NODEDATABASE, [&]() {
-            meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(nodeNum);
-            if (!n)
-                return;
-            found = true;
-            wasMuted = nodeInfoLiteIsMuted(n);
-            nodeInfoLiteSetBit(n, NODEINFO_BITFIELD_IS_MUTED_MASK, !wasMuted);
-        }) &&
+    if (persistMenuConfigMutation(SEGMENT_NODEDATABASE,
+                                  [&]() {
+                                      meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(nodeNum);
+                                      if (!n)
+                                          return;
+                                      found = true;
+                                      wasMuted = nodeInfoLiteIsMuted(n);
+                                      nodeInfoLiteSetBit(n, NODEINFO_BITFIELD_IS_MUTED_MASK, !wasMuted);
+                                  }) &&
         found) {
         LOG_INFO(wasMuted ? "Unmuted node 0x%08x" : "Muted node 0x%08x", nodeNum);
         nodeDB->notifyObservers(true);

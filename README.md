@@ -13,10 +13,10 @@ The common goal is lower avoidable power consumption, protection against deep-di
 
 ## Choose the correct profile
 
-| Profile | PlatformIO environment | Intended use | Critical-battery behavior |
-| --- | --- | --- | --- |
-| **Standard** | `heltec-v4-standard` | `CLIENT`, `CLIENT_MUTE`, `CLIENT_BASE`, tracker, handheld, mobile, and other regular nodes | Meshtastic's normal 3.10 V threshold, 10 confirming readings, and role-default wake behavior |
-| **Solar Router** | `heltec-v4-solar-router` | Fixed, elevated, unattended solar infrastructure using `ROUTER` or `ROUTER_LATE` | 3.50 V threshold, 3 confirming readings, timer-only sleep, peripheral isolation, and a 3.65 V recovery latch with an active USB data-host bypass |
+| Profile          | PlatformIO environment   | Intended use                                                                               | Critical-battery behavior                                                                                                                        |
+| ---------------- | ------------------------ | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Standard**     | `heltec-v4-standard`     | `CLIENT`, `CLIENT_MUTE`, `CLIENT_BASE`, tracker, handheld, mobile, and other regular nodes | Meshtastic's normal 3.10 V threshold, 10 confirming readings, and role-default wake behavior                                                     |
+| **Solar Router** | `heltec-v4-solar-router` | Fixed, elevated, unattended solar infrastructure using `ROUTER` or `ROUTER_LATE`           | 3.50 V threshold, 3 confirming readings, timer-only sleep, peripheral isolation, and a 3.65 V recovery latch with an active USB data-host bypass |
 
 The firmware profile does **not** change the node role automatically. Select the intended role separately in the Meshtastic app or CLI.
 
@@ -80,6 +80,7 @@ This is different from **Sleep Screen**, which is temporary and may wake on norm
 
 ### Battery reporting and critical-write protection
 
+- Early boot and normal telemetry use the same calibrated 15-sample ADC reader and persisted `adc_multiplier_override`. Changing the multiplier discards readings and filters from the previous scale; invalid calibration values and failed samples cannot authorize battery-powered storage writes.
 - Uses profile-aligned voltage curves with the same calibrated Heltec V4 upper range.
 - The Standard curve continues through the normal discharge tail toward 3.10 V instead of displaying 0% prematurely at 3.50 V.
 - The Solar Router curve deliberately reaches 0% at its protective 3.50 V cutoff.
@@ -145,8 +146,6 @@ The fork preserves successful MQTT implicit acknowledgement state without cancel
 
 Normal LoRa acknowledgements and routing behavior remain intact.
 
-An incoming-message banner no longer replaces a text-message frame that is already being read; the message is still stored and marked unread.
-
 ### Radio recovery and unchanged operating limits
 
 If the SX1262 loses its runtime state after a transient reset or brownout, the firmware reinitializes it in place and periodically rearms receive mode. A failed channel-activity scan is recovered and retried once, then fails closed by deferring transmission. During Solar Router critical sleep, a radio that cannot confirm sleep is held in reset. Recovery always recalculates chip power from the configured request, so repeated recovery cannot compound the GC1109/KCT8103L FEM conversion.
@@ -193,7 +192,7 @@ Profile isolation is additionally checked by host policy tests and by compiling 
 
 Open the repository's [Releases](https://github.com/Amoulier/meshtastic-heltec-v4-firmware/releases) page and select the latest stable profile release.
 
-The distribution revision is `v2.8.0.8` (full tag: `heltec-v4-profiles-v2.8.0.8`). Its manifests, firmware filenames, and Meshtastic client **About** view identify the exact compiled image as `2.8.0.<7-character commit SHA>`; the compact OLED footer displays `2.8.0`. These are expected representations of the same release, not evidence that the wrong image was installed.
+The distribution revision is `v2.8.0.9` (full tag: `heltec-v4-profiles-v2.8.0.9`). Its manifests, firmware filenames, ESP application descriptor, and Meshtastic client **About** view identify the compiled image as `2.8.0-h9g<8-character fingerprint>`. Local builds with modified sources use `h9d` instead of `h9g`; the compact OLED footer displays `2.8.0-h9`. The manifest records the full source and build-identity SHA256, source commit, and each image's SHA256. Rebuild after committing source changes; renaming a previous image does not change its embedded identity.
 
 ### Standard node
 
@@ -211,7 +210,7 @@ Use files beginning with:
 firmware-heltec-v4-solar-router-
 ```
 
-### OTA update — recommended
+### OTA update - recommended
 
 Use the normal `.bin` image that does not contain `.factory` in its filename. An OTA or normal firmware update preserves the node configuration, every valid keypair, Bluetooth bonds, and persistent display setting. The visible Node ID exceptions described above still apply to a legacy mismatched identity, a clean keyless node, or a rejected low-entropy key.
 
@@ -259,7 +258,7 @@ release(heltec-v4):
 
 Each release provides one profile-specific normal `.bin` for OTA updates plus one complete clean-install ZIP for each profile.
 
-The build uses the official Meshtastic ESP32-S3 container by immutable image digest, SHA-pinned GitHub Actions, a SHA-256-pinned unified OTA loader, three host policy configurations, source-invariant linters, and exact manifest/file verification before publication.
+The build uses the official Meshtastic ESP32-S3 container by immutable image digest, SHA-pinned GitHub Actions, and a SHA-256-pinned unified OTA loader. Publication requires both profile builds, native integration tests, host regressions for calibration and power policies, source-invariant linters, and exact manifest/file verification.
 
 ## Upstream synchronization
 

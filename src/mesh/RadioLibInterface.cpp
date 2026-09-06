@@ -6,8 +6,8 @@
 #include "SPILock.h"
 #include "Throttle.h"
 #include "UptimeClock.h"
-#include "configuration.h"
 #include "concurrency/LockGuard.h"
+#include "configuration.h"
 #include "error.h"
 #include "main.h"
 #include "mesh-pb-constants.h"
@@ -120,7 +120,8 @@ bool RadioLibInterface::canSendImmediately()
         return true;
 }
 
-bool RadioLibInterface::receiveDetected(uint16_t irq, unsigned long syncWordHeaderValidFlag, unsigned long preambleDetectedFlag)
+bool RadioLibInterface::receiveDetected(uint16_t irq, unsigned long syncWordHeaderValidFlag, unsigned long preambleDetectedFlag,
+                                        bool resetOnExpiry)
 {
     bool detected = (irq & (syncWordHeaderValidFlag | preambleDetectedFlag));
     // Handle false detections
@@ -130,14 +131,16 @@ bool RadioLibInterface::receiveDetected(uint16_t irq, unsigned long syncWordHead
         } else if (!Throttle::isWithinTimespanMs(activeReceiveStart, 2 * preambleTimeMsec)) {
             if (!(irq & syncWordHeaderValidFlag)) {
                 // The HEADER_VALID flag should be set by now if it was really a packet, so ignore PREAMBLE_DETECTED flag
-                activeReceiveStart = 0;
+                if (resetOnExpiry)
+                    activeReceiveStart = 0;
                 LOG_TRACE("Ignore false preamble detection");
                 return false;
             } else {
                 uint32_t maxPacketTimeMsec = getPacketTime(meshtastic_Constants_DATA_PAYLOAD_LEN + sizeof(PacketHeader));
                 if (!Throttle::isWithinTimespanMs(activeReceiveStart, maxPacketTimeMsec)) {
                     // We should have gotten an RX_DONE IRQ by now if it was really a packet, so ignore HEADER_VALID flag
-                    activeReceiveStart = 0;
+                    if (resetOnExpiry)
+                        activeReceiveStart = 0;
                     LOG_TRACE("Ignore false header detection");
                     return false;
                 }
@@ -159,9 +162,8 @@ ErrorCode RadioLibInterface::send(meshtastic_MeshPacket *p)
         ~SendAdmissionGuard() { depth.fetch_sub(1, std::memory_order_release); }
     } sendAdmissionGuard{sendAdmissionDepth};
 
-    const bool preferenceFenceBlocks =
-        nodeDB && nodeDB->isPreferenceEditTransactionActive() &&
-        (!nodeDB->isPreferenceEditQuiescing() || !nodeDB->hasCurrentExternalStateAccess());
+    const bool preferenceFenceBlocks = nodeDB && nodeDB->isPreferenceEditTransactionActive() &&
+                                       (!nodeDB->isPreferenceEditQuiescing() || !nodeDB->hasCurrentExternalStateAccess());
     if (nodeDB && (preferenceFenceBlocks || nodeDB->isDestructiveStorageMutationActive())) {
         LOG_WARN("send - storage transaction has parked LoRa");
         packetPool.release(p);
@@ -257,10 +259,21 @@ bool RadioLibInterface::canSleep(bool deepSleep)
     const bool txDeferred = hasConfigDeferredPacket();
     bool res = txQueue.empty() && !txDeferred && !(deepSleep && isSending()) && !rxInFlight;
     if (!res) { // only print debug messages if we are vetoing sleep
-        LOG_DEBUG("Radio wait to sleep, txEmpty=%d, txDeferred=%d, txInFlight=%d, rxInFlight=%d", txQueue.empty(),
-                  txDeferred, isSending(), rxInFlight);
+        LOG_DEBUG("Radio wait to sleep, txEmpty=%d, txDeferred=%d, txInFlight=%d, rxInFlight=%d", txQueue.empty(), txDeferred,
+                  isSending(), rxInFlight);
     }
     return res;
+}
+
+bool RadioLibInterface::isActivelyReceivingForConfig(uint32_t &expiredIrqFlags)
+{
+    expiredIrqFlags = 0;
+    return isActivelyReceiving();
+}
+
+bool RadioLibInterface::isIRQPendingForConfig(uint32_t)
+{
+    return isIRQPending();
 }
 
 bool RadioLibInterface::canParkForConfig()
@@ -269,14 +282,13 @@ bool RadioLibInterface::canParkForConfig()
     if (sendAdmissionDepth.load(std::memory_order_acquire) != 0)
         return false;
 #endif
-    if (radioNotificationDepth.load(std::memory_order_acquire) != 0 || isSending() || isIRQPending())
+    if (radioNotificationDepth.load(std::memory_order_acquire) != 0 || isSending())
         return false;
-    const bool rxInFlight = isReceiving && isActivelyReceiving();
-    // isActivelyReceiving() performs a chip read and can overlap the radio
-    // worker becoming runnable. Re-read both software owners afterwards so a
-    // dequeue/terminal IRQ that crossed the first observation cannot be
-    // mistaken for an idle radio.
-    return !rxInFlight && radioNotificationDepth.load(std::memory_order_acquire) == 0 && !isSending() && !isIRQPending()
+    uint32_t expiredIrqFlags = 0;
+    const bool rxInFlight = isReceiving && isActivelyReceivingForConfig(expiredIrqFlags);
+    // Recheck software owners and IRQs after the chip read; only that snapshot's expired detections may be ignored.
+    return !rxInFlight && !isIRQPendingForConfig(expiredIrqFlags) &&
+           radioNotificationDepth.load(std::memory_order_acquire) == 0 && !isSending()
 #if defined(HELTEC_V4_OLED)
            && sendAdmissionDepth.load(std::memory_order_acquire) == 0
 #endif
@@ -597,8 +609,7 @@ void RadioLibInterface::onNotify(uint32_t notification)
     }
 #if defined(HELTEC_V4_OLED)
     if (configResumeRequested.exchange(false, std::memory_order_acq_rel)) {
-        if (nodeDB &&
-            (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive())) {
+        if (nodeDB && (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive())) {
             // A new fence won the race with this old wake. Preserve the request;
             // its eventual NONE transition will notify us again.
             configResumeRequested.store(true, std::memory_order_release);
@@ -777,9 +788,8 @@ void RadioLibInterface::abortSending()
 void RadioLibInterface::handleReceiveInterrupt()
 {
 #if defined(HELTEC_V4_OLED)
-    if (nodeDB &&
-        ((nodeDB->isPreferenceEditTransactionActive() && !nodeDB->isPreferenceEditQuiescing()) ||
-         nodeDB->isDestructiveStorageMutationActive())) {
+    if (nodeDB && ((nodeDB->isPreferenceEditTransactionActive() && !nodeDB->isPreferenceEditQuiescing()) ||
+                   nodeDB->isDestructiveStorageMutationActive())) {
         isReceiving = false;
         LOG_DEBUG("Ignore RX interrupt while storage transaction has parked LoRa");
         return;
@@ -920,8 +930,7 @@ void RadioLibInterface::resetAGC()
 void RadioLibInterface::periodicRadioMaintenance()
 {
 #if defined(HELTEC_V4_OLED)
-    if (nodeDB &&
-        (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive())) {
+    if (nodeDB && (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive())) {
         // OPEN/COMMITTING owns the radio generation. A recovery or AGC reset
         // here could power/rearm the chip with provisional settings behind the
         // transaction owner's back.

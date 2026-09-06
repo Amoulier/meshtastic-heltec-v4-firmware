@@ -27,10 +27,7 @@ template <class T> class SX126xInterface : public RadioLibInterface
     /// Prepare hardware for sleep.  Call this _only_ for deep sleep, not needed for light sleep.
     virtual bool sleep() override;
 
-    bool isIRQPending() override
-    {
-        return !radioHardwareParked.load(std::memory_order_acquire) && lora.getIrqFlags() != 0;
-    }
+    bool isIRQPending() override { return !radioHardwareParked.load(std::memory_order_acquire) && lora.getIrqFlags() != 0; }
 
     void resetAGC() override;
 
@@ -67,6 +64,9 @@ template <class T> class SX126xInterface : public RadioLibInterface
     /** are we actively receiving a packet (only called during receiving state) */
     virtual bool isActivelyReceiving() override;
 
+    bool isActivelyReceivingForConfig(uint32_t &expiredIrqFlags) override;
+    bool isIRQPendingForConfig(uint32_t expiredIrqFlags) override;
+
     /**
      * Start waiting to receive a message
      */
@@ -87,6 +87,7 @@ template <class T> class SX126xInterface : public RadioLibInterface
     uint32_t getPacketTime(uint32_t pl, bool received) override { return computePacketTime(lora, pl, received); }
 
   private:
+    std::atomic<uint32_t> configHeaderDetectedAt{0};
     std::atomic<bool> radioHardwareParked{false};
     // A parked FEM is not evidence that the transceiver accepted sleep().
     std::atomic<bool> radioSleepConfirmed{false};

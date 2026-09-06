@@ -1081,9 +1081,8 @@ bool RadioInterface::checkHardwareFrequencyRange(const meshtastic_Config_LoRaCon
         return false;
     }
     if (loraConfig.override_frequency != 0) {
-        const float occupiedBandwidthKHz =
-            loraConfig.use_preset ? modemPresetToBwKHz(loraConfig.modem_preset, region->wideLora)
-                                  : bwCodeToKHz(loraConfig.bandwidth);
+        const float occupiedBandwidthKHz = loraConfig.use_preset ? modemPresetToBwKHz(loraConfig.modem_preset, region->wideLora)
+                                                                 : bwCodeToKHz(loraConfig.bandwidth);
         if (region->code == meshtastic_Config_LoRaConfig_RegionCode_UNSET ||
             !frequencyOccupancyFitsBounds(loraConfig.override_frequency, loraConfig.frequency_offset, occupiedBandwidthKHz,
                                           heltecV4MinMHz, heltecV4MaxMHz) ||
@@ -1172,7 +1171,7 @@ bool RadioInterface::validateConfigRegion(const meshtastic_Config_LoRaConfig &lo
  * When clamp==false, returns false on first error (pure validation).
  * When clamp==true, fixes invalid settings in-place and returns true.
  */
-bool RadioInterface::checkOrClampConfigLora(meshtastic_Config_LoRaConfig &loraConfig, bool clamp)
+bool RadioInterface::checkOrClampConfigLora(meshtastic_Config_LoRaConfig &loraConfig, bool clamp, const char *primaryChannelName)
 {
     char err_string[160];
     float check_bw;
@@ -1295,7 +1294,7 @@ bool RadioInterface::checkOrClampConfigLora(meshtastic_Config_LoRaConfig &loraCo
             // Recompute slot width and number of slots based on the new bandwidth
             freqSlotWidth = newRegion->profile->spacing + (newRegion->profile->padding * 2) + (check_bw / 1000); // in MHz
             numFreqSlots = usableFrequencySlotCount(newRegion->freqStart, newRegion->freqEnd, check_bw,
-                                                     newRegion->profile->spacing, newRegion->profile->padding);
+                                                    newRegion->profile->spacing, newRegion->profile->padding);
             if (numFreqSlots == 0)
                 return false;
         } else {
@@ -1303,7 +1302,7 @@ bool RadioInterface::checkOrClampConfigLora(meshtastic_Config_LoRaConfig &loraCo
         }
     }
 
-    const char *channelName = channels.getName(channels.getPrimaryIndex());
+    const char *channelName = primaryChannelName ? primaryChannelName : channels.getName(channels.getPrimaryIndex());
     const char *presetNameDisplay =
         DisplayFormatters::getModemPresetDisplayName(loraConfig.modem_preset, false, loraConfig.use_preset);
     // numFreqSlots can still be 0 for an UNSET/degenerate region, and % 0 is a SIGFPE
@@ -1402,10 +1401,10 @@ bool RadioInterface::checkOrClampConfigLora(meshtastic_Config_LoRaConfig &loraCo
     return true;
 }
 
-bool RadioInterface::validateConfigLora(const meshtastic_Config_LoRaConfig &loraConfig)
+bool RadioInterface::validateConfigLora(const meshtastic_Config_LoRaConfig &loraConfig, const char *primaryChannelName)
 {
     auto copy = loraConfig;
-    return checkOrClampConfigLora(copy, false);
+    return checkOrClampConfigLora(copy, false, primaryChannelName);
 }
 
 bool RadioInterface::clampConfigLora(meshtastic_Config_LoRaConfig &loraConfig)

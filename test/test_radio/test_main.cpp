@@ -1,3 +1,4 @@
+#include "Channels.h"
 #include "LR20x0Band.h"
 #include "MeshRadio.h"
 #include "MeshService.h"
@@ -161,6 +162,32 @@ static void test_validateConfigLora_noopWhenUsePresetFalse()
     TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_FAST, cfg.modem_preset);
 }
 
+static void test_validateConfigLora_candidateNameMustNotComeFromLiveChannels()
+{
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_TURBO;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    config.lora.channel_num = 0;
+    config.lora.override_frequency = 0;
+    config.lora.frequency_offset = 0;
+    auto candidate = config.lora;
+    candidate.frequency_offset = -7.0f;
+    auto &primary = channels.getByIndex(channels.getPrimaryIndex());
+    primary.settings.name[0] = '\0';
+    channels.onConfigChanged(false);
+
+    TEST_ASSERT_FALSE(RadioInterface::validateConfigLora(candidate));
+    TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(candidate, "X38"));
+    TEST_ASSERT_EQUAL_STRING("LongTurbo", channels.getName(channels.getPrimaryIndex()));
+    strcpy(primary.settings.name, "X38");
+    channels.onConfigChanged(false);
+    TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(candidate));
+    TEST_ASSERT_FALSE(RadioInterface::validateConfigLora(candidate, "LongTurbo"));
+    TEST_ASSERT_EQUAL_STRING("X38", channels.getName(channels.getPrimaryIndex()));
+    TEST_ASSERT_EQUAL_FLOAT(-7.0f, candidate.frequency_offset);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, config.lora.frequency_offset);
+}
+
 static void test_customTupleRejectsAndClampsUnsafeSfCr()
 {
     meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
@@ -289,13 +316,13 @@ static void test_everyStockRegionPresetDefaultSlotOccupancyIsValid()
             const auto preset = region->getAvailablePresets()[presetIndex];
             const float bw = modemPresetToBwKHz(preset, region->wideLora);
             const float slotWidth = region->profile->spacing + 2.0f * region->profile->padding + bw / 1000.0f;
-            const uint32_t slots = usableFrequencySlotCount(region->freqStart, region->freqEnd, bw,
-                                                            region->profile->spacing, region->profile->padding);
+            const uint32_t slots = usableFrequencySlotCount(region->freqStart, region->freqEnd, bw, region->profile->spacing,
+                                                            region->profile->padding);
             TEST_ASSERT_GREATER_THAN_UINT32_MESSAGE(0, slots, region->name);
             for (uint32_t slot = 0; slot < slots; slot++) {
                 const float center = region->freqStart + bw / 2000.0f + region->profile->padding + slot * slotWidth;
-                TEST_ASSERT_TRUE_MESSAGE(
-                    frequencyOccupancyFitsBounds(center, 0.0f, bw, region->freqStart, region->freqEnd), region->name);
+                TEST_ASSERT_TRUE_MESSAGE(frequencyOccupancyFitsBounds(center, 0.0f, bw, region->freqStart, region->freqEnd),
+                                         region->name);
                 TEST_ASSERT_TRUE_MESSAGE(center - bw / 2000.0f >= region->freqStart + region->profile->padding - 0.0001f,
                                          region->name);
                 TEST_ASSERT_TRUE_MESSAGE(center + bw / 2000.0f <= region->freqEnd - region->profile->padding + 0.0001f,
@@ -737,6 +764,10 @@ void setUp(void)
     mockMeshService = new MockMeshService();
     service = mockMeshService;
 
+    channelFile = meshtastic_ChannelFile_init_zero;
+    channels.initDefaults();
+    channels.onConfigChanged();
+
     // RadioInterface computes slotTimeMsec during construction and expects myRegion to be valid.
     config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
     initRegion();
@@ -780,6 +811,7 @@ void setup()
     RUN_TEST(test_frequencyOccupancyChecksEdgesAndOffset);
     RUN_TEST(test_usableFrequencySlotCountNeverRoundsOutsideBand);
     RUN_TEST(test_validateConfigLora_noopWhenUsePresetFalse);
+    RUN_TEST(test_validateConfigLora_candidateNameMustNotComeFromLiveChannels);
     RUN_TEST(test_customTupleRejectsAndClampsUnsafeSfCr);
 #if defined(HELTEC_V4_OLED)
     RUN_TEST(test_heltecCustomTupleRejectsAndClampsUnsupportedBandwidth);

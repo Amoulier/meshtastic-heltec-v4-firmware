@@ -15,6 +15,7 @@
  */
 #include "Power.h"
 #include "BluetoothCommon.h"
+#include "FilesystemMountPolicy.h"
 #include "MessageStore.h"
 #include "NodeDB.h"
 #include "PowerFSM.h"
@@ -23,10 +24,12 @@
 #include "buzz/buzz.h"
 #include "concurrency/LockGuard.h"
 #include "configuration.h"
-#include "FilesystemMountPolicy.h"
 #include "main.h"
 #include "meshUtils.h"
 #include "power/BatteryCriticalPolicy.h"
+#if defined(HELTEC_V4_OLED)
+#include "power/HeltecV4BatteryAdc.h"
+#endif
 #include "power/PowerHAL.h"
 #include "power/SGM41562.h"
 #include "sleep.h"
@@ -102,7 +105,7 @@
 #define HEAP_LOG_INTERVAL_MS (5 * 60 * 1000)
 #endif
 
-#if defined(BATTERY_PIN) && defined(ARCH_ESP32)
+#if defined(BATTERY_PIN) && defined(ARCH_ESP32) && !defined(HELTEC_V4_OLED)
 
 #ifndef BAT_MEASURE_ADC_UNIT // ADC1 is default
 static const adc_channel_t adc_channel = ADC_CHANNEL;
@@ -327,9 +330,9 @@ using namespace meshtastic;
  */
 static HasBatteryLevel *batteryLevel; // Default to NULL for no battery level sensor
 
-#ifdef BATTERY_PIN
+#if defined(BATTERY_PIN) && !defined(HELTEC_V4_OLED)
 
-void battery_adcEnable()
+static void battery_adcEnable()
 {
 #ifdef ADC_CTRL // enable adc voltage divider when we need to read
 #ifdef ADC_USE_PULLUP
@@ -438,6 +441,9 @@ class AnalogBatteryLevel : public HasBatteryLevel
 #if HAS_TELEMETRY && !defined(HAS_PMU) && !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR
         if (hasINA()) {
             latest_raw_read_value = getINAVoltage();
+#if defined(HELTEC_V4_OLED)
+            latest_read_valid = latest_raw_read_value > 0;
+#endif
             return latest_raw_read_value;
         }
 #endif
@@ -453,6 +459,9 @@ class AnalogBatteryLevel : public HasBatteryLevel
 #endif
 
 #ifdef BATTERY_PIN
+#if defined(HELTEC_V4_OLED)
+        return getHeltecBattVoltage();
+#else
         // Override variant or default ADC_MULTIPLIER if we have the override pref
         float operativeAdcMultiplier =
             config.power.adc_multiplier_override > 0 ? config.power.adc_multiplier_override : ADC_MULTIPLIER;
@@ -510,8 +519,7 @@ class AnalogBatteryLevel : public HasBatteryLevel
 #else
                 constexpr bool trustFirstSampleBelowFloor = false;
 #endif
-                last_read_value =
-                    initialAnalogBatteryFilteredVoltage(last_read_value, scaled, trustFirstSampleBelowFloor);
+                last_read_value = initialAnalogBatteryFilteredVoltage(last_read_value, scaled, trustFirstSampleBelowFloor);
                 initial_read_done = true;
             } else {
                 // Already initialized - filter this reading
@@ -522,6 +530,7 @@ class AnalogBatteryLevel : public HasBatteryLevel
             // BATTERY_PIN, raw, (uint32_t)(scaled), (uint32_t) (last_read_value));
         }
         return last_read_value;
+#endif // HELTEC_V4_OLED
 #endif // BATTERY_PIN
         return 0;
     }
@@ -540,7 +549,39 @@ class AnalogBatteryLevel : public HasBatteryLevel
         return latest_raw_read_value;
     }
 
-#if defined(ARCH_ESP32) && !defined(HAS_PMU) && defined(BATTERY_PIN)
+#if defined(HELTEC_V4_OLED)
+    bool hasValidBatteryReading() const { return latest_read_valid; }
+    float getBatteryReadingMultiplier() const { return last_adc_multiplier; }
+
+    uint16_t getHeltecBattVoltage()
+    {
+        const float multiplier = getActiveHeltecV4AdcMultiplier();
+        if (multiplier != last_adc_multiplier) {
+            last_adc_multiplier = multiplier;
+            initial_read_done = false;
+            read_attempted = false;
+            last_read_value = 0;
+        }
+        if (forceFreshRawRead || !read_attempted || Throttle::hasElapsed(last_read_time_ms, 5000)) {
+            read_attempted = true;
+            last_read_time_ms = millis();
+            latest_read_valid = readHeltecV4BatteryMillivolts(multiplier, latest_raw_read_value);
+            if (latest_read_valid) {
+                if (!initial_read_done) {
+                    last_read_value = latest_raw_read_value;
+                    initial_read_done = true;
+                } else {
+                    last_read_value += (latest_raw_read_value - last_read_value) * 0.5f;
+                }
+            } else {
+                latest_raw_read_value = 0;
+            }
+        }
+        return initial_read_done ? static_cast<uint16_t>(last_read_value) : 0;
+    }
+#endif
+
+#if defined(ARCH_ESP32) && !defined(HAS_PMU) && defined(BATTERY_PIN) && !defined(HELTEC_V4_OLED)
     /**
      * ESP32 specific function for getting calibrated ADC reads
      */
@@ -630,7 +671,12 @@ class AnalogBatteryLevel : public HasBatteryLevel
 #elif defined(MUZI_BASE) || defined(PROMICRO_DIY_TCXO) || defined(ELECROW_ThinkNode_M8)
         return powerHAL_isVBUSConnected();
 #endif
+#if defined(HELTEC_V4_OLED)
+        const uint16_t voltage = getBattVoltage();
+        return latest_read_valid && voltage > chargingVolt;
+#else
         return getBattVoltage() > chargingVolt;
+#endif
     }
 
     /// Assume charging if we have a battery and external power is connected.
@@ -696,6 +742,11 @@ class AnalogBatteryLevel : public HasBatteryLevel
     // reasonable.
     bool initial_read_done = false;
     bool forceFreshRawRead = false;
+#if defined(HELTEC_V4_OLED)
+    bool read_attempted = false;
+    bool latest_read_valid = false;
+    float last_adc_multiplier = 0;
+#endif
     float last_read_value = (OCV[NUM_OCV_POINTS - 1] * NUM_CELLS);
     uint16_t latest_raw_read_value = 0;
     uint32_t last_read_time_ms = 0;
@@ -931,9 +982,14 @@ bool Power::analogInit()
 
 #ifdef BATTERY_PIN
     LOG_DEBUG("Use analog input %d for battery level", BATTERY_PIN);
+#if defined(HELTEC_V4_OLED)
+    LOG_INFO("Battery ADC startup multiplier: %.6f", getActiveHeltecV4AdcMultiplier());
+#endif
 
     // disable any internal pullups
+#if !defined(HELTEC_V4_OLED)
     pinMode(BATTERY_PIN, INPUT);
+#endif
 
 #ifndef BATTERY_SENSE_RESOLUTION_BITS
 #define BATTERY_SENSE_RESOLUTION_BITS 10
@@ -941,7 +997,7 @@ bool Power::analogInit()
 
 #ifdef ARCH_STM32
     analogReadResolution(BATTERY_SENSE_RESOLUTION_BITS);
-#elif defined(ARCH_ESP32) // ESP32 needs special analog stuff
+#elif defined(ARCH_ESP32) && !defined(HELTEC_V4_OLED) // Heltec shares its calibrated early-boot reader.
     adc_oneshot_unit_init_cfg_t init_config = {
         .unit_id = unit,
     };
@@ -966,7 +1022,7 @@ bool Power::analogInit()
     }
 
     adc_calibrated = initAdcCalibration();
-#endif                    // ARCH_ESP32
+#endif                                                // ARCH_ESP32
 
     // NRF52 ADC init moved to powerHAL_init in nrf52 platform
 
@@ -1153,6 +1209,10 @@ void Power::readPowerStatus()
                                           // code doesn't run every time
     OptionalBool isChargingNow = OptUnknown;
     bool hasBatteryLevel = false;
+#if defined(HELTEC_V4_OLED)
+    bool batterySampleValid = true;
+    float batteryReadingMultiplier = 0;
+#endif
 
     {
 #if defined(HELTEC_V4_OLED)
@@ -1182,6 +1242,9 @@ void Power::readPowerStatus()
             }
 #if defined(HELTEC_V4_OLED) && !defined(HAS_PMU)
             batteryVoltageRawMv = batteryLevel->getBattVoltageRaw();
+            batterySampleValid = batteryLevel != &analogLevel || analogLevel.hasValidBatteryReading();
+            if (batteryLevel == &analogLevel)
+                batteryReadingMultiplier = analogLevel.getBatteryReadingMultiplier();
 #else
             // Other battery interfaces do not all expose an unfiltered sample. Preserve
             // their existing behavior and API surface; only Heltec V4
@@ -1191,6 +1254,15 @@ void Power::readPowerStatus()
         }
     }
 
+#if defined(HELTEC_V4_OLED)
+    if (batteryReadingMultiplier != reportedAdcMultiplier) {
+        reportedAdcMultiplier = batteryReadingMultiplier;
+#ifdef BATTERY_PERCENT_SLEW_INTERVAL_MSEC
+        reportedBatteryPercent = -1;
+#endif
+        low_voltage_counter = 0;
+    }
+#endif
 #ifdef BATTERY_PERCENT_SLEW_INTERVAL_MSEC
     // Keep raw voltage available to the low-battery protection below, but prevent
     // brief load-induced voltage sag from making the reported percentage jump.
@@ -1311,15 +1383,20 @@ void Power::readPowerStatus()
             solarBatteryPresenceConfirmed = true;
         }
         shouldEvaluateCriticalBattery = shouldEvaluateCriticalBatteryReading(
-            solarBatteryPresenceConfirmed, powerStatus2.getHasUSB(), criticalBatteryVoltageMv,
-            BATTERY_BOOT_GUARD_MIN_MILLIVOLTS,
+            solarBatteryPresenceConfirmed, powerStatus2.getHasUSB(), criticalBatteryVoltageMv, BATTERY_BOOT_GUARD_MIN_MILLIVOLTS,
             shouldUseRawBatteryVoltageForCriticalCutoff());
     }
 #endif
 
+#if defined(HELTEC_V4_OLED)
+    if (!batterySampleValid) {
+        criticalBatteryVoltageMv = 0;
+        shouldEvaluateCriticalBattery = !powerStatus2.getHasUSB();
+    }
+#endif
     if (hasBatteryLevel && shouldEvaluateCriticalBattery) {
-        low_voltage_counter = nextCriticalBatteryReadingCount(
-            low_voltage_counter, criticalBatteryVoltageMv, BATTERY_CRITICAL_MILLIVOLTS, BATTERY_CRITICAL_READINGS);
+        low_voltage_counter = nextCriticalBatteryReadingCount(low_voltage_counter, criticalBatteryVoltageMv,
+                                                              BATTERY_CRITICAL_MILLIVOLTS, BATTERY_CRITICAL_READINGS);
         if (low_voltage_counter > 0) {
             LOG_DEBUG("Low voltage counter: %d/%d", low_voltage_counter, BATTERY_CRITICAL_READINGS);
             if (low_voltage_counter >= BATTERY_CRITICAL_READINGS) {
@@ -1337,8 +1414,7 @@ void Power::readPowerStatus()
 }
 
 #if defined(HELTEC_V4_OLED)
-bool Power::readDestructiveStoragePowerSnapshot(bool &batteryPresent, bool &externalPowerPresent,
-                                                int32_t &batteryVoltageRawMv)
+bool Power::readDestructiveStoragePowerSnapshot(bool &batteryPresent, bool &externalPowerPresent, int32_t &batteryVoltageRawMv)
 {
     concurrency::LockGuard batteryGuard(&batteryLevelLock);
     batteryPresent = false;
@@ -1349,6 +1425,12 @@ bool Power::readDestructiveStoragePowerSnapshot(bool &batteryPresent, bool &exte
 
     batteryPresent = batteryLevel->isBatteryConnect();
     externalPowerPresent = batteryLevel->isVbusIn();
+#if !defined(HAS_PMU)
+    if (batteryLevel == &analogLevel) {
+        batteryVoltageRawMv = analogLevel.getBattVoltageRawFresh();
+        return analogLevel.hasValidBatteryReading();
+    }
+#endif
     if (batteryPresent) {
 #if defined(HELTEC_V4_OLED) && !defined(HAS_PMU)
         batteryVoltageRawMv = batteryLevel->getBattVoltageRawFresh();
@@ -1380,18 +1462,23 @@ bool heltecStoragePowerIsSafe(bool destructive)
     (void)externalPowerPresent;
     const bool sourceIsSafe =
         destructive
-            ? shouldAllowHeltecDestructiveStorageMutation(powerSnapshotAvailable, powerSnapshotAvailable,
-                                                          usbDataHostConnected, batteryPresent, freshBatteryVoltageRawMv)
-            : shouldAllowHeltecPreferenceStorageMutation(powerSnapshotAvailable, powerSnapshotAvailable,
-                                                         usbDataHostConnected, batteryPresent, freshBatteryVoltageRawMv,
-                                                         heltecPreferenceStorageMinimumMillivolts(
-                                                             BATTERY_CRITICAL_MILLIVOLTS));
+            ? shouldAllowHeltecDestructiveStorageMutation(powerSnapshotAvailable, powerSnapshotAvailable, usbDataHostConnected,
+                                                          batteryPresent, freshBatteryVoltageRawMv)
+            : shouldAllowHeltecPreferenceStorageMutation(powerSnapshotAvailable, powerSnapshotAvailable, usbDataHostConnected,
+                                                         batteryPresent, freshBatteryVoltageRawMv,
+                                                         heltecPreferenceStorageMinimumMillivolts(BATTERY_CRITICAL_MILLIVOLTS));
     return powerHAL_isPowerLevelSafe() && sourceIsSafe;
 }
 } // namespace
 
-bool heltecDestructiveStoragePowerIsSafe() { return heltecStoragePowerIsSafe(true); }
-bool heltecPreferenceStoragePowerIsSafe() { return heltecStoragePowerIsSafe(false); }
+bool heltecDestructiveStoragePowerIsSafe()
+{
+    return heltecStoragePowerIsSafe(true);
+}
+bool heltecPreferenceStoragePowerIsSafe()
+{
+    return heltecStoragePowerIsSafe(false);
+}
 #endif
 
 /**
@@ -1432,8 +1519,7 @@ int32_t Power::runOnce()
 #if defined(HELTEC_V4_OLED)
     // A refused low-voltage core save stays dirty in NodeDB. Retry only after a
     // later fresh sample (or USB data host) makes ordinary persistence safe.
-    if (nodeDB && shouldAttemptHeltecDeferredPreferenceRetry(true, isLowBattery(), rebootAtMsec != 0,
-                                                            shutdownAtMsec != 0))
+    if (nodeDB && shouldAttemptHeltecDeferredPreferenceRetry(true, isLowBattery(), rebootAtMsec != 0, shutdownAtMsec != 0))
         nodeDB->retryPowerDeferredPreferenceWrites();
 #endif
     logHeapUsage();

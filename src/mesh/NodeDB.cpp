@@ -6,6 +6,7 @@
 #include "Channels.h"
 #include "CryptoEngine.h"
 #include "Default.h"
+#include "DisplayFormatters.h"
 #include "FSCommon.h"
 #include "MeshRadio.h"
 #include "MeshService.h"
@@ -15,8 +16,8 @@
 #include "Power.h"
 #include "PowerFSM.h"
 #include "PowerStatus.h"
-#include "RadioInterface.h"
 #include "PreferenceRecoveryPolicy.h"
+#include "RadioInterface.h"
 #include "Router.h"
 #include "SPILock.h"
 #include "SafeFile.h"
@@ -52,6 +53,12 @@
 #include <pb_encode.h>
 #include <power/PowerHAL.h>
 #include <vector>
+#if defined(HELTEC_V4_OLED) || defined(HELTEC_V4_NATIVE_STORAGE_AUDIT)
+#include "power/HeltecV4BatteryAdc.h"
+#endif
+#if defined(HELTEC_V4_OLED)
+#include "power/HeltecV4BatteryCalibration.h"
+#endif
 
 void disableBluetooth();
 
@@ -139,6 +146,36 @@ meshtastic_LocalConfig config;
 meshtastic_DeviceUIConfig uiconfig{.screen_brightness = 153, .screen_timeout = 30};
 meshtastic_LocalModuleConfig moduleConfig;
 meshtastic_ChannelFile channelFile;
+
+#if defined(HELTEC_V4_OLED)
+namespace
+{
+std::atomic<bool> heltecBatteryCalibrationSyncPending{false};
+
+bool syncHeltecBatteryCalibration(bool requireDestructivePower, bool nvsLockHeld = false)
+{
+    // Callers own the loaded generation or its transaction/storage-writer fence.
+    float multiplier;
+    if (!resolveHeltecV4AdcMultiplier(config.power.adc_multiplier_override, multiplier))
+        return false;
+    const auto sync = [&]() {
+        if (!writeHeltecV4BatteryCalibration(multiplier, requireDestructivePower ? heltecDestructiveStoragePowerIsSafe
+                                                                                 : heltecPreferenceStoragePowerIsSafe)) {
+            heltecBatteryCalibrationSyncPending.store(true, std::memory_order_release);
+            LOG_WARN("Battery calibration cache could not be verified; keeping the active calibration");
+            return false;
+        }
+        setActiveHeltecV4AdcMultiplier(multiplier);
+        heltecBatteryCalibrationSyncPending.store(false, std::memory_order_release);
+        return true;
+    };
+    if (nvsLockHeld)
+        return sync();
+    concurrency::LockGuard nvsGuard(&heltecV4NvsMutationLock);
+    return sync();
+}
+} // namespace
+#endif
 
 static void forceHeltecLocalRecoveryConfiguration()
 {
@@ -890,6 +927,15 @@ NodeDB::NodeDB()
         forceHeltecLocalRecoveryConfiguration();
         LOG_ERROR("Legacy preference migration did not commit - local recovery only");
     }
+    if (finalSaveSucceeded && !requiresConfigRecovery()) {
+#if USERPREFS_EVENT_MODE
+        if (!eventProfileStorageUnavailable)
+#endif
+#ifdef MESHTASTIC_ENCRYPTED_STORAGE
+            if (!(EncryptedStorage::isLockdownActive() && !EncryptedStorage::isUnlocked()))
+#endif
+                syncHeltecBatteryCalibration(false);
+    }
 #endif
 #ifdef FSCom
     if (legacyMigrationWasPending && legacyXModemExclusive)
@@ -996,6 +1042,10 @@ void NodeDB::resetRadioConfig(bool is_fresh_install, bool activateRuntime)
             channels.ensureLicensedOperation();
     }
 
+    // Frequency validation needs the loaded primary channel; rebuild hashes after any preset repair.
+    channels.onConfigChanged(false);
+    if (config.has_lora && config.lora.use_preset)
+        RadioInterface::clampConfigLora(config.lora);
     channels.onConfigChanged(activateRuntime);
 
     // Update the global myRegion
@@ -1026,21 +1076,8 @@ bool parkHeltecRadioForStorageMutation()
     if (!radio)
         return true;
 
-    constexpr uint32_t radioQuiesceWaitMs = 5000;
-    const auto waitForIdle = [&]() {
-        const uint32_t started = millis();
-        while (!radio->canParkForConfig()) {
-            if (!Throttle::isWithinTimespanMs(started, radioQuiesceWaitMs))
-                return false;
-            delay(1);
-        }
-        return true;
-    };
-
-    // A destructive operation may discard queued work at reboot, but it must
-    // never truncate an on-air TX and report that packet as successful. Let
-    // the admitted hardware operation finish before cutting the rail.
-    return waitForIdle() && radio->sleep() && waitForIdle();
+    // The caller may share the radio's cooperative worker: let pending work run before a later retry.
+    return radio->canParkForConfig() && radio->sleep() && radio->canParkForConfig();
 }
 
 class HeltecXModemStorageGuard
@@ -2030,6 +2067,10 @@ bool NodeDB::factoryReset(bool eraseBleBonds)
     }
     if (eraseBleBonds && !clearHeltecNvsRebuildPendingFile()) {
         LOG_ERROR("Factory reset completed but secondary pending marker could not be cleared");
+        return abortHeltecReset();
+    }
+    if (!syncHeltecBatteryCalibration(true, true)) {
+        LOG_ERROR("Factory reset could not commit its battery calibration");
         return abortHeltecReset();
     }
     if (!clearHeltecResetPendingMarker(resetKind, true)) {
@@ -4415,6 +4456,14 @@ void NodeDB::loadFromDisk()
     const bool invalidLoadedRegionPolicy = state == LoadFileResult::LOAD_SUCCESS && config.has_lora &&
                                            config.lora.region != meshtastic_Config_LoRaConfig_RegionCode_UA_868 &&
                                            !RadioInterface::checkConfigRegion(config.lora);
+#if defined(HELTEC_V4_OLED) || defined(HELTEC_V4_NATIVE_STORAGE_AUDIT)
+    float loadedAdcMultiplier;
+    const bool invalidLoadedAdcCalibration =
+        state == LoadFileResult::LOAD_SUCCESS && config.has_power &&
+        !resolveHeltecV4AdcMultiplier(config.power.adc_multiplier_override, loadedAdcMultiplier);
+#else
+    constexpr bool invalidLoadedAdcCalibration = false;
+#endif
 #if HAS_STRICT_PREFERENCE_RECOVERY
     const bool configVersionTooNew = state == LoadFileResult::LOAD_SUCCESS && config.version > DEVICESTATE_CUR_VER;
 #else
@@ -4422,7 +4471,7 @@ void NodeDB::loadFromDisk()
 #endif
     if (state == LoadFileResult::DECODE_FAILED || state == LoadFileResult::OTHER_FAILURE || invalidPrivateKeyLength ||
         missingPrivateKeyForKnownIdentity || loadedPublicKeyMismatch || missingConfigForKnownIdentity ||
-        invalidLoadedRegionPolicy || configVersionTooNew) {
+        invalidLoadedRegionPolicy || invalidLoadedAdcCalibration || configVersionTooNew) {
         // Config file present but unreadable this boot (corruption / torn write
         // / transient open, allocation, or decrypt fail). loadProto() already
         // zeroed `config`, so the keypair is gone from RAM; minting a new one
@@ -4442,6 +4491,11 @@ void NodeDB::loadFromDisk()
         // No config generation exists to protect (first boot), or this platform
         // has no filesystem.
         installDefaultConfig();
+#if HAS_STRICT_PREFERENCE_RECOVERY
+        // Defaults precede the constructor's CRC baseline, so explicitly queue
+        // the complete first-boot generation even while identity is keyless.
+        saveToDisk(SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS);
+#endif
     } else if (config.version < DEVICESTATE_MIN_VER) {
         LOG_WARN("config %d is old, discard", config.version);
         installDefaultConfig(true, false);
@@ -4449,8 +4503,7 @@ void NodeDB::loadFromDisk()
         LOG_INFO("Loaded saved config v%d", config.version);
     }
 #if HAS_STRICT_PREFERENCE_RECOVERY && defined(FSCom)
-    if (nodeDatabaseMissingFromPersistedGeneration &&
-        persistedIdentityNeedsNodeDatabase) {
+    if (nodeDatabaseMissingFromPersistedGeneration && persistedIdentityNeedsNodeDatabase) {
         unreadablePreferenceSegments |= SEGMENT_NODEDATABASE;
         configDecodeFailed = true;
         LOG_ERROR("Partial preference generation: identity exists but node "
@@ -4459,12 +4512,6 @@ void NodeDB::loadFromDisk()
     }
 #endif
     configLoadComplete = true;
-
-    // Coerce LoRa config fields derived from presets while bootstrapping.
-    // Some clients/UI components display bandwidth/spread_factor directly from config even in preset mode.
-    if (config.has_lora && config.lora.use_preset) {
-        RadioInterface::clampConfigLora(config.lora);
-    }
 
 #if defined(USERPREFS_LORA_TX_DISABLED) && USERPREFS_LORA_TX_DISABLED
     config.lora.tx_enabled = false;
@@ -4990,6 +5037,16 @@ bool NodeDB::reloadFromDisk()
     }
     if (nodeDatabaseMigrationPending)
         migrationSavePending = false;
+
+#if defined(HELTEC_V4_OLED)
+#if USERPREFS_EVENT_MODE
+    if (eventProfileStorageUnavailable)
+        return false;
+#endif
+    if (!syncHeltecBatteryCalibration(false)) {
+        LOG_WARN("NodeDB: battery calibration synchronization deferred after storage reload");
+    }
+#endif
 
     // Rebuild channel hashes and the region pointer before pushing the real
     // persisted generation to hardware. The locked placeholder deliberately
@@ -5563,7 +5620,24 @@ bool NodeDB::saveToDisk(int saveWhat)
         return true;
     }
 #endif
+#if defined(HELTEC_V4_OLED) || defined(HELTEC_V4_NATIVE_STORAGE_AUDIT)
+    float candidateAdcMultiplier;
+    if ((saveWhat & SEGMENT_CONFIG) &&
+        !resolveHeltecV4AdcMultiplier(config.power.adc_multiplier_override, candidateAdcMultiplier)) {
+        LOG_ERROR("NodeDB: reject invalid battery calibration before preference writes");
+        return false;
+    }
+#endif
 #if defined(HELTEC_V4_OLED)
+    // A locked/event placeholder is not a durable configuration to mirror into early-boot NVS.
+#ifdef MESHTASTIC_ENCRYPTED_STORAGE
+    if (EncryptedStorage::isLockdownActive() && !EncryptedStorage::isUnlocked())
+        return false;
+#endif
+#if USERPREFS_EVENT_MODE
+    if ((saveWhat & SEGMENT_CONFIG) && eventProfileStorageUnavailable)
+        return false;
+#endif
     PreferenceStorageWriteGuard storageWrite(*this);
     if (!storageWrite) {
         LOG_WARN("NodeDB: reject save during destructive storage mutation");
@@ -5658,6 +5732,8 @@ bool NodeDB::saveToDisk(int saveWhat)
 #if defined(HELTEC_V4_OLED)
     if (success)
         powerDeferredPreferenceSegments.fetch_and(~saveWhat, std::memory_order_acq_rel);
+    if (success && (saveWhat & SEGMENT_CONFIG) && !preferenceEditActive && !destructiveMutationActiveNow)
+        syncHeltecBatteryCalibration(false);
 #endif
 
     return success;
@@ -5666,15 +5742,36 @@ bool NodeDB::saveToDisk(int saveWhat)
 #if defined(HELTEC_V4_OLED)
 void NodeDB::retryPowerDeferredPreferenceWrites()
 {
+#if defined(FSCom)
+    concurrency::LockGuard transactionGuard(&heltecPreferencesTransactionLock);
+#endif
     const int saveWhat = powerDeferredPreferenceSegments.load(std::memory_order_acquire);
-    if (saveWhat == 0 || bootInitializationInProgress || requiresConfigRecovery() || rebootAtMsec != 0 || shutdownAtMsec != 0 ||
-        isPreferenceEditTransactionActive() || destructiveStorageMutationActive.load(std::memory_order_acquire))
+    if ((saveWhat == 0 && !heltecBatteryCalibrationSyncPending.load(std::memory_order_acquire)) || bootInitializationInProgress ||
+        requiresConfigRecovery() || rebootAtMsec != 0 || shutdownAtMsec != 0 || isPreferenceEditTransactionActive() ||
+        destructiveStorageMutationActive.load(std::memory_order_acquire))
         return;
+#if USERPREFS_EVENT_MODE
+    if (eventProfileStorageUnavailable)
+        return;
+#endif
+#ifdef MESHTASTIC_ENCRYPTED_STORAGE
+    if (EncryptedStorage::isLockdownActive() && !EncryptedStorage::isUnlocked())
+        return;
+#endif
     if (!heltecPreferenceStoragePowerIsSafe())
         return;
 
-    LOG_INFO("NodeDB: retrying low-voltage deferred preference segments 0x%x", saveWhat);
-    (void)saveToDisk(saveWhat);
+    if (saveWhat != 0) {
+        LOG_INFO("NodeDB: retrying low-voltage deferred preference segments 0x%x", saveWhat);
+        if (!saveToDisk(saveWhat))
+            return;
+        if (saveWhat & SEGMENT_CONFIG)
+            return;
+    }
+    // A queued CONFIG still belongs to RAM; only mirror a durable generation.
+    if (!(powerDeferredPreferenceSegments.load(std::memory_order_acquire) & SEGMENT_CONFIG) &&
+        heltecBatteryCalibrationSyncPending.load(std::memory_order_acquire))
+        syncHeltecBatteryCalibration(false);
 }
 #endif
 
@@ -5730,9 +5827,7 @@ bool NodeDB::beginPreferenceEdit(bool requireDestructivePower)
             router->setReceivedMessage();
     };
     const auto cancelBegin = [&]() {
-        // Once radioParked is latched, QUIESCING may already have suppressed
-        // the post-RX rearm even if sleep itself was never needed. Reapply the
-        // unchanged durable generation before releasing either queue.
+        // Only a sleep attempt needs reconfiguration; an earlier refusal must not interrupt newly admitted RX/TX.
         if (preferenceEditRadioParked.load(std::memory_order_acquire)) {
             preferenceEditState.store(PreferenceEditState::ACTIVATING, std::memory_order_release);
         }
@@ -5750,33 +5845,15 @@ bool NodeDB::beginPreferenceEdit(bool requireDestructivePower)
         return false;
     };
 
-    // QUIESCING blocks new mesh egress and new Router decoding, but permits a
-    // TX/RX admitted under the committed generation to finish. Never call
-    // sleep() while a TX is active: forced standby is not a successful TX and
-    // must not be reported as one. A bounded refusal leaves the active radio
-    // operation untouched and lets the client retry BEGIN.
-    const auto waitForRadioQuiesce = [&]() {
-        if (!radio)
+    // Waiting here can block the same cooperative worker that must finish RX/TX. Release the fence for a later retry.
+    const auto radioIsQuiescent = [&]() {
+        if (!radio || radio->canParkForConfig())
             return true;
-        constexpr uint32_t radioQuiesceWaitMs = 5000;
-        const uint32_t started = millis();
-        while (!radio->canParkForConfig()) {
-            if (!Throttle::isWithinTimespanMs(started, radioQuiesceWaitMs)) {
-                LOG_WARN("Settings edit refused: LoRa did not quiesce in time");
-                return false;
-            }
-            delay(1);
-        }
-        return true;
+        LOG_INFO("Settings edit deferred: LoRa is busy; retry after pending work completes");
+        return false;
     };
-    if (!waitForRadioQuiesce())
+    if (!radioIsQuiescent())
         return cancelBegin();
-    if (radio) {
-        // Once the first stable handoff is observed, a just-completed RX/TX
-        // may already have suppressed its normal rearm. Every later exit must
-        // therefore reapply the unchanged committed generation.
-        preferenceEditRadioParked.store(true, std::memory_order_release);
-    }
 
     // Drain operations admitted just before the CAS while they can still nest
     // old-generation scopes and enqueue their resulting ACK/relay packet. The
@@ -5793,7 +5870,7 @@ bool NodeDB::beginPreferenceEdit(bool requireDestructivePower)
 
     // A finishing admitted reader may have been the last producer of radio
     // work. Revalidate hardware idleness after the reader fence drains.
-    if (!waitForRadioQuiesce())
+    if (!radioIsQuiescent())
         return cancelBegin();
 
     if (radio) {
@@ -5808,15 +5885,13 @@ bool NodeDB::beginPreferenceEdit(bool requireDestructivePower)
     }
 
     if (radio) {
+        preferenceEditRadioParked.store(true, std::memory_order_release);
         if (!radio->sleep()) {
             LOG_ERROR("Settings edit could not park LoRa safely");
             return cancelBegin();
         }
-        // A terminal ISR worker can become runnable immediately after the
-        // pre-sleep snapshot. Driver SPI operations are serialized and
-        // QUIESCING forbids rearm; wait until that worker has fully handed off
-        // its packet before inspecting queues or permitting RAM mutation.
-        if (!waitForRadioQuiesce()) {
+        // Keep the generation unchanged if a terminal handoff raced the sleep boundary.
+        if (!radioIsQuiescent()) {
             LOG_ERROR("Settings edit could not verify the parked LoRa handoff");
             return cancelBegin();
         }
@@ -6216,9 +6291,11 @@ bool NodeDB::commitPreferenceEdit(int saveWhat, bool commitOpenEdit)
     preferenceEditOwnerTask.store(reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle()), std::memory_order_release);
     preferenceEditState.store(PreferenceEditState::COMMITTING, std::memory_order_release);
     const bool saved = saveToDisk(saveWhat);
+    const bool calibrationSaved =
+        saved && (!(saveWhat & SEGMENT_CONFIG) || syncHeltecBatteryCalibration(editRequiresDestructivePower));
     const bool powerStillSafe = commitPowerIsSafe();
-    const bool markerCleared =
-        saved && powerStillSafe && clearHeltecResetPendingMarker(HeltecResetPendingKind::EDIT, editRequiresDestructivePower);
+    const bool markerCleared = calibrationSaved && powerStillSafe &&
+                               clearHeltecResetPendingMarker(HeltecResetPendingKind::EDIT, editRequiresDestructivePower);
     if (markerCleared) {
         // Keep mesh traffic fenced until MeshService has applied the committed
         // channel/radio generation to hardware. The owner task alone may rearm
@@ -7773,11 +7850,34 @@ bool NodeDB::restorePreferences(meshtastic_AdminMessage_BackupLocation location,
         }
 
         meshtastic_LocalConfig candidateConfig = (restoreWhat & SEGMENT_CONFIG) ? backup.config : config;
+#if defined(HELTEC_V4_OLED) || defined(HELTEC_V4_NATIVE_STORAGE_AUDIT)
+        float candidateAdcMultiplier;
+        if (!resolveHeltecV4AdcMultiplier(candidateConfig.power.adc_multiplier_override, candidateAdcMultiplier)) {
+            LOG_ERROR("Restore contains invalid battery calibration");
+            return false;
+        }
+#endif
         meshtastic_User candidateOwner = (restoreWhat & SEGMENT_DEVICESTATE) ? backup.owner : owner;
-        if (restoreWhat & SEGMENT_CONFIG) {
+        if (restoreWhat & (SEGMENT_CONFIG | SEGMENT_CHANNELS)) {
+            const meshtastic_ChannelFile &candidateChannels = (restoreWhat & SEGMENT_CHANNELS) ? backup.channels : channelFile;
+            if (!isCompleteChannelFile(candidateChannels)) {
+                LOG_ERROR("Restore prefs rejected: effective channel profile is incomplete");
+                return false;
+            }
+            const char *candidateChannelName = nullptr;
+            for (const auto &channel : candidateChannels.channels) {
+                if (channel.role == meshtastic_Channel_Role_PRIMARY)
+                    candidateChannelName = channel.settings.name;
+            }
             if (!candidateConfig.has_lora) {
                 LOG_ERROR("Restore prefs rejected: backup config has no LoRa section");
                 return false;
+            }
+            if (!*candidateChannelName || strcmp(candidateChannelName, "Default") == 0) {
+                candidateChannelName =
+                    candidateConfig.lora.use_preset
+                        ? DisplayFormatters::getModemPresetDisplayName(candidateConfig.lora.modem_preset, false, true)
+                        : "Custom";
             }
             if (candidateConfig.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UA_868) {
                 LOG_INFO("Restore prefs: migrate obsolete UA_868 region to EU_868");
@@ -7804,7 +7904,7 @@ bool NodeDB::restorePreferences(meshtastic_AdminMessage_BackupLocation location,
             char regionError[160] = {};
             if (!RadioInterface::checkConfigRegion(candidateConfig.lora, regionError, sizeof(regionError),
                                                    candidateOwner.is_licensed) ||
-                !RadioInterface::validateConfigLora(candidateConfig.lora)) {
+                !RadioInterface::validateConfigLora(candidateConfig.lora, candidateChannelName)) {
                 LOG_ERROR("Restore prefs rejected: LoRa settings are not usable on this hardware (%s)", regionError);
                 return false;
             }
@@ -8041,6 +8141,10 @@ bool NodeDB::restorePreferences(meshtastic_AdminMessage_BackupLocation location,
 #if defined(HELTEC_V4_OLED)
         if (!heltecDestructiveStoragePowerIsSafe()) {
             LOG_ERROR("Restore prefs stopped: power changed before final marker commit");
+            return abortRestore();
+        }
+        if (!syncHeltecBatteryCalibration(true)) {
+            LOG_ERROR("Restore prefs could not commit its battery calibration");
             return abortRestore();
         }
         if (!clearHeltecResetPendingMarker(HeltecResetPendingKind::RESTORE, true)) {

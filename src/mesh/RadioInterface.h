@@ -267,7 +267,8 @@ class RadioInterface
     // Whether we have a custom channel name
     static bool uses_custom_channel_name;
 
-    static bool checkOrClampConfigLora(meshtastic_Config_LoRaConfig &loraConfig, bool clamp);
+    static bool checkOrClampConfigLora(meshtastic_Config_LoRaConfig &loraConfig, bool clamp,
+                                       const char *primaryChannelName = nullptr);
 
     // Validate frequency values against board-specific radio limits without
     // touching hardware. This is safe during early boot and backup restore.
@@ -285,7 +286,7 @@ class RadioInterface
     static bool validateConfigRegion(const meshtastic_Config_LoRaConfig &loraConfig);
 
     // Check if a candidate radio configuration is valid.
-    static bool validateConfigLora(const meshtastic_Config_LoRaConfig &loraConfig);
+    static bool validateConfigLora(const meshtastic_Config_LoRaConfig &loraConfig, const char *primaryChannelName = nullptr);
 
     // Make a candidate radio configuration valid when a safe repair exists.
     // Returns false when hardware/regulatory constraints make automatic repair unsafe.

@@ -6,7 +6,6 @@ on:
       - "main"
       - "feature/**"
       - "fix/**"
-      - "audit/heltec-v4-v2.8.0.8"
 
 permissions: read-all
 
@@ -21,14 +20,14 @@ jobs:
   build-standard:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: ${{ github.ref_name == 'main' && 'heltec-v4-standard-v2.8.0.8' || format('heltec-v4-standard-test-{0}', github.sha) }}
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-standard-v2.8.0.9' || format('heltec-v4-standard-test-{0}', github.sha) }}
       platform: esp32s3
       pio_env: heltec-v4-standard
 
   build-solar-router:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: ${{ github.ref_name == 'main' && 'heltec-v4-solar-router-v2.8.0.8' || format('heltec-v4-solar-router-test-{0}', github.sha) }}
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-solar-router-v2.8.0.9' || format('heltec-v4-solar-router-test-{0}', github.sha) }}
       platform: esp32s3
       pio_env: heltec-v4-solar-router
 
@@ -43,10 +42,28 @@ jobs:
       - build-standard
       - build-solar-router
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Resolve exact source version
+        id: source-version
+        run: |
+          set -euo pipefail
+          version_json=$(python3 bin/buildinfo.py json)
+          jq -e --arg commit "$GITHUB_SHA" '.source.commit == $commit and .source.dirty == false' <<<"$version_json" >/dev/null
+          firmware_version=$(jq -er .long <<<"$version_json")
+          source_sha256=$(jq -er .source.sha256 <<<"$version_json")
+          identity_sha256=$(jq -er .identity_sha256 <<<"$version_json")
+          echo "firmware_version=$firmware_version" >> "$GITHUB_OUTPUT"
+          echo "source_sha256=$source_sha256" >> "$GITHUB_OUTPUT"
+          echo "identity_sha256=$identity_sha256" >> "$GITHUB_OUTPUT"
+
       - name: Verify release provenance
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: heltec-v4-profiles-v2.8.0.8
+          RELEASE_TAG: heltec-v4-profiles-v2.8.0.9
         run: |
           set -euo pipefail
 
@@ -113,20 +130,24 @@ jobs:
       - name: Download Standard firmware
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: firmware-esp32s3-heltec-v4-standard-heltec-v4-standard-v2.8.0.8
+          name: firmware-esp32s3-heltec-v4-standard-heltec-v4-standard-v2.8.0.9
           path: release-assets/standard
 
       - name: Download Solar Router firmware
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: firmware-esp32s3-heltec-v4-solar-router-heltec-v4-solar-router-v2.8.0.8
+          name: firmware-esp32s3-heltec-v4-solar-router-heltec-v4-solar-router-v2.8.0.9
           path: release-assets/solar-router
 
       - name: Verify and package profile assets
+        env:
+          FIRMWARE_VERSION: ${{ steps.source-version.outputs.firmware_version }}
+          SOURCE_SHA256: ${{ steps.source-version.outputs.source_sha256 }}
+          IDENTITY_SHA256: ${{ steps.source-version.outputs.identity_sha256 }}
         run: |
           set -euo pipefail
 
-          firmware_version="2.8.0.${GITHUB_SHA::7}"
+          firmware_version="$FIRMWARE_VERSION"
 
           validate_profile() {
             local directory="$1"
@@ -165,11 +186,15 @@ jobs:
 
             test -s "$manifest"
             jq -e --arg target "$target" --arg version "$firmware_version" \
+              --arg commit "$GITHUB_SHA" --arg source_sha256 "$SOURCE_SHA256" --arg identity_sha256 "$IDENTITY_SHA256" \
               --arg normal_bin "$normal_bin" --arg elf "$elf" --arg factory_bin "$factory_bin" \
               --arg littlefs_bin "$littlefs_bin" --arg ota_bin "$ota_bin" \
               '.platformioTarget == $target and .version == $version and .mcu == "esp32s3" and
                .repo == "Amoulier/meshtastic-heltec-v4-firmware" and .hwModelSlug == "HELTEC_V4" and
                .partitionScheme == "16MB" and
+               .upstream_version == "2.8.0" and .fork_revision == 9 and
+               .source.commit == $commit and .source.dirty == false and
+               .source.sha256 == $source_sha256 and .identity_sha256 == $identity_sha256 and
                (.part | type == "array" and length == 6) and
                ([.part[].name] | unique | length == 6) and
                ([.part[].offset] | unique | length == 6) and
@@ -191,6 +216,7 @@ jobs:
                (all(.files[];
                  (.name | type == "string") and
                  (.md5 | type == "string" and test("^[0-9a-f]{32}$")) and
+                 (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
                  (.bytes | type == "number" and . > 0 and floor == .) and
                  (if .name == $normal_bin then .part_name == "app0" and .bytes <= 6553600
                   elif .name == $factory_bin then (has("part_name") | not) and .bytes <= 6619136
@@ -200,10 +226,10 @@ jobs:
                   else false
                   end)))' "$manifest" >/dev/null
 
-            jq -er '.files[] | [.name, .md5, (.bytes | tostring)] | @tsv' "$manifest" > "$manifest_rows"
+            jq -er '.files[] | [.name, .md5, .sha256, (.bytes | tostring)] | @tsv' "$manifest" > "$manifest_rows"
             test "$(wc -l < "$manifest_rows")" -eq 5
 
-            while IFS=$'\t' read -r name expected_md5 expected_bytes; do
+            while IFS=$'\t' read -r name expected_md5 expected_sha256 expected_bytes; do
               case "$name" in
                 "firmware-${target}-${firmware_version}.bin" | \
                 "firmware-${target}-${firmware_version}.elf" | \
@@ -217,6 +243,7 @@ jobs:
 
               test -s "$directory/$name"
               test "$(md5sum "$directory/$name" | awk '{print $1}')" = "$expected_md5"
+              test "$(sha256sum "$directory/$name" | awk '{print $1}')" = "$expected_sha256"
               test "$(stat -c%s "$directory/$name")" = "$expected_bytes"
             done < "$manifest_rows"
             rm "$manifest_rows"
@@ -250,15 +277,15 @@ jobs:
 
           (
             cd release-assets/standard
-            zip -9 -r ../../publish/heltec-v4-standard-complete-v2.8.0.8.zip .
+            zip -9 -r "../../publish/heltec-v4-standard-complete-${firmware_version}.zip" .
           )
           (
             cd release-assets/solar-router
-            zip -9 -r ../../publish/heltec-v4-solar-router-complete-v2.8.0.8.zip .
+            zip -9 -r "../../publish/heltec-v4-solar-router-complete-${firmware_version}.zip" .
           )
 
-          standard_zip_listing=$(zipinfo -l publish/heltec-v4-standard-complete-v2.8.0.8.zip)
-          solar_zip_listing=$(zipinfo -l publish/heltec-v4-solar-router-complete-v2.8.0.8.zip)
+          standard_zip_listing=$(zipinfo -l "publish/heltec-v4-standard-complete-${firmware_version}.zip")
+          solar_zip_listing=$(zipinfo -l "publish/heltec-v4-solar-router-complete-${firmware_version}.zip")
           grep -E '^-rwxr-xr-x .* device-install\.sh$' <<<"$standard_zip_listing" >/dev/null
           grep -E '^-rwxr-xr-x .* device-update\.sh$' <<<"$standard_zip_listing" >/dev/null
           grep -E '^-rwxr-xr-x .* device-install\.sh$' <<<"$solar_zip_listing" >/dev/null
@@ -270,7 +297,7 @@ jobs:
       - name: Verify main still points to this release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: heltec-v4-profiles-v2.8.0.8
+          RELEASE_TAG: heltec-v4-profiles-v2.8.0.9
         run: |
           set -euo pipefail
           remote_main=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | awk '{print $1}')
@@ -333,91 +360,45 @@ jobs:
       - name: Publish Heltec V4 profile release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          tag_name: heltec-v4-profiles-v2.8.0.8
+          tag_name: heltec-v4-profiles-v2.8.0.9
           target_commitish: ${{ github.sha }}
-          name: Heltec V4 Standard and Solar Router v2.8.0.8
+          name: Heltec V4 Standard and Solar Router v2.8.0.9
           prerelease: false
           make_latest: true
           generate_release_notes: false
           overwrite_files: false
           body: |
-            Custom Meshtastic firmware exclusively for the Heltec V4 OLED, now distributed as two explicit profiles from one maintained codebase.
+            Independent Meshtastic 2.8.0 firmware for the Heltec V4 OLED, with Standard and Solar Router profiles.
 
-            `v2.8.0.8` is the distribution revision. Manifests, firmware filenames and the Meshtastic client About view identify the exact build as `2.8.0.<7-character commit SHA>`; the compact OLED footer displays `2.8.0`. Those are expected representations of this same release.
+            Distribution revision: `v2.8.0.9`. Compiled firmware: `${{ steps.source-version.outputs.firmware_version }}`. The OLED footer displays `2.8.0-h9`.
 
-            Choose one profile:
+            Changes in this revision:
 
-            - `heltec-v4-standard`: regular personal or mobile nodes. It keeps the common OLED, GPS, Bluetooth, battery reporting, CPU and MQTT improvements, while retaining normal Meshtastic critical-battery thresholds and wake behavior.
-            - `heltec-v4-solar-router`: fixed solar infrastructure configured as `ROUTER` or `ROUTER_LATE`. It adds the aggressive 3.50 V protective shutdown, timer-only critical sleep, peripheral power isolation and 3.65 V recovery hysteresis, with a USB data-host bypass for local recovery.
+            - Early boot and normal telemetry share one calibrated 15-sample battery ADC reader and the persisted custom multiplier. A verified NVS cache makes the multiplier available before preferences load.
+            - Multiplier changes discard readings and filters from the previous scale. Invalid calibration, initialization failures, and failed samples cannot authorize battery-powered storage writes; Solar Router remains in protective sleep when early calibration cannot be trusted and no USB data host is connected.
+            - Initial region selection persists a complete configuration generation, and PRG menu callbacks retain valid selection and text storage.
+            - Preference transactions drain admitted radio work before parking the SX1262, preserving reception state and preventing maintenance or queued work from reactivating a parked radio.
+            - Firmware filenames, the API, the ESP application descriptor, and manifests share one source-derived identity. Clean builds use `2.8.0-h9g<8-character fingerprint>`; modified sources use `h9d`. Manifests include full source/build-identity SHA256, source commit, and image SHA256. Old images are never renamed into the new release.
+            - Windows installers correctly parse supported esptool versions with CMD delayed expansion enabled.
 
-            The legacy PlatformIO target `heltec-v4` remains a compatibility alias for `heltec-v4-solar-router`, but release files use only the explicit profile names.
+            Choose the profile for the intended use:
 
-            Common improvements:
+            - `heltec-v4-standard`: personal or mobile nodes, with normal Meshtastic critical-battery thresholds and wake behavior.
+            - `heltec-v4-solar-router`: fixed solar infrastructure configured separately as `ROUTER` or `ROUTER_LATE`, with a 3.50 V protective cutoff, timer-only critical sleep, peripheral power isolation, and 3.65 V recovery hysteresis. An active USB data host permits local recovery.
 
-            - Persistent `Display Options -> Disable Display` control.
-            - Persistent display-off always holds the OLED in reset. The shared GPIO36 VEXT/QuickLink rail is also turned off when the completed boot scan found no other I2C accessory, but remains powered when one was detected. UART, analog and power-only accessories cannot be detected automatically and should not use this mode when they depend on VEXT.
-            - Incoming messages and automatic events do not wake a persistently disabled OLED.
-            - Geofence, motion/tap and remotely injected input events do not create hidden display-wake intervals while it is disabled.
-            - Holding PRG for about one second restores the display.
-            - The status/pairing LED stays dark in persistent display-off mode, including on headless timer wakes.
-            - GPS is disabled by default on a clean installation and is not probed while disabled.
-            - A valid GPS fix observed during a search cycle remains credited at cycle end even if the final poll has no new fix.
-            - Bluetooth remains discoverable and reconnectable without pressing PRG, including on `ROUTER` and `ROUTER_LATE` while the OLED is disabled.
-            - Explicitly disabling Bluetooth restores the normal Router/power-saving sleep path.
-            - Disabling Bluetooth from the physical menu verifies the persisted setting before restarting, so a write failure retains the previous working state.
-            - Profile-aligned battery curves: Standard represents the normal 3.10 V discharge tail, while Solar Router reaches 0% at its 3.50 V protective cutoff.
-            - Published battery percentage is slew-limited while Solar Router protection uses the latest unfiltered 15-sample ADC average.
-            - A confirmed battery remains protected through severe voltage sag without treating the open battery input at boot as a real cell.
-            - On battery, ordinary preference writes require a fresh usable reading of at least 3.30 V on Standard or strictly above 3.50 V on Solar Router (minimum integer reading 3.501 V); an active enumerated USB data host also authorizes the write, while charge-only/VBUS detection does not. Eligible transaction-free core saves retry when safe power returns.
-            - Reset, preference restore and OTA entry use the stricter fresh 3.65 V-or-USB-data-host power gate.
-            - Preference writes report verification failures and retry without formatting or wiping the filesystem.
-            - A failed LittleFS mount never auto-formats Heltec V4: the node boots fail-closed with LoRa TX and GPS off, accepts only local BLE/USB administration (including supported BLE OTA) for recovery, and rejects identity/settings writes.
-            - A mounted but unreadable identity/config file remains protected after boot: LoRa stays silent, ordinary Admin mutations and identity-bearing writes are rejected, and config-only reset cannot replace the unavailable key.
-            - A partial core generation is detected before any boot migration or automatic save. Config, channel, module and device-state files must form one complete generation. `nodes.proto` may be absent only for a new keyless, unlicensed node; once private/config public key material, an owner public key or licensed identity exists, it is required too. A missing required peer or pending temporary keeps the node radio-silent and preserves the surviving files for local recovery.
-            - Recovery exposes only a bounded local BLE/USB allowlist: reboot/shutdown, DFU, supported BLE OTA, compatible preference restore and factory reset operations, plus NodeDB reset when the surviving state permits it. Destructive operations require an active USB data-host connection or an initialized raw battery reading of at least 3.65 V, refreshed immediately before each destructive boundary.
-            - Full reset clears unrelated files before `/prefs`; if its explicitly authorized preference removal becomes partial, it completes through a verified filesystem format instead of returning with a half-deleted generation.
-            - Config-only reset replaces each identity-bearing core file atomically before auxiliary preferences are removed, and cannot retain a stale node cache when no initialized identity can produce a fresh one; an incomplete multi-file reset reports failure and keeps recovery connectivity available for retry.
-            - Legacy preferences are replaced with clean defaults without an early-boot directory erase; the cryptographic identity is preserved, four identity/config-bearing files are verified, then the old node cache and obsolete marker are removed in retry-safe order. An unreadable legacy identity fails closed without replacing or deleting it.
-            - Correct MQTT implicit acknowledgement handling without changing normal LoRa acknowledgements.
-            - MQTT configuration validation no longer opens a live TCP probe before committing a candidate configuration.
-            - SX1262 state-loss recovery no longer compounds the Heltec V4 FEM power conversion; failed CAD defers TX, failed reconfiguration rearms RX, and failed critical-sleep entry asserts radio reset.
-            - Muted senders and channels do not wake the display or power state machine.
-            - Candidate low-entropy PKI keys are rejected without replacing the current identity; stored weak identities are securely regenerated during recovery. Every valid existing keypair is preserved, although a legacy visible Node ID may be realigned to `CRC32(public_key)`; selecting the first region on a clean keyless node creates its initial identity.
-            - Unified OTA transport and firmware hash are read back from NVS before the OTA loader is selected, preventing a persistence failure from stranding the node in app1.
-            - BLE OTA cannot reactivate stale Wi-Fi credentials from an earlier Wi-Fi OTA, including during fail-closed storage recovery.
-            - Abandoned multi-setting Admin transactions expire on the real idle deadline, persist their applied values, and retain any restart required for Bluetooth/power-state changes.
-            - Multi-setting edits reject concurrent UI, HTTP and background persistence. Invalid radio candidates are rejected before commit; after a valid generation commits, traffic stays fenced until radio activation succeeds, and an activation failure leaves LoRa parked and schedules a guarded reboot.
-            - Settings BEGIN uses a lossless quiescing phase: it blocks new radio/network work, drains already admitted RX/TX, preserves a packet caught after dequeue, then parks the radio. Maintenance cannot rearm it, queues resume only after the transaction finishes, and a one-shot mutation without this pre-mutation fence is rejected.
-            - Message and waypoint persistence locks are drained before filesystem reset, and queued clear/autosave work cannot cross into the destructive transaction.
-            - Preference backup/restore validates complete segments, identity/keypair consistency, radio legality and backup layout before replacing live files; a durable marker makes an interrupted restore retry-safe and nested backups are rejected.
-            - Message and waypoint stores use locked snapshots and verified atomic writes. Saved messages own independent text storage, avoiding wraparound corruption, and malformed records or notification flags are rejected.
-            - Security SET validates key lengths/counts, private/public consistency and compromised low-entropy keys before mutation; Curve25519 shared-secret bytes are no longer logged.
-            - XMODEM is restricted to local BLE/serial, refuses preference/backup/recovery paths, and is disabled during recovery or storage transactions. Short uploads remove partial files and cancelling a download preserves its source.
-            - HTTP uploads and deletes are confined to the static-file tree; traversal and protected persistence paths are rejected, and state readers are fenced during reset/restore.
-            - Role changes undo only unchanged role-imposed defaults, preserve later user customizations and clear stale `is_unmessagable` state when appropriate.
-            - First event-profile use creates config and channels together without deleting the inactive profile or its backup; encrypted-storage unlock reloads and validates the persisted PKI identity rather than retaining the locked placeholder.
-            - Canned-message, ringtone and manual key-verification changes propagate persistence failure instead of acknowledging RAM-only state; canned text no longer implicitly toggles the separate module-enable setting.
-            - Removing licensed status in a licensed-only region atomically selects region `UNSET`, disables TX and clears frequency/channel overrides.
-            - Irreparable or physically unsupported LoRa configurations are rejected before persistence; modem setup recalculates the effective region after every safe repair and otherwise disables TX without guessing a regulatory domain.
-            - Regional settings, configured LoRa transmit power and RX Boosted Gain behavior remain unchanged.
+            Both profiles default to LongFast on a clean installation and preserve existing modem settings during an update. Bluetooth remains manually controlled; disabling it permits the normal Router/power-saving sleep path. The legacy `heltec-v4` build target remains a Solar Router compatibility alias.
 
-            Solar Router safeguards:
+            Persistent display-off holds the OLED in reset. The shared GPIO36 VEXT/QuickLink rail is also turned off when the completed boot scan found no other I2C accessory, but remains powered when one was detected. UART, analog, and power-only accessories cannot be detected automatically; avoid this mode when they depend on VEXT. Holding PRG for about one second restores the display.
 
-            - Three consecutive raw battery readings at or below 3.50 V trigger protective deep sleep.
-            - Critical sleep disables external wake sources and wakes only by timer.
-            - OLED, GPS, LED, LoRa FEM and other retained power domains are forced off.
-            - Without an active enumerated USB data host, boot remains in recovery sleep until battery voltage reaches approximately 3.65 V; a data-host connection permits local recovery.
+            Installation:
 
-            Upstream base: Meshtastic `develop` through `7239fe886a30fa13cd35946fa5ae1a46a2807eeb`, with audited stability backports selected through `fdb67309aa8fb9a019e07160ac72024c3d25ce2d`. This release intentionally remains on the 2.8.0 base and does not claim a full 2.8.1 synchronization.
+            - OTA: use the profile-specific normal `.bin` published as an individual asset.
+            - Wired preserving update: extract the matching `complete` ZIP and run `device-update.sh` or `device-update.bat` with its normal `.bin` and adjacent manifest.
+            - Clean installation: extract every file from the matching `complete` ZIP and run `device-install.sh` or `device-install.bat` with its `.factory.bin`. This erases existing settings and identity, then writes the application, unified OTA loader, and LittleFS together. Do not erase and flash the `.factory.bin` alone.
+            - Installers require esptool 4.5.1 or newer and an explicit serial port. They verify ESP32-S3, 16 MB flash, profile/version, repository provenance, partition layout, sizes, and digests before writing. POSIX scripts also require `jq`.
 
-            Installation safety:
+            Publication is gated by both profile builds, native integration tests, host fault-injection regressions, source checks, and manifest/hash verification. The corrected Solar Router implementation was also tested on a Heltec V4.3 OLED for calibration persistence, PRG navigation, Bluetooth, and configuration preservation. Absolute voltage accuracy requires a reference measurement; validate low-voltage sleep/recovery and autonomy with the actual battery and solar supply before unattended deployment.
 
-            - For an OTA update, use the profile-specific normal `.bin` published as an individual asset.
-            - For a wired preserving update, extract the matching `complete` ZIP and run `device-update.sh` or `device-update.bat` with its normal `.bin`; the adjacent manifest is required for verification.
-            - For an erased or deliberately clean device, download the matching `complete` ZIP, extract every file, and run `device-install.sh` or `device-install.bat` with its `.factory.bin`. The installer writes the factory image, unified OTA loader and LittleFS image together.
-            - The included installers require esptool 4.5.1 or newer and an explicit serial port, verify ESP32-S3 identity and 16 MB flash, bind the selected profile/version filename exactly to manifest target/version, and validate repository provenance, partition metadata, sizes and digests before any erase or write. POSIX scripts also require `jq`.
-            - Do not erase flash and then write the `.factory.bin` alone; it deliberately remains inside the complete bundle to prevent that incomplete installation path.
-
-            This is an independent release and is not an official Meshtastic build. Validate the complete low-voltage shutdown and recovery cycle on the target solar power system before unattended deployment.
+            Upstream base: Meshtastic `develop` through `7239fe886a30fa13cd35946fa5ae1a46a2807eeb`, with stability backports selected through `fdb67309aa8fb9a019e07160ac72024c3d25ce2d`. This independent release remains on upstream 2.8.0 and is not an official Meshtastic build.
           files: publish/*
           fail_on_unmatched_files: true

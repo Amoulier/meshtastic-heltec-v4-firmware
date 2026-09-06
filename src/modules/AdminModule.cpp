@@ -21,10 +21,10 @@
 #include "Router.h"
 #include "concurrency/LockGuard.h"
 #include "configuration.h"
-#include "main.h"
-#ifdef ARCH_NRF52
-#include "main.h"
+#if defined(HELTEC_V4_OLED)
+#include "power/HeltecV4BatteryAdc.h"
 #endif
+#include "main.h"
 #ifdef ARCH_PORTDUINO
 #include "PortduinoGlue.h"
 #include "unistd.h"
@@ -54,8 +54,7 @@
 #include "GPS.h"
 #endif
 
-#include <RNG.h>      // CryptRNG, the seeded CSPRNG used as fallback for the session passkey
-#include <Throttle.h> // rollover-safe elapsed-time checks for the session passkey
+#include <RNG.h> // CryptRNG, the seeded CSPRNG used as fallback for the session passkey
 #include <algorithm>
 
 #if MESHTASTIC_EXCLUDE_GPS
@@ -1226,6 +1225,15 @@ static bool isBareKeypairRotation(const meshtastic_Config_SecurityConfig &incomi
 
 bool AdminModule::handleSetConfig(const meshtastic_Config &c, bool fromOthers)
 {
+#if defined(HELTEC_V4_OLED)
+    if (c.which_payload_variant == meshtastic_Config_power_tag) {
+        float resolvedMultiplier;
+        if (!resolveHeltecV4AdcMultiplier(c.payload_variant.power.adc_multiplier_override, resolvedMultiplier)) {
+            LOG_WARN("Invalid ADC calibration multiplier");
+            return false;
+        }
+    }
+#endif
     auto changes = SEGMENT_CONFIG;
     auto existingRole = config.device.role;
     bool isRegionUnset = (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET);
