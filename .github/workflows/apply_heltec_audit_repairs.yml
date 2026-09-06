@@ -1,0 +1,74 @@
+name: Prepare verified Heltec regression candidate
+on:
+  push:
+    branches: [workbench/heltec-v4-audit-snapshot]
+    paths: [.github/workflows/apply_heltec_audit_repairs.yml]
+permissions:
+  contents: read
+jobs:
+  prepare:
+    if: github.repository == 'Amoulier/meshtastic-heltec-v4-firmware'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 042116c3c9a03bf2f0b8be782f32874574431585
+          path: candidate
+          submodules: recursive
+          persist-credentials: false
+      - name: Apply reviewed repairs and verify exact file hashes
+        run: |
+          set -euo pipefail
+          test "$(git -C candidate rev-parse HEAD)" = 042116c3c9a03bf2f0b8be782f32874574431585
+          python3 audit/prepare_regression_repairs.py
+          python3 audit/prepare_storage_repairs.py
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+            '.github/workflows/audit_native_heltec.yml': '505513fbec10b82891b744c0a63ab67eda3882fa',
+            'bin/run-heltec-native-audit.py': 'e037e48fa62b1eeb070b67e0b36fe10292a694d4',
+            'src/PreferenceRecoveryPolicy.h': 'dfa31b318494ab1eae90eab3d2234ac3f9f4f9c1',
+            'src/mesh/NodeDB.cpp': '6c0276fe61c959853a8c9033063fd359eb059f3f',
+            'test/host/heltec_storage_audit.ini': '1e8d0ac2315d21a2e7f523f33519e9fa1c526baa',
+            'test/test_admin_radio/test_main.cpp': '74bdf19883bdb7f11a08881f7832502a6b097f7a',
+            'test/test_nodedb_boot_recovery/test_main.cpp': '5c39fb0d0e5e8a3e3e955b605f0fe6997aa3ba98',
+            'test/test_xmodem/test_main.cpp': '1c42d02d7f8865d5af96ab818085f9dc67fd88bd',
+          }
+          for path, sha in expected.items():
+              actual = subprocess.check_output(['git','hash-object',path],cwd='candidate',text=True).strip()
+              if actual != sha:
+                  raise SystemExit(f'{path}: expected {sha}, found {actual}')
+          subprocess.run(['git','add','--',*expected],cwd='candidate',check=True)
+          actual = subprocess.check_output(['git','diff','--cached','--name-only'],cwd='candidate',text=True).splitlines()
+          assert set(actual) == set(expected)
+          PY
+          cd candidate
+          git diff --cached --check
+          python3 test/host/heltec_release_policy_test.py
+          python3 test/host/heltec_audit_regression.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(heltec-v4): repair regression fixtures and audit strict storage recovery'
+          git rev-parse HEAD > /tmp/candidate-sha.txt
+          git show --stat HEAD >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish only an isolated candidate ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd candidate
+          ref=refs/heads/workbench/heltec-v4-regression-candidate
+          existing=$(git ls-remote origin "$ref")
+          test -z "$existing"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin "HEAD:$ref"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: heltec-regression-candidate-sha
+          path: /tmp/candidate-sha.txt
+          if-no-files-found: error
