@@ -126,7 +126,7 @@ for component, value in (("major", "2"), ("minor", "8"), ("build", "0")):
 
 # External actions and the build container must remain immutable references.
 for line in release.splitlines() + build.splitlines():
-    match = re.match(r"\s*uses:\s*([^\s#]+)", line)
+    match = re.match(r"\s*(?:-\s*)?uses:\s*([^\s#]+)", line)
     if match and not match.group(1).startswith("./"):
         require(re.search(r"@[0-9a-f]{40}$", match.group(1)) is not None, f"GitHub Action is not SHA-pinned: {match.group(1)}")
 require(
