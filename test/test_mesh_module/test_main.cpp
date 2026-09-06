@@ -849,7 +849,7 @@ static void test_deferredChain_drainsBreadthFirst()
 }
 
 // Overflowing the fixed deferred queue drops the excess deferrals gracefully: no crash, no leak,
-// depth still capped, and every send's phone cc still happens (return codes unchanged).
+// depth still capped, and only admitted sends are confirmed to the phone.
 static void test_deferredQueueOverflow_dropsGracefully()
 {
     const uint32_t burst = 6; // deferredLocalCapacity (4) + 2 - keep in sync with Router.h
@@ -863,13 +863,13 @@ static void test_deferredQueueOverflow_dropsGracefully()
     TEST_ASSERT_EQUAL_UINT8(1, mockRouter->maxHandleDepthObserved);
     TEST_ASSERT_EQUAL_UINT8(0, mockRouter->deferredLocalPending()); // drained clean
 
-    // Return codes were unchanged: every reply still cc'd to the phone, dropped deferral or not.
+    // A dropped local unicast must not be confirmed as delivered to the phone.
     uint32_t delivered = 0;
     while (auto *toPhone = mockService->getForPhone()) {
         mockService->releaseToPool(toPhone);
         delivered++;
     }
-    TEST_ASSERT_EQUAL_UINT32(burst, delivered);
+    TEST_ASSERT_EQUAL_UINT32(burst - mockRouter->deferredLocalDropped, delivered);
 }
 
 void setup()

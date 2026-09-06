@@ -1,3 +1,4 @@
+#include "configuration.h" // HAS_SCREEN must be known before MessageStore.h
 #include "MessageStore.h"
 #include <cstdlib>
 #include <cstdio>
@@ -10,7 +11,7 @@ void tearDown(void) {}
 
 static StoredMessage makeMessage(unsigned index, size_t length)
 {
-    StoredMessage message;
+    StoredMessage message{};
     std::string text(length, static_cast<char>('a' + index % 26));
     if (length >= 7) {
         char prefix[8];

@@ -1068,6 +1068,8 @@ static void restoreAdminRadioGlobals()
     owner = savedOwner;
     config = savedConfig;
     channelFile = savedChannelFile;
+    if (crypto)
+        crypto->restoreIdentity(config.security.private_key.size == 32 ? config.security.private_key.bytes : nullptr);
     initRegion();
 }
 
@@ -1722,17 +1724,25 @@ static void test_handleSetConfig_fromLocal_customBandwidthNonZeroPreserved()
     TEST_ASSERT_EQUAL_UINT16(125, config.lora.bandwidth);
 }
 
+// Deterministic test-only private bytes are not secrets. Derive the public half with
+// the real validation routine so positive SET tests obey the production keypair invariant.
+static meshtastic_Config_SecurityConfig matchingSecurityFixture(uint8_t fill)
+{
+    meshtastic_Config_SecurityConfig value = meshtastic_Config_SecurityConfig_init_zero;
+    value.private_key.size = 32;
+    memset(value.private_key.bytes, fill, 32);
+    value.public_key.size = 32;
+    TEST_ASSERT_TRUE(nodeDB->derivePublicKeyForValidation(value.private_key.bytes, value.public_key.bytes));
+    return value;
+}
+
 // A security-config SET that omits the private key (partial/legacy client
 // editing some other security field) must NOT regenerate our keypair: our
 // NodeNum is crc32(public_key), so a new keypair would silently change our
 // identity. The existing keypair has to be preserved.
 static void test_handleSetConfig_security_preservesKeypairWhenPrivateOmitted()
 {
-    config.security = meshtastic_Config_SecurityConfig_init_zero;
-    config.security.private_key.size = 32;
-    memset(config.security.private_key.bytes, 0x11, 32);
-    config.security.public_key.size = 32;
-    memset(config.security.public_key.bytes, 0x22, 32);
+    config.security = matchingSecurityFixture(0x11);
 
     // Incoming SET carries no private/public key, just another security field.
     meshtastic_Config c = meshtastic_Config_init_zero;
@@ -1740,12 +1750,12 @@ static void test_handleSetConfig_security_preservesKeypairWhenPrivateOmitted()
     c.payload_variant.security.serial_enabled = true;
 
     testAdmin->deferSaves();
-    testAdmin->handleSetConfig(c, false);
+    TEST_ASSERT_TRUE(testAdmin->handleSetConfig(c, false));
 
     uint8_t expectedPriv[32];
     memset(expectedPriv, 0x11, 32);
-    uint8_t expectedPub[32];
-    memset(expectedPub, 0x22, 32);
+    const auto expected = matchingSecurityFixture(0x11);
+    const uint8_t *expectedPub = expected.public_key.bytes;
     TEST_ASSERT_EQUAL_UINT(32, config.security.private_key.size);
     TEST_ASSERT_EQUAL_MEMORY(expectedPriv, config.security.private_key.bytes, 32);
     TEST_ASSERT_EQUAL_UINT(32, config.security.public_key.size);
@@ -1758,26 +1768,19 @@ static void test_handleSetConfig_security_preservesKeypairWhenPrivateOmitted()
 // apply it, not preserve the old one.
 static void test_handleSetConfig_security_acceptsSuppliedKeypair()
 {
-    config.security = meshtastic_Config_SecurityConfig_init_zero;
-    config.security.private_key.size = 32;
-    memset(config.security.private_key.bytes, 0x11, 32);
-    config.security.public_key.size = 32;
-    memset(config.security.public_key.bytes, 0x22, 32);
+    config.security = matchingSecurityFixture(0x11);
 
     meshtastic_Config c = meshtastic_Config_init_zero;
     c.which_payload_variant = meshtastic_Config_security_tag;
-    c.payload_variant.security.private_key.size = 32;
-    memset(c.payload_variant.security.private_key.bytes, 0x33, 32);
-    c.payload_variant.security.public_key.size = 32;
-    memset(c.payload_variant.security.public_key.bytes, 0x44, 32);
+    c.payload_variant.security = matchingSecurityFixture(0x33);
 
     testAdmin->deferSaves();
-    testAdmin->handleSetConfig(c, false);
+    TEST_ASSERT_TRUE(testAdmin->handleSetConfig(c, false));
 
     uint8_t expectedPriv[32];
     memset(expectedPriv, 0x33, 32);
-    uint8_t expectedPub[32];
-    memset(expectedPub, 0x44, 32);
+    const auto expected = matchingSecurityFixture(0x33);
+    const uint8_t *expectedPub = expected.public_key.bytes;
     TEST_ASSERT_EQUAL_MEMORY(expectedPriv, config.security.private_key.bytes, 32);
     TEST_ASSERT_EQUAL_MEMORY(expectedPub, config.security.public_key.bytes, 32);
 }
@@ -1787,11 +1790,7 @@ static void test_handleSetConfig_security_acceptsSuppliedKeypair()
 // locking the owner out of remote admin.
 static void test_handleSetConfig_security_rotationPreservesAdminKeys()
 {
-    config.security = meshtastic_Config_SecurityConfig_init_zero;
-    config.security.private_key.size = 32;
-    memset(config.security.private_key.bytes, 0x11, 32);
-    config.security.public_key.size = 32;
-    memset(config.security.public_key.bytes, 0x22, 32);
+    config.security = matchingSecurityFixture(0x11);
     config.security.admin_key_count = 2;
     config.security.admin_key[0].size = 32;
     memset(config.security.admin_key[0].bytes, 0xAA, 32);
@@ -1809,7 +1808,7 @@ static void test_handleSetConfig_security_rotationPreservesAdminKeys()
     memset(c.payload_variant.security.private_key.bytes, 0x33, 32);
 
     testAdmin->deferSaves();
-    testAdmin->handleSetConfig(c, false);
+    TEST_ASSERT_TRUE(testAdmin->handleSetConfig(c, false));
 
     uint8_t expectedPriv[32];
     memset(expectedPriv, 0x33, 32);
@@ -1834,11 +1833,7 @@ static void test_handleSetConfig_security_rotationPreservesAdminKeys()
 // keys.
 static void test_handleSetConfig_security_clearsAdminKeysWhenKeypairUnchanged()
 {
-    config.security = meshtastic_Config_SecurityConfig_init_zero;
-    config.security.private_key.size = 32;
-    memset(config.security.private_key.bytes, 0x11, 32);
-    config.security.public_key.size = 32;
-    memset(config.security.public_key.bytes, 0x22, 32);
+    config.security = matchingSecurityFixture(0x11);
     config.security.admin_key_count = 1;
     config.security.admin_key[0].size = 32;
     memset(config.security.admin_key[0].bytes, 0xAA, 32);
@@ -1846,13 +1841,10 @@ static void test_handleSetConfig_security_clearsAdminKeysWhenKeypairUnchanged()
     // Same private key we already hold, empty admin key list.
     meshtastic_Config c = meshtastic_Config_init_zero;
     c.which_payload_variant = meshtastic_Config_security_tag;
-    c.payload_variant.security.private_key.size = 32;
-    memset(c.payload_variant.security.private_key.bytes, 0x11, 32);
-    c.payload_variant.security.public_key.size = 32;
-    memset(c.payload_variant.security.public_key.bytes, 0x22, 32);
+    c.payload_variant.security = matchingSecurityFixture(0x11);
 
     testAdmin->deferSaves();
-    testAdmin->handleSetConfig(c, false);
+    TEST_ASSERT_TRUE(testAdmin->handleSetConfig(c, false));
 
     TEST_ASSERT_EQUAL_UINT(0, config.security.admin_key_count);
     TEST_ASSERT_EQUAL_UINT(0, config.security.admin_key[0].size);
@@ -1870,6 +1862,18 @@ class RestoreDerivingCryptoEngine : public CryptoEngine
   public:
     bool regenerateSucceeds = true;
     bool derivesLowEntropy = true;
+    // Candidate validation uses a non-mutating real Curve25519 derivation. Inject only
+    // blacklist membership here; no compromised private key needs to be disclosed.
+    bool blacklistCandidate = false;
+    uint8_t candidatePublicKey[32] = {};
+    void hash(uint8_t *bytes, size_t numBytes) override
+    {
+        if (blacklistCandidate && numBytes == 32 && memcmp(bytes, candidatePublicKey, 32) == 0) {
+            memcpy(bytes, LOW_ENTROPY_HASHES[0], 32);
+            return;
+        }
+        CryptoEngine::hash(bytes, numBytes);
+    }
     bool regeneratePublicKey(uint8_t *pubKey, uint8_t *privKey) override
     {
         if (!regenerateSucceeds)
@@ -1949,79 +1953,68 @@ static bool capturedWarningsContain(const char *needle)
     return false;
 }
 
-// A restored private key deriving a blacklisted public key is rejected and
-// rotated at set time, and the client is told why - not left to discover it
-// after the next reboot.
-static void test_handleSetConfig_security_lowEntropyRestoreWarnsAndRotates()
+// Both bare and full weak candidate imports are rejected before any live identity
+// mutation. The old upstream fixtures expected a rotation; that is not this fork's contract.
+static void assertWeakCandidateRejected(bool includePublicKey)
 {
-    installRestoreCrypto();
-
-    const meshtastic_Config c = makeBareKeyRestoreConfig();
-    testAdmin->deferSaves();
-    testAdmin->handleSetConfig(c, false);
-
-    TEST_ASSERT_TRUE(nodeDB->keyIsLowEntropy);
-    TEST_ASSERT_EQUAL_UINT(32, config.security.public_key.size);
-    TEST_ASSERT_TRUE(memcmp(COMPROMISED_PUBLIC_KEY, config.security.public_key.bytes, 32) != 0);
-    TEST_ASSERT_FALSE(nodeDB->checkLowEntropyPublicKey(config.security.public_key));
-    TEST_ASSERT_TRUE(capturedWarningsContain(LOW_ENTROPY_RESTORE_WARNING));
-}
-
-// A restore carrying a whole blacklisted pair must not skip validation just
-// because it populated the public key too - that path reaches neither keygen
-// branch, so the weak identity used to be kept.
-static void test_handleSetConfig_security_lowEntropyFullKeypairRestoreIsRejected()
-{
-    installRestoreCrypto();
-
-    config.security = meshtastic_Config_SecurityConfig_init_zero;
+    config.security = matchingSecurityFixture(0x33);
     config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
     initRegion();
+    auto *engine = installRestoreCrypto();
+    memcpy(engine->private_key, config.security.private_key.bytes, 32);
+    memcpy(engine->public_key, config.security.public_key.bytes, 32);
+    const auto before = config.security;
+    const auto beforeOwner = owner;
+    const NodeNum beforeNode = nodeDB->getNodeNum();
 
     meshtastic_Config c = meshtastic_Config_init_zero;
     c.which_payload_variant = meshtastic_Config_security_tag;
-    c.payload_variant.security.private_key.size = 32;
-    memset(c.payload_variant.security.private_key.bytes, 0x11, 32);
-    c.payload_variant.security.public_key.size = 32;
-    memcpy(c.payload_variant.security.public_key.bytes, COMPROMISED_PUBLIC_KEY, 32);
-
+    c.payload_variant.security = matchingSecurityFixture(0x11);
+    memcpy(engine->candidatePublicKey, c.payload_variant.security.public_key.bytes, 32);
+    engine->blacklistCandidate = true;
+    if (!includePublicKey)
+        c.payload_variant.security.public_key.size = 0;
     testAdmin->deferSaves();
-    testAdmin->handleSetConfig(c, false);
+    TEST_ASSERT_FALSE(testAdmin->handleSetConfig(c, false));
 
-    TEST_ASSERT_EQUAL_UINT(32, config.security.public_key.size);
-    TEST_ASSERT_TRUE(memcmp(COMPROMISED_PUBLIC_KEY, config.security.public_key.bytes, 32) != 0);
-    TEST_ASSERT_FALSE(nodeDB->checkLowEntropyPublicKey(config.security.public_key));
-    TEST_ASSERT_TRUE(capturedWarningsContain(LOW_ENTROPY_RESTORE_WARNING));
+    TEST_ASSERT_EQUAL_MEMORY(&before, &config.security, sizeof(before));
+    TEST_ASSERT_EQUAL_MEMORY(&beforeOwner, &owner, sizeof(beforeOwner));
+    TEST_ASSERT_EQUAL_UINT32(beforeNode, nodeDB->getNodeNum());
+    TEST_ASSERT_EQUAL_MEMORY(before.private_key.bytes, engine->private_key, 32);
+    TEST_ASSERT_EQUAL_MEMORY(before.public_key.bytes, engine->public_key, 32);
+    TEST_ASSERT_EQUAL_INT(0, testAdmin->savedSegments());
+    TEST_ASSERT_TRUE(capturedWarningsContain(LOW_ENTROPY_REJECT_WARNING));
+    TEST_ASSERT_FALSE(capturedWarningsContain(LOW_ENTROPY_RESTORE_WARNING));
 }
 
-// A blacklisted public key whose private key derives a clean one is only
-// re-derived - the user's key does stick, so the "a new secure key was
-// generated" warning would be a lie here.
-static void test_handleSetConfig_security_reDerivedCleanKeyDoesNotWarn()
+static void test_handleSetConfig_security_weakBareCandidatePreservesIdentity()
 {
-    installRestoreCrypto()->derivesLowEntropy = false;
+    assertWeakCandidateRejected(false);
+}
 
-    config.security = meshtastic_Config_SecurityConfig_init_zero;
-    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
-    initRegion();
+static void test_handleSetConfig_security_weakFullCandidatePreservesIdentity()
+{
+    assertWeakCandidateRejected(true);
+}
 
+// A mismatching supplied public half is rejected, not silently repaired into an
+// identity different from the imported pair. This uses the real derivation.
+static void test_handleSetConfig_security_mismatchedPairPreservesIdentity()
+{
+    config.security = matchingSecurityFixture(0x33);
+    const auto before = config.security;
+    const auto beforeOwner = owner;
+    const NodeNum beforeNode = nodeDB->getNodeNum();
     meshtastic_Config c = meshtastic_Config_init_zero;
     c.which_payload_variant = meshtastic_Config_security_tag;
-    c.payload_variant.security.private_key.size = 32;
-    memset(c.payload_variant.security.private_key.bytes, 0x11, 32);
-    c.payload_variant.security.public_key.size = 32;
+    c.payload_variant.security = matchingSecurityFixture(0x11);
     memcpy(c.payload_variant.security.public_key.bytes, COMPROMISED_PUBLIC_KEY, 32);
-
     testAdmin->deferSaves();
-    testAdmin->handleSetConfig(c, false);
-
-    // The supplied private key survives, and the blacklisted public key is
-    // replaced by its derivation.
-    uint8_t expectedPriv[32];
-    memset(expectedPriv, 0x11, 32);
-    TEST_ASSERT_EQUAL_MEMORY(expectedPriv, config.security.private_key.bytes, 32);
-    TEST_ASSERT_FALSE(nodeDB->checkLowEntropyPublicKey(config.security.public_key));
-    TEST_ASSERT_TRUE(memcmp(COMPROMISED_PUBLIC_KEY, config.security.public_key.bytes, 32) != 0);
+    TEST_ASSERT_FALSE(testAdmin->handleSetConfig(c, false));
+    TEST_ASSERT_EQUAL_MEMORY(&before, &config.security, sizeof(before));
+    TEST_ASSERT_EQUAL_MEMORY(&beforeOwner, &owner, sizeof(beforeOwner));
+    TEST_ASSERT_EQUAL_UINT32(beforeNode, nodeDB->getNodeNum());
+    TEST_ASSERT_EQUAL_INT(0, testAdmin->savedSegments());
     TEST_ASSERT_FALSE(capturedWarningsContain(LOW_ENTROPY_RESTORE_WARNING));
 }
 
@@ -3290,9 +3283,9 @@ void setup()
     RUN_TEST(test_handleSetConfig_security_acceptsSuppliedKeypair);
     RUN_TEST(test_handleSetConfig_security_rotationPreservesAdminKeys);
     RUN_TEST(test_handleSetConfig_security_clearsAdminKeysWhenKeypairUnchanged);
-    RUN_TEST(test_handleSetConfig_security_lowEntropyRestoreWarnsAndRotates);
-    RUN_TEST(test_handleSetConfig_security_lowEntropyFullKeypairRestoreIsRejected);
-    RUN_TEST(test_handleSetConfig_security_reDerivedCleanKeyDoesNotWarn);
+    RUN_TEST(test_handleSetConfig_security_weakBareCandidatePreservesIdentity);
+    RUN_TEST(test_handleSetConfig_security_weakFullCandidatePreservesIdentity);
+    RUN_TEST(test_handleSetConfig_security_mismatchedPairPreservesIdentity);
     RUN_TEST(test_handleSetConfig_security_blacklistedMintLeavesNoKey);
     RUN_TEST(test_handleSetConfig_firstRegionIdentityFailureRollsBackAndRepliesBadRequest);
     RUN_TEST(test_handleSetOwner_licensingIdentityFailureRollsBackAndRepliesBadRequest);

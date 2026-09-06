@@ -89,6 +89,45 @@ int main(){
 for label,flags in [('standard',('-DHELTEC_V4_OLED=1',)),('solar',('-DHELTEC_V4_OLED=1','-DHELTEC_V4_SOLAR_ROUTER_PROFILE=1'))]:
     build_run(f'sx1262_{label}',sx_prefix+sx_methods+sx_tests,flags)
 
+# Exercise the actual FEM conversion together with RadioInterface's normalization boundary.
+fem_prefix = r'''
+#include <cassert>
+#include <cstdint>
+#define HAS_LORA_FEM 1
+#define HELTEC_V4 1
+#define LOG_INFO(...) ((void)0)
+struct LoRaFEMInterface { enum Type {NONE,GC1109_PA,KCT8103L_PA}; Type fem_type=KCT8103L_PA;
+ int8_t powerConversion(int8_t); } loraFEMInterface;
+struct {struct {bool is_licensed=false;} owner;} devicestate;
+struct Region {uint8_t powerLimit=30;} region;
+struct RadioInterface {int8_t power=0,requestedPower=0; Region* myRegion=&region; void limitPower(int8_t);};
+'''
+fem_impl = body('src/mesh/LoRaFEMInterface.cpp','int8_t LoRaFEMInterface::powerConversion(') + '\n' + body(
+    'src/mesh/RadioInterface.cpp','void RadioInterface::limitPower(')
+fem_tests = r'''
+int main(){
+ RadioInterface r;
+ for(auto fem: {LoRaFEMInterface::GC1109_PA,LoRaFEMInterface::KCT8103L_PA}) {
+  loraFEMInterface.fem_type=fem;
+  for(int limit=10;limit<=30;++limit) {
+   region.powerLimit=limit;
+   for(int request=-9;request<=30;++request) {
+    r.requestedPower=request; r.power=request;
+    r.limitPower(22); const int expected=r.power;
+    for(int recovery=0;recovery<20;++recovery) {r.limitPower(22);assert(r.power==expected);assert(r.requestedPower==request);}
+   }
+  }
+ }
+ region.powerLimit=30; loraFEMInterface.fem_type=LoRaFEMInterface::KCT8103L_PA;
+ r.requestedPower=30; r.limitPower(22);assert(r.power==22);
+ r.requestedPower=22; r.limitPower(22);assert(r.power==9);r.limitPower(22);assert(r.power==9);
+ devicestate.owner.is_licensed=true;r.requestedPower=30;r.limitPower(22);assert(r.power==22);
+ loraFEMInterface.fem_type=LoRaFEMInterface::NONE;devicestate.owner.is_licensed=false;
+ r.requestedPower=20;region.powerLimit=17;r.limitPower(22);assert(r.power==17);
+}
+'''
+build_run('fem_recovery_idempotence','#include <initializer_list>\n'+fem_prefix+fem_impl+fem_tests)
+
 mqtt_src = (ROOT/'src/mqtt/MQTT.cpp').read_text()
 start=mqtt_src.index('static MqttAckHistory mqttAckHistory;')
 end=mqtt_src.index('inline bool shouldDropMqttDownlink',start)

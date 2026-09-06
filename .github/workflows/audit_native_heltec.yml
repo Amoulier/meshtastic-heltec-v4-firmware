@@ -24,7 +24,9 @@ jobs:
         with:
           repository: meshtastic/firmware
           ref: 7239fe886a30fa13cd35946fa5ae1a46a2807eeb
-          sparse-checkout: variants/native
+          sparse-checkout: |
+            variants/native
+            src/platform/portduino
           path: _native_fixture
           persist-credentials: false
       - name: Install test-only native configuration without replacing fork source
@@ -34,6 +36,10 @@ jobs:
           mkdir -p variants/native
           cp _native_fixture/variants/native/portduino.ini variants/native/
           cp -a _native_fixture/variants/native/portduino variants/native/
+          # This fork omits non-Heltec host adapters. Restore only the absent,
+          # pinned CI adapter; never replace any maintained firmware source.
+          test ! -e src/platform/portduino
+          cp -a _native_fixture/src/platform/portduino src/platform/
           python3 - <<'PY'
           from pathlib import Path
           import re

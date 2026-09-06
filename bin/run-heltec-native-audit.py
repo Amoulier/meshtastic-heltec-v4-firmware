@@ -22,6 +22,15 @@ xml.unlink(missing_ok=True)
 args = ['pio', 'test', '-e', 'coverage', '-v', '--junit-output-path', str(xml)]
 for suite in suites:
     args += ['-f', suite]
+# Compile one complete suite first, so a broken host adapter fails once rather
+# than repeating the same compilation error 25 times. This does not count as a
+# test pass: every suite is still built and executed by the full command below.
+smoke = ['pio', 'test', '-e', 'coverage', '-f', 'test_module_config', '--without-testing', '-v']
+with (report / 'native-preflight.log').open('w') as log:
+    preflight = subprocess.run(smoke, stdout=log, stderr=subprocess.STDOUT)
+if preflight.returncode:
+    print((report / 'native-preflight.log').read_text()[-18000:])
+    raise SystemExit(preflight.returncode)
 with (report / 'native.log').open('w') as log:
     result = subprocess.run(args, stdout=log, stderr=subprocess.STDOUT)
 if result.returncode:
