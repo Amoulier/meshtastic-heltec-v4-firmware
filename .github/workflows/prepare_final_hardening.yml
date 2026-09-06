@@ -1,0 +1,57 @@
+name: Prepare final Heltec hardening
+on:
+  push:
+    branches: ["audit-helper/heltec-native-repairs"]
+    paths: [".github/workflows/prepare_final_hardening.yml"]
+permissions:
+  contents: write
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 042116c3c9a03bf2f0b8be782f32874574431585
+          persist-credentials: false
+      - name: Apply exact reviewed patch and test production paths
+        run: |
+          python3 - <<'PY'
+          import base64,gzip,hashlib,subprocess
+          from pathlib import Path
+          encoded='''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'''
+          patch=gzip.decompress(base64.b64decode(encoded,validate=True))
+          assert hashlib.sha256(patch).hexdigest()=='d78ea2d40c8c85dac87f393fbfe25820a94eb3c5fcc36dc13a7fae2400361f60'
+          Path('/tmp/final.patch').write_bytes(patch)
+          subprocess.run(['git','apply','--check','/tmp/final.patch'],check=True)
+          subprocess.run(['git','apply','/tmp/final.patch'],check=True)
+          PY
+          python3 test/host/heltec_audit_regression.py
+          python3 test/host/heltec_release_policy_test.py
+          git diff --check
+      - name: Store verified blobs without moving branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64,hashlib,json,os,subprocess,urllib.request
+          from pathlib import Path
+          paths=subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
+          assert len(paths)==7,paths
+          entries=[]
+          for path in paths:
+              content=Path(path).read_bytes()
+              expected=hashlib.sha1(b'blob '+str(len(content)).encode()+b'\0'+content).hexdigest()
+              req=urllib.request.Request('https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/git/blobs',
+                  data=json.dumps({'encoding':'base64','content':base64.b64encode(content).decode()}).encode(),
+                  headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'},method='POST')
+              with urllib.request.urlopen(req,timeout=60) as response: blob=json.load(response)
+              assert blob['sha']==expected
+              entries.append({'path':path,'mode':'100644','type':'blob','sha':expected})
+          print(json.dumps(entries,indent=2))
+          Path('/tmp/final-blobs.json').write_text(json.dumps(entries,indent=2))
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: final-hardening-blobs
+          path: /tmp/final-blobs.json
+          if-no-files-found: error
