@@ -9,8 +9,8 @@
 // validation, NAK/retransmit, CAN cleanup, EOT close, and the getForPhone()/resetForPhone()
 // contract PhoneAPI uses to drain replies. PhoneAPI feeds handlePacket attacker-controllable
 // ToRadio protobufs, and none of this had pinning coverage. These tests assert what the code does
-// today; the two tests marked "documents current behaviour" pin known state-confusion edges so a
-// deliberate fix has to update them consciously.
+// today, including state-confusion regressions: completed uploads and download sources must
+// survive cancellation, and a misplaced EOT cannot acknowledge or wedge a download.
 #include "TestUtil.h"
 #include "xmodem.h"
 #include <unity.h>
@@ -308,23 +308,20 @@ void test_xmodem_can_mid_receive_removes_the_file(void)
     TEST_ASSERT_FALSE(FSCom.exists(kRxPath));
 }
 
-void test_xmodem_can_after_eot_removes_completed_file(void)
+void test_xmodem_can_after_eot_preserves_completed_file(void)
 {
-    // Documents current behaviour: the CAN handler acts on the stale filename from the previous
-    // session even when no transfer is in flight, deleting a file that completed successfully.
-    // A deliberate fix (ignoring CAN while idle) should update this test.
-    uint8_t payload[8];
+    uint8_t payload[8], readback[8];
     fillPattern(payload, sizeof(payload), 5);
-
     startReceive();
     xm->handlePacket(makeData(1, payload, sizeof(payload)));
     xm->handlePacket(makeControl(meshtastic_XModem_Control_EOT));
     TEST_ASSERT_FALSE(xm->isBusy());
-    TEST_ASSERT_TRUE(FSCom.exists(kRxPath));
-
     xm->handlePacket(makeControl(meshtastic_XModem_Control_CAN));
     TEST_ASSERT_EQUAL(meshtastic_XModem_Control_ACK, xm->getForPhone().control);
-    TEST_ASSERT_FALSE(FSCom.exists(kRxPath));
+    TEST_ASSERT_FALSE(xm->isBusy());
+    TEST_ASSERT_TRUE(FSCom.exists(kRxPath));
+    TEST_ASSERT_EQUAL_size_t(sizeof(payload), readAll(kRxPath, readback, sizeof(readback)));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(payload, readback, sizeof(payload));
 }
 
 // --- Transmit path ---
@@ -428,18 +425,25 @@ void test_xmodem_soh_mid_transmit_cancels(void)
     TEST_ASSERT_FALSE(xm->isBusy());
 }
 
-void test_xmodem_eot_mid_transmit_leaves_state_busy(void)
+void test_xmodem_eot_mid_transmit_rejects_and_resumes(void)
 {
-    // Documents current behaviour: the EOT handler only clears isReceiving, so an EOT received
-    // while transmitting ACKs, closes the file, and leaves the adapter wedged busy. A deliberate
-    // fix should update this test.
-    uint8_t payload[300];
+    uint8_t payload[300], readback[300];
     fillPattern(payload, sizeof(payload), 13);
-
     startTransmit(payload, sizeof(payload));
     xm->handlePacket(makeControl(meshtastic_XModem_Control_EOT));
-    TEST_ASSERT_EQUAL(meshtastic_XModem_Control_ACK, xm->getForPhone().control);
+    TEST_ASSERT_EQUAL(meshtastic_XModem_Control_NAK, xm->getForPhone().control);
     TEST_ASSERT_TRUE(xm->isBusy());
+    // Rejection leaves the valid sending session and its file offset intact.
+    xm->handlePacket(makeControl(meshtastic_XModem_Control_ACK));
+    meshtastic_XModem next = xm->getForPhone();
+    TEST_ASSERT_EQUAL(meshtastic_XModem_Control_SOH, next.control);
+    TEST_ASSERT_EQUAL_UINT16(2, next.seq);
+    TEST_ASSERT_EQUAL_UINT16(kChunk, next.buffer.size);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(payload + kChunk, next.buffer.bytes, kChunk);
+    xm->handlePacket(makeControl(meshtastic_XModem_Control_CAN));
+    TEST_ASSERT_FALSE(xm->isBusy());
+    TEST_ASSERT_EQUAL_size_t(sizeof(payload), readAll(kTxPath, readback, sizeof(readback)));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(payload, readback, sizeof(payload));
 }
 
 // --- Idle replies and the getForPhone/resetForPhone contract ---
@@ -518,7 +522,7 @@ void setup()
     RUN_TEST(test_xmodem_receive_rejects_bad_crc);
     RUN_TEST(test_xmodem_receive_naks_traversal_filename);
     RUN_TEST(test_xmodem_can_mid_receive_removes_the_file);
-    RUN_TEST(test_xmodem_can_after_eot_removes_completed_file);
+    RUN_TEST(test_xmodem_can_after_eot_preserves_completed_file);
 
     printf("\n=== Transmit path ===\n");
     RUN_TEST(test_xmodem_transmit_happy_path);
@@ -526,7 +530,7 @@ void setup()
     RUN_TEST(test_xmodem_transmit_retry_cap_cancels);
     RUN_TEST(test_xmodem_transmit_naks_missing_file);
     RUN_TEST(test_xmodem_soh_mid_transmit_cancels);
-    RUN_TEST(test_xmodem_eot_mid_transmit_leaves_state_busy);
+    RUN_TEST(test_xmodem_eot_mid_transmit_rejects_and_resumes);
 
     printf("\n=== Idle replies / phone contract ===\n");
     RUN_TEST(test_xmodem_ack_nak_while_idle_provoke_can);

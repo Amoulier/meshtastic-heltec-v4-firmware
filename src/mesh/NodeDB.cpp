@@ -16,6 +16,7 @@
 #include "PowerFSM.h"
 #include "PowerStatus.h"
 #include "RadioInterface.h"
+#include "PreferenceRecoveryPolicy.h"
 #include "Router.h"
 #include "SPILock.h"
 #include "SafeFile.h"
@@ -141,7 +142,7 @@ meshtastic_ChannelFile channelFile;
 
 static void forceHeltecLocalRecoveryConfiguration()
 {
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
     config.lora.tx_enabled = false;
     config.position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_DISABLED;
@@ -600,7 +601,7 @@ NodeDB::NodeDB()
         && !encryptedStorageLockedPlaceholder
 #endif
     ) {
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
         const size_t privateKeySize = config.security.private_key.size;
         const size_t configPublicKeySize = config.security.public_key.size;
         const size_t ownerPublicKeySize = owner.public_key.size;
@@ -3880,7 +3881,7 @@ void NodeDB::loadFromDisk()
     // temporary) remains, defaulting a missing config/channel could silently
     // replace identity or transmit on the public default PSK.
     bool persistedCoreGenerationPresent = false;
-#if defined(HELTEC_V4_OLED) && defined(FSCom)
+#if HAS_STRICT_PREFERENCE_RECOVERY && defined(FSCom)
     bool nodeDatabaseMissingFromPersistedGeneration = false;
 #endif
 #if USERPREFS_EVENT_MODE
@@ -3889,7 +3890,7 @@ void NodeDB::loadFromDisk()
     // combinations are a torn generation and remain fail-closed.
     bool eventProfileFirstUse = false;
 #endif
-#if defined(HELTEC_V4_OLED) && defined(FSCom)
+#if HAS_STRICT_PREFERENCE_RECOVERY && defined(FSCom)
     {
         concurrency::LockGuard guard(spiLock);
         const auto activeFileExists = [](const char *path) { return FSCom.exists(path); };
@@ -4218,7 +4219,7 @@ void NodeDB::loadFromDisk()
 
     auto state = loadProto(nodeDatabaseFileName, getMaxNodesAllocatedSize(), sizeof(meshtastic_NodeDatabase),
                            &meshtastic_NodeDatabase_msg, &nodeDatabase);
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     const bool nodeDatabaseVersionTooNew = state == LoadFileResult::LOAD_SUCCESS && nodeDatabase.version > DEVICESTATE_CUR_VER;
 #else
     const bool nodeDatabaseVersionTooNew = false;
@@ -4226,7 +4227,7 @@ void NodeDB::loadFromDisk()
     if (state == LoadFileResult::DECODE_FAILED || state == LoadFileResult::OTHER_FAILURE) {
         unreadablePreferenceSegments |= SEGMENT_NODEDATABASE;
     }
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     if (nodeDatabaseVersionTooNew) {
         unreadablePreferenceSegments |= SEGMENT_NODEDATABASE;
         LOG_ERROR("Node database version %u is newer than supported %u; preserve file without downgrade",
@@ -4290,7 +4291,7 @@ void NodeDB::loadFromDisk()
     state = loadProto(deviceStateFileName, meshtastic_DeviceState_size, sizeof(meshtastic_DeviceState),
                       &meshtastic_DeviceState_msg, &devicestate);
 
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     const bool deviceStateVersionTooNew = state == LoadFileResult::LOAD_SUCCESS && devicestate.version > DEVICESTATE_CUR_VER;
 #else
     const bool deviceStateVersionTooNew = false;
@@ -4299,7 +4300,7 @@ void NodeDB::loadFromDisk()
     if (state == LoadFileResult::DECODE_FAILED || state == LoadFileResult::OTHER_FAILURE) {
         unreadablePreferenceSegments |= SEGMENT_DEVICESTATE;
     }
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     if (deviceStateVersionTooNew) {
         unreadablePreferenceSegments |= SEGMENT_DEVICESTATE;
         configDecodeFailed = true;
@@ -4307,7 +4308,7 @@ void NodeDB::loadFromDisk()
                   static_cast<unsigned>(devicestate.version), static_cast<unsigned>(DEVICESTATE_CUR_VER));
     }
 #endif
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     if (state == LoadFileResult::NOT_FOUND && persistedCoreGenerationPresent) {
         unreadablePreferenceSegments |= SEGMENT_DEVICESTATE;
         configDecodeFailed = true;
@@ -4355,7 +4356,7 @@ void NodeDB::loadFromDisk()
     state = loadProto(configFileName, meshtastic_LocalConfig_size, sizeof(meshtastic_LocalConfig), &meshtastic_LocalConfig_msg,
                       &config);
 #if USERPREFS_EVENT_MODE
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     if (canSeedEventProfile(eventProfileFirstUse, !eventProfileStorageUnavailable) && state != LoadFileResult::LOAD_SUCCESS) {
 #else
     if (eventConfigMissing && state != LoadFileResult::LOAD_SUCCESS) {
@@ -4386,7 +4387,7 @@ void NodeDB::loadFromDisk()
     }
 #endif
     const bool loadedValidPrivateKey = config.has_security && config.security.private_key.size == 32;
-#if defined(HELTEC_V4_OLED) && defined(FSCom)
+#if HAS_STRICT_PREFERENCE_RECOVERY && defined(FSCom)
     const bool persistedIdentityNeedsNodeDatabase = persistedIdentityRequiresNodeDatabase(
         config.has_security ? config.security.private_key.size : 0, config.has_security ? config.security.public_key.size : 0,
         owner.public_key.size, owner.is_licensed);
@@ -4414,7 +4415,7 @@ void NodeDB::loadFromDisk()
     const bool invalidLoadedRegionPolicy = state == LoadFileResult::LOAD_SUCCESS && config.has_lora &&
                                            config.lora.region != meshtastic_Config_LoRaConfig_RegionCode_UA_868 &&
                                            !RadioInterface::checkConfigRegion(config.lora);
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     const bool configVersionTooNew = state == LoadFileResult::LOAD_SUCCESS && config.version > DEVICESTATE_CUR_VER;
 #else
     const bool configVersionTooNew = false;
@@ -4447,7 +4448,7 @@ void NodeDB::loadFromDisk()
     } else {
         LOG_INFO("Loaded saved config v%d", config.version);
     }
-#if defined(HELTEC_V4_OLED) && defined(FSCom)
+#if HAS_STRICT_PREFERENCE_RECOVERY && defined(FSCom)
     if (nodeDatabaseMissingFromPersistedGeneration &&
         persistedIdentityNeedsNodeDatabase) {
         unreadablePreferenceSegments |= SEGMENT_NODEDATABASE;
@@ -4558,7 +4559,7 @@ void NodeDB::loadFromDisk()
 
     state = loadProto(moduleConfigFileName, meshtastic_LocalModuleConfig_size, sizeof(meshtastic_LocalModuleConfig),
                       &meshtastic_LocalModuleConfig_msg, &moduleConfig);
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     const bool moduleConfigVersionTooNew =
         state == LoadFileResult::LOAD_SUCCESS && moduleConfig.version > POSITION_TELEMETRY_OPTIN_VER;
 #else
@@ -4567,7 +4568,7 @@ void NodeDB::loadFromDisk()
     if (state == LoadFileResult::DECODE_FAILED || state == LoadFileResult::OTHER_FAILURE) {
         unreadablePreferenceSegments |= SEGMENT_MODULECONFIG;
     }
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     if (moduleConfigVersionTooNew) {
         unreadablePreferenceSegments |= SEGMENT_MODULECONFIG;
         configDecodeFailed = true;
@@ -4603,7 +4604,7 @@ void NodeDB::loadFromDisk()
 
     state = loadProto(channelFileName, meshtastic_ChannelFile_size, sizeof(meshtastic_ChannelFile), &meshtastic_ChannelFile_msg,
                       &channelFile);
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     const bool channelVersionTooNew = state == LoadFileResult::LOAD_SUCCESS && channelFile.version > POSITION_TELEMETRY_OPTIN_VER;
 #else
     const bool channelVersionTooNew = false;
@@ -4627,7 +4628,7 @@ void NodeDB::loadFromDisk()
         LOG_ERROR("Channel version is newer than supported; preserve future profile and disable radio");
     } else if (state != LoadFileResult::LOAD_SUCCESS) {
         installDefaultChannels(); // Safe only on an actually empty first boot.
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
         const bool expectedMissingEventChannels =
 #if USERPREFS_EVENT_MODE
             canInitializeMissingEventChannels(eventProfileFirstUse, initializedEventConfig, state == LoadFileResult::NOT_FOUND);
@@ -4643,7 +4644,7 @@ void NodeDB::loadFromDisk()
         }
 #endif
     } else {
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
         if (!isCompleteChannelFile(channelFile)) {
             // A syntactically valid but truncated channel file is still an
             // identity/radio-profile failure. Do not let resetRadioConfig()
@@ -4805,7 +4806,7 @@ void NodeDB::loadFromDisk()
         LOG_WARN("Licensed operation removed persisted channel encryption/admin access");
         saveToDisk(SEGMENT_CHANNELS);
     }
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     if (incompleteConfigResetDetected)
         configDecodeFailed = true;
     if (requiresConfigRecovery())
@@ -5051,14 +5052,20 @@ bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_
     }
 
     const int preferenceSegment = preferenceSegmentForFile(filename);
+#if HAS_STRICT_PREFERENCE_RECOVERY
 #if defined(HELTEC_V4_OLED)
     const bool authorizedRecoveryWriter =
         destructiveStorageMutationActive.load(std::memory_order_acquire) &&
         destructiveStorageOwnerTask.load(std::memory_order_acquire) == reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+#else
+    constexpr bool authorizedRecoveryWriter = false;
+#endif
     if (preferenceSegment != 0 && requiresConfigRecovery() && !authorizedRecoveryWriter) {
         LOG_ERROR("NodeDB: refusing core write while another segment requires recovery: %s", filename);
         return false;
     }
+#endif
+#if defined(HELTEC_V4_OLED)
     if (preferenceSegment != 0 && !preferenceWriteAllowedDuringEdit()) {
         LOG_WARN("NodeDB: defer external preference write during settings edit: %s", filename);
         return false;
@@ -5248,9 +5255,15 @@ bool NodeDB::saveNodeDatabaseToDisk()
     PreferenceStorageWriteGuard storageWrite(*this);
     if (!storageWrite)
         return false;
+#endif
+#if HAS_STRICT_PREFERENCE_RECOVERY
+#if defined(HELTEC_V4_OLED)
     const bool authorizedRecoveryWriter =
         destructiveStorageMutationActive.load(std::memory_order_acquire) &&
         destructiveStorageOwnerTask.load(std::memory_order_acquire) == reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+#else
+    constexpr bool authorizedRecoveryWriter = false;
+#endif
     if ((requiresConfigRecovery() || (unreadablePreferenceSegments & SEGMENT_NODEDATABASE) != 0) && !authorizedRecoveryWriter) {
         // Return before projecting satellite maps or flushing warm.dat. A
         // corrupt/missing node generation must remain byte-for-byte available
@@ -5258,6 +5271,8 @@ bool NodeDB::saveNodeDatabaseToDisk()
         LOG_WARN("NodeDB: reject node/warm save while persisted generation requires recovery");
         return false;
     }
+#endif
+#if defined(HELTEC_V4_OLED)
 #if defined(FSCom)
     if (incompleteNodeDatabaseResetDetected && !(destructiveStorageMutationActive.load(std::memory_order_acquire) &&
                                                  destructiveStorageOwnerTask.load(std::memory_order_acquire) ==
@@ -5541,30 +5556,47 @@ bool NodeDB::saveToDisk(int saveWhat)
 {
     LOG_DEBUG("Save to disk %d", saveWhat);
 
-#if defined(HELTEC_V4_OLED)
+#if HAS_STRICT_PREFERENCE_RECOVERY
     if (shouldDeferBootPersistence(bootInitializationInProgress, configLoadComplete, configDecodeFailed)) {
         bootDeferredPreferenceSegments |= saveWhat;
         LOG_DEBUG("NodeDB: defer core save 0x%x until complete boot scan", saveWhat);
         return true;
     }
+#endif
+#if defined(HELTEC_V4_OLED)
     PreferenceStorageWriteGuard storageWrite(*this);
     if (!storageWrite) {
         LOG_WARN("NodeDB: reject save during destructive storage mutation");
         return false;
     }
+#endif
+#if HAS_STRICT_PREFERENCE_RECOVERY
+#if defined(HELTEC_V4_OLED)
     const bool authorizedRecoveryWriter =
         destructiveStorageMutationActive.load(std::memory_order_acquire) &&
         destructiveStorageOwnerTask.load(std::memory_order_acquire) == reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+#else
+    constexpr bool authorizedRecoveryWriter = false;
+#endif
     if (requiresConfigRecovery() && !authorizedRecoveryWriter) {
         LOG_WARN("NodeDB: reject automatic/core save while configuration recovery is required");
         return false;
     }
+#endif
+#if defined(HELTEC_V4_OLED)
     if (!preferenceWriteAllowedDuringEdit()) {
         LOG_WARN("NodeDB: reject external save while a settings edit is open");
         return false;
     }
 #endif
 
+    // This is a known read-only rejection, not a failed flash operation. The
+    // lower saveProto() boundary rejects it too; do not retry or record a
+    // spurious FLASH_CORRUPTION error (which terminates a native audit).
+    if ((unreadablePreferenceSegments & saveWhat) != 0) {
+        LOG_WARN("NodeDB: reject save of an unreadable preference segment");
+        return false;
+    }
     if (!shouldUseFilesystemPersistence(fsIsMounted())) {
         LOG_ERROR("NodeDB: refusing preference write while filesystem is unavailable");
 #if defined(HELTEC_V4_OLED)

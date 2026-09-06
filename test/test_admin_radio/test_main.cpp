@@ -20,6 +20,7 @@
 #include "RadioInterface.h"
 #include "TestUtil.h"
 #include "graphics/draw/MenuHandler.h"
+#include "main.h"
 #include "mesh/Channels.h"
 #include "mesh/CryptoEngine.h" // crypto global: the tests swap in a stub engine to drive key derivation
 #include "mesh/Default.h"
@@ -1027,6 +1028,9 @@ static meshtastic_DeviceState savedDeviceState;
 static meshtastic_User savedOwner;
 static meshtastic_LocalConfig savedConfig;
 static meshtastic_ChannelFile savedChannelFile;
+static meshtastic_LocalModuleConfig savedModuleConfig;
+static uint32_t savedRebootAtMsec;
+static uint32_t savedShutdownAtMsec;
 // Only the ham dispatcher test installs a router (allocErrorResponse()
 // allocates through it). Saved/torn down for every test so a failed assertion's
 // longjmp cannot leave one dangling.
@@ -1046,6 +1050,12 @@ static void replaceAdminRadioGlobals()
     savedOwner = owner;
     savedConfig = config;
     savedChannelFile = channelFile;
+    savedModuleConfig = moduleConfig;
+    savedRebootAtMsec = rebootAtMsec;
+    savedShutdownAtMsec = shutdownAtMsec;
+    // A scheduled lifecycle transition belongs to one test, not the next.
+    rebootAtMsec = 0;
+    shutdownAtMsec = 0;
     replacementNodeDB = new NodeDB();
     nodeDB = replacementNodeDB;
 }
@@ -1053,6 +1063,7 @@ static void replaceAdminRadioGlobals()
 // Defined with the crypto stub below; tearDown must undo an install even when a
 // failed assertion longjmped out of the test body before it could.
 static void dropRestoreCryptoStub();
+static void dropConfigChangedCounter();
 
 static void restoreAdminRadioGlobals()
 {
@@ -1068,6 +1079,9 @@ static void restoreAdminRadioGlobals()
     owner = savedOwner;
     config = savedConfig;
     channelFile = savedChannelFile;
+    moduleConfig = savedModuleConfig;
+    rebootAtMsec = savedRebootAtMsec;
+    shutdownAtMsec = savedShutdownAtMsec;
     if (crypto)
         crypto->restoreIdentity(config.security.private_key.size == 32 ? config.security.private_key.bytes : nullptr);
     initRegion();
@@ -1389,14 +1403,15 @@ static void test_bootDefense_sanitizesStaleLicensedChannelsOnce()
 
 static void test_restorePreferences_sanitizesLicensedBackupBeforeReturn()
 {
-    NodeDB *savedNodeDB = nodeDB;
-    nodeDB = new NodeDB();
-    const meshtastic_DeviceState savedDeviceState = devicestate;
-    const meshtastic_ChannelFile savedChannelFile = channelFile;
-
-    owner = meshtastic_User_init_zero;
+    // Use the fixture-owned database/router so Unity longjmp cannot leak them.
+    // Restore validates and installs a key under the same crypto lock as boot.
+    hamMockRouter = new HamModeMockRouter();
+    router = hamMockRouter;
     owner.is_licensed = true;
     installEncryptedAndAdminChannels();
+    const auto priorPrivateKey = config.security.private_key;
+    const auto priorPublicKey = config.security.public_key;
+    const NodeNum priorNodeNum = nodeDB->getNodeNum();
     TEST_ASSERT_TRUE(nodeDB->backupPreferences(meshtastic_AdminMessage_BackupLocation_FLASH));
 
     owner.is_licensed = false;
@@ -1406,13 +1421,10 @@ static void test_restorePreferences_sanitizesLicensedBackupBeforeReturn()
     TEST_ASSERT_TRUE(owner.is_licensed);
     assertLicensedChannelsSanitized();
     TEST_ASSERT_FALSE_MESSAGE(channels.ensureLicensedOperation(), "restored licensed channels must remain sanitized");
-
-    devicestate = savedDeviceState;
-    channelFile = savedChannelFile;
-    nodeDB->saveToDisk(SEGMENT_DEVICESTATE | SEGMENT_CHANNELS);
-    FSCom.remove(backupFileName);
-    delete nodeDB;
-    nodeDB = savedNodeDB;
+    TEST_ASSERT_EQUAL_UINT32(priorNodeNum, nodeDB->getNodeNum());
+    TEST_ASSERT_EQUAL_MEMORY(priorPrivateKey.bytes, config.security.private_key.bytes, 32);
+    TEST_ASSERT_EQUAL_MEMORY(priorPublicKey.bytes, owner.public_key.bytes, 32);
+    TEST_ASSERT_TRUE(FSCom.remove(backupFileName));
 }
 
 static meshtastic_Config makeLoraSetConfig(meshtastic_Config_LoRaConfig_RegionCode region, bool usePreset,
@@ -2733,7 +2745,16 @@ static void sendAdmin(meshtastic_AdminMessage &m)
     mp.from = 0;
     mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag; // required: handler drops non-decoded
                                                                   // packets
+    testAdmin->drainReply();
     testAdmin->handleReceivedProtobuf(mp, &m);
+    // These helpers model successful requests. Do not let an unexpected
+    // rejection masquerade as a clean "no warning" result.
+    if (testAdmin->reply() && testAdmin->reply()->decoded.portnum == meshtastic_PortNum_ROUTING_APP) {
+        meshtastic_Routing_Error err = meshtastic_Routing_Error_BAD_REQUEST;
+        TEST_ASSERT_TRUE(decodeRoutingError(testAdmin->reply(), err));
+        TEST_ASSERT_EQUAL(meshtastic_Routing_Error_NONE, err);
+    }
+    testAdmin->drainReply();
 }
 
 static void sendSetChannel(const meshtastic_Channel &ch)
@@ -2781,6 +2802,30 @@ static void usePresetLongFast()
     config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
     initRegion();
     owner.is_licensed = false;
+}
+
+static void test_pendingLifecycle_rejectsMutationWithoutChangingChannel()
+{
+    usePresetLongFast();
+    const meshtastic_Channel before = channels.getByIndex(0);
+    meshtastic_AdminMessage message = meshtastic_AdminMessage_init_zero;
+    message.which_payload_variant = meshtastic_AdminMessage_set_channel_tag;
+    message.set_channel = makeChannel(0, meshtastic_Channel_Role_PRIMARY, "blocked", DEFAULT_KEY, 1);
+    meshtastic_MeshPacket packet = meshtastic_MeshPacket_init_zero;
+    packet.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    packet.decoded.want_response = true;
+    for (bool shutdown : {false, true}) {
+        rebootAtMsec = shutdown ? 0 : millis() + 10000;
+        shutdownAtMsec = shutdown ? millis() + 10000 : 0;
+        testAdmin->handleReceivedProtobuf(packet, &message);
+        meshtastic_Routing_Error err = meshtastic_Routing_Error_NONE;
+        TEST_ASSERT_TRUE(decodeRoutingError(testAdmin->reply(), err));
+        TEST_ASSERT_EQUAL(meshtastic_Routing_Error_BAD_REQUEST, err);
+        TEST_ASSERT_EQUAL_STRING(before.settings.name, channels.getByIndex(0).settings.name);
+        TEST_ASSERT_EQUAL_MEMORY(before.settings.psk.bytes, channels.getByIndex(0).settings.psk.bytes,
+                                 before.settings.psk.size);
+        testAdmin->drainReply();
+    }
 }
 
 static void test_warn_singleChannel_variantName_oneSpecificMessage()
@@ -2950,13 +2995,27 @@ class ConfigChangedCounter : public Observer<void *>
     }
 };
 
+// Heap-owned by tearDown: Unity assertions use longjmp, which skips C++
+// stack destructors and would leave a registered stack observer dangling.
+static ConfigChangedCounter *activeConfigChangedCounter = nullptr;
+static ConfigChangedCounter &installConfigChangedCounter()
+{
+    activeConfigChangedCounter = new ConfigChangedCounter();
+    activeConfigChangedCounter->observe(&service->configChanged);
+    return *activeConfigChangedCounter;
+}
+static void dropConfigChangedCounter()
+{
+    delete activeConfigChangedCounter;
+    activeConfigChangedCounter = nullptr;
+}
+
 static const NodeNum TEST_NODE_NUM = 0x12345678;
 
 static void test_setFavoriteNode_skipsRadioReload_butPersists()
 {
     nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
-    ConfigChangedCounter counter;
-    counter.observe(&service->configChanged);
+    ConfigChangedCounter &counter = installConfigChangedCounter();
 
     meshtastic_AdminMessage m = meshtastic_AdminMessage_init_zero;
     m.which_payload_variant = meshtastic_AdminMessage_set_favorite_node_tag;
@@ -2970,8 +3029,7 @@ static void test_setFavoriteNode_skipsRadioReload_butPersists()
 static void test_setIgnoredNode_skipsRadioReload_butPersists()
 {
     nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
-    ConfigChangedCounter counter;
-    counter.observe(&service->configChanged);
+    ConfigChangedCounter &counter = installConfigChangedCounter();
 
     meshtastic_AdminMessage m = meshtastic_AdminMessage_init_zero;
     m.which_payload_variant = meshtastic_AdminMessage_set_ignored_node_tag;
@@ -2985,8 +3043,7 @@ static void test_setIgnoredNode_skipsRadioReload_butPersists()
 static void test_toggleMutedNode_skipsRadioReload_butPersists()
 {
     nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
-    ConfigChangedCounter counter;
-    counter.observe(&service->configChanged);
+    ConfigChangedCounter &counter = installConfigChangedCounter();
 
     meshtastic_AdminMessage m = meshtastic_AdminMessage_init_zero;
     m.which_payload_variant = meshtastic_AdminMessage_toggle_muted_node_tag;
@@ -3009,8 +3066,7 @@ static void test_toggleMutedNode_skipsRadioReload_butPersists()
 static void test_toggleNodeMuted_flipsBitAndSkipsRadioReload()
 {
     nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
-    ConfigChangedCounter counter;
-    counter.observe(&service->configChanged);
+    ConfigChangedCounter &counter = installConfigChangedCounter();
 
     graphics::menuHandler::toggleNodeMuted(TEST_NODE_NUM);
     TEST_ASSERT_TRUE(nodeInfoLiteIsMuted(nodeDB->getMeshNode(TEST_NODE_NUM)));
@@ -3023,8 +3079,7 @@ static void test_toggleNodeMuted_flipsBitAndSkipsRadioReload()
 
 static void test_toggleNodeMuted_unknownNodeDoesNothing()
 {
-    ConfigChangedCounter counter;
-    counter.observe(&service->configChanged);
+    ConfigChangedCounter &counter = installConfigChangedCounter();
 
     graphics::menuHandler::toggleNodeMuted(0xDEADBEEF); // never added to the DB
 
@@ -3032,27 +3087,37 @@ static void test_toggleNodeMuted_unknownNodeDoesNothing()
     TEST_ASSERT_NULL(nodeDB->getMeshNode(0xDEADBEEF));
 }
 
-// CHARACTERIZATION OF A KNOWN DEFECT, not an endorsement. Flipping one
-// NodeInfoLite bit currently calls bare nodeDB->saveToDisk(), which rewrites
-// all five segments. saveToDisk() is not virtual, so the mask is observed
-// through its effect: every prefs file reappears after being removed.
-//
-// A pending fix narrows this to SEGMENT_NODEDATABASE. When it lands, only
-// nodes.proto should come back and this assertion is EXPECTED to change - that
-// diff is the point, so the improvement is visible instead of silent.
-static void test_toggleNodeMuted_currentlyRewritesEverySegment()
+// A node metadata edit must not rewrite identity, channels or module settings.
+static void test_toggleNodeMuted_persistsOnlyNodeDatabase()
 {
-    nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
-
-    const char *segmentFiles[] = {configFileName, moduleConfigFileName, deviceStateFileName, channelFileName,
-                                  nodeDatabaseFileName};
-    for (const char *f : segmentFiles)
-        FSCom.remove(f);
+    auto *node = nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
+    TEST_ASSERT_NOT_NULL(node);
+    nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_HAS_USER_MASK, true);
+    TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE |
+                                       SEGMENT_CHANNELS | SEGMENT_NODEDATABASE));
+    const char *otherFiles[] = {configFileName, moduleConfigFileName, deviceStateFileName, channelFileName};
+    std::vector<std::string> before;
+    const auto readBytes = [](const char *path) {
+        File file = FSCom.open(path, FILE_O_READ);
+        std::string bytes;
+        while (file && file.available())
+            bytes.push_back(static_cast<char>(file.read()));
+        file.close();
+        return bytes;
+    };
+    for (const char *path : otherFiles) {
+        TEST_ASSERT_TRUE_MESSAGE(FSCom.exists(path), path);
+        before.push_back(readBytes(path));
+    }
+    TEST_ASSERT_TRUE(FSCom.remove(nodeDatabaseFileName));
 
     graphics::menuHandler::toggleNodeMuted(TEST_NODE_NUM);
-
-    for (const char *f : segmentFiles)
-        TEST_ASSERT_TRUE_MESSAGE(FSCom.exists(f), f);
+    TEST_ASSERT_TRUE(nodeInfoLiteIsMuted(nodeDB->getMeshNode(TEST_NODE_NUM)));
+    TEST_ASSERT_TRUE(FSCom.exists(nodeDatabaseFileName));
+    for (size_t i = 0; i < before.size(); ++i) {
+        TEST_ASSERT_TRUE_MESSAGE(FSCom.exists(otherFiles[i]), otherFiles[i]);
+        TEST_ASSERT_TRUE_MESSAGE(before[i] == readBytes(otherFiles[i]), otherFiles[i]);
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -3163,6 +3228,8 @@ void setUp(void)
 }
 void tearDown(void)
 {
+    testAdmin->drainReply();
+    dropConfigChangedCounter();
     restoreAdminRadioGlobals();
     service = nullptr;
     delete mockMeshService;
@@ -3308,6 +3375,7 @@ void setup()
     RUN_TEST(test_handleSetConfig_roleTransitionPersistsEveryDerivedSegment);
 
     // Channel-configuration warning + coalescing
+    RUN_TEST(test_pendingLifecycle_rejectsMutationWithoutChangingChannel);
     RUN_TEST(test_warn_singleChannel_variantName_oneSpecificMessage);
     RUN_TEST(test_warn_singleChannel_nameAndPsk_collapsedToCatchAll);
     RUN_TEST(test_warn_cleanChannel_noMessage);
@@ -3328,7 +3396,7 @@ void setup()
     // Node menu mute toggle
     RUN_TEST(test_toggleNodeMuted_flipsBitAndSkipsRadioReload);
     RUN_TEST(test_toggleNodeMuted_unknownNodeDoesNothing);
-    RUN_TEST(test_toggleNodeMuted_currentlyRewritesEverySegment);
+    RUN_TEST(test_toggleNodeMuted_persistsOnlyNodeDatabase);
 
     // BaseUI region chooser preset default
 #ifndef USERPREFS_LORACONFIG_MODEM_PRESET

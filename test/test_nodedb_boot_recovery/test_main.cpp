@@ -13,6 +13,9 @@
 #endif
 
 #include "FSCommon.h" // defines FSCom; must precede the feature guard below
+#if defined(ARCH_PORTDUINO) && !defined(HELTEC_V4_NATIVE_STORAGE_AUDIT)
+#error "Run this suite with the coverage-storage audit environment"
+#endif
 
 // The identity-freeze contract only exists where there is a filesystem and boot
 // keygen.
@@ -223,7 +226,11 @@ static void test_healthyReboot_preservesIdentity(void)
 static void test_repeatedReload_replacesRatherThanAppendsNodeDatabase(void)
 {
     constexpr NodeNum diskOnlyNode = 0xA55AA55A;
-    TEST_ASSERT_NOT_NULL(nodeDB->getOrCreateMeshNode(diskOnlyNode));
+    auto *diskNode = nodeDB->getOrCreateMeshNode(diskOnlyNode);
+    TEST_ASSERT_NOT_NULL(diskNode);
+    // Empty discoveries are intentionally purged on boot; use a real user
+    // record so this tests replacement of repeated fields, not cleanup policy.
+    nodeInfoLiteSetBit(diskNode, NODEINFO_BITFIELD_HAS_USER_MASK, true);
     TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_NODEDATABASE));
 
     // Make RAM intentionally disagree with disk. If loadFromDisk appends to
@@ -278,7 +285,9 @@ static void test_degradedBoot_runtimeConfigSaveIsRejected(void)
     TEST_ASSERT_TRUE(NodeDBTestShim::decodeFailed(nodeDB));
     const uint64_t fpGarbage = fileFingerprint(configFileName);
 
+    const auto priorError = error_code;
     TEST_ASSERT_FALSE(nodeDB->saveToDisk(SEGMENT_CONFIG));
+    TEST_ASSERT_EQUAL(priorError, error_code);
     TEST_ASSERT_EQUAL_UINT64(fpGarbage, fileFingerprint(configFileName));
 }
 
