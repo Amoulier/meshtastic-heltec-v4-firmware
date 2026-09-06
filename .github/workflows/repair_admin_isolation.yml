@@ -24,33 +24,15 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           p=Path('test/test_admin_radio/test_main.cpp');s=p.read_text()
-          a='''        TEST_ASSERT_EQUAL_MEMORY(before.settings.psk.bytes, channels.getByIndex(0).settings.psk.bytes,
-                                   before.settings.psk.size);'''
-          b='''        TEST_ASSERT_EQUAL_UINT16(before.settings.psk.size, channels.getByIndex(0).settings.psk.size);
-                  // Compare storage too: a deliberately empty key has a zero logical length.
-                  TEST_ASSERT_EQUAL_MEMORY(before.settings.psk.bytes, channels.getByIndex(0).settings.psk.bytes,
-                                           sizeof(before.settings.psk.bytes));'''
+          a='        TEST_ASSERT_EQUAL_MEMORY(before.settings.psk.bytes, channels.getByIndex(0).settings.psk.bytes,\n' + ' '*33 + 'before.settings.psk.size);'
+          b='        TEST_ASSERT_EQUAL_UINT16(before.settings.psk.size, channels.getByIndex(0).settings.psk.size);\n' + '        // Compare storage too: a deliberately empty key has a zero logical length.\n' + '        TEST_ASSERT_EQUAL_MEMORY(before.settings.psk.bytes, channels.getByIndex(0).settings.psk.bytes,\n' + ' '*33 + 'sizeof(before.settings.psk.bytes));'
           assert s.count(a)==1;s=s.replace(a,b)
           for name in ['test_toggleMutedNode_skipsRadioReload_butPersists','test_toggleNodeMuted_flipsBitAndSkipsRadioReload']:
-              a=f'''static void {name}()
-          {{
-              nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);'''
-              b=f'''static void {name}()
-          {{
-              auto *node = nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
-              TEST_ASSERT_NOT_NULL(node);
-              // Another test may have persisted a muted copy of this same fixture node.
-              nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_IS_MUTED_MASK, false);
-              TEST_ASSERT_FALSE(nodeInfoLiteIsMuted(node));'''
+              a='static void '+name+'()\n{\n    nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);'
+              b='static void '+name+'()\n{\n    auto *node = nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);\n    TEST_ASSERT_NOT_NULL(node);\n    // Another test may have persisted a muted copy of this same fixture node.\n    nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_IS_MUTED_MASK, false);\n    TEST_ASSERT_FALSE(nodeInfoLiteIsMuted(node));'
               assert s.count(a)==1;s=s.replace(a,b)
-          a='''static void test_toggleNodeMuted_persistsOnlyNodeDatabase()
-          {
-              auto *node = nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
-              TEST_ASSERT_NOT_NULL(node);
-              nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_HAS_USER_MASK, true);'''
-          b=a+'''
-              nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_IS_MUTED_MASK, false);
-              TEST_ASSERT_FALSE(nodeInfoLiteIsMuted(node));'''
+          a='static void test_toggleNodeMuted_persistsOnlyNodeDatabase()\n{\n    auto *node = nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);\n    TEST_ASSERT_NOT_NULL(node);\n    nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_HAS_USER_MASK, true);'
+          b=a+'\n    nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_IS_MUTED_MASK, false);\n    TEST_ASSERT_FALSE(nodeInfoLiteIsMuted(node));'
           assert s.count(a)==1;s=s.replace(a,b);p.write_text(s)
           PY
           test "$(git hash-object test/test_admin_radio/test_main.cpp)" = 01d8a445da1a67ae81227df29c96a4d45b56f571
