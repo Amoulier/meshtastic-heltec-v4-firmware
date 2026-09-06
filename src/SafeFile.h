@@ -3,6 +3,7 @@
 #include "FSCommon.h"
 #include "SPILock.h"
 #include "configuration.h"
+#include <ErriezCRC32.h>
 
 #ifdef FSCom
 
@@ -13,7 +14,7 @@
  * be very careful about how we write files.  This class provides a restricted (Stream only) writing API for writing to files.
  *
  * Notably:
- * - we keep a simple xor hash of all characters that were written.
+ * - we keep the exact byte count and a CRC32 of everything written.
  * - We do not allow seeking (because we want to maintain our hash)
  * - we provide an close() method which is similar to close but returns false if we were unable to successfully write the
  * file.  Also this method
@@ -25,7 +26,13 @@
 class SafeFile : public Print
 {
   public:
-    explicit SafeFile(char const *filepath, bool fullAtomic = false);
+    /**
+     * @param requireDestructivePower Keep the stronger board-specific power
+     * authorization through the final publish/rename. This is used by reset
+     * markers and preference transactions that must remain above the
+     * destructive-storage threshold for their entire commit.
+     */
+    explicit SafeFile(char const *filepath, bool fullAtomic = false, bool requireDestructivePower = false);
 
     virtual size_t write(uint8_t);
     virtual size_t write(const uint8_t *buffer, size_t size);
@@ -38,13 +45,15 @@ class SafeFile : public Print
     bool close();
 
   private:
-    /// Read our (closed) tempfile back in and compare the hash
-    bool testReadback();
+    /// Read a closed file back in and compare both length and CRC32.
+    bool testReadback(const char *path);
 
     String filename;
     File f;
     bool fullAtomic;
-    uint8_t hash = 0;
+    bool requireDestructivePower;
+    uint32_t crc = CRC32_INITIAL;
+    size_t bytesExpected = 0;
 };
 
 #endif

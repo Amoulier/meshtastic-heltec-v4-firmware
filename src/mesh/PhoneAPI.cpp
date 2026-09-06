@@ -44,11 +44,51 @@ namespace
 {
 constexpr uint8_t FILES_MANIFEST_LEVELS = 3;
 constexpr size_t FILES_MANIFEST_MAX_COUNT = 64;
+#if defined(HELTEC_V4_OLED)
+std::atomic<uintptr_t> nextExternalStateSessionToken{1};
+
+uintptr_t allocateExternalStateSessionToken()
+{
+    uintptr_t token = nextExternalStateSessionToken.fetch_add(1, std::memory_order_acq_rel);
+    // Zero is reserved for internal/non-PhoneAPI work. Rollover is practically
+    // unreachable, but skipping it keeps the ownership invariant exact.
+    while (token == 0)
+        token = nextExternalStateSessionToken.fetch_add(1, std::memory_order_acq_rel);
+    // Bit zero is reserved to label stateless/request-scoped transports.
+    return token << 1;
+}
+#endif
 
 void releaseFilesManifest(std::vector<meshtastic_FileInfo> &filesManifest)
 {
     std::vector<meshtastic_FileInfo>().swap(filesManifest);
 }
+
+class ExternalStateAccessGuard
+{
+  public:
+    explicit ExternalStateAccessGuard(const PhoneAPI *owner)
+        : token(
+#if defined(HELTEC_V4_OLED)
+              owner ? owner->externalStateAccessToken() : 0
+#else
+              reinterpret_cast<uintptr_t>(owner)
+#endif
+          ),
+          acquired(!nodeDB || nodeDB->beginExternalStateAccess(token))
+    {
+    }
+    ~ExternalStateAccessGuard()
+    {
+        if (acquired && nodeDB)
+            nodeDB->endExternalStateAccess(token);
+    }
+    explicit operator bool() const { return acquired; }
+
+  private:
+    uintptr_t token;
+    bool acquired;
+};
 } // namespace
 
 // Flag to indicate a heartbeat was received and we should send queue status
@@ -246,7 +286,17 @@ PhoneAPI::PhoneAPI()
 {
     lastContactMsec = millis();
     std::fill(std::begin(recentToRadioPacketIds), std::end(recentToRadioPacketIds), 0);
+#if defined(HELTEC_V4_OLED)
+    rotateExternalStateSessionToken();
+#endif
 }
+
+#if defined(HELTEC_V4_OLED)
+void PhoneAPI::rotateExternalStateSessionToken()
+{
+    externalStateSessionToken.store(allocateExternalStateSessionToken(), std::memory_order_release);
+}
+#endif
 
 PhoneAPI::~PhoneAPI()
 {
@@ -268,6 +318,11 @@ void PhoneAPI::handleStartConfig()
 {
     // Must be before setting state (because state is how we know !connected)
     if (!isConnected()) {
+#if defined(HELTEC_V4_OLED)
+        // A reused BLE/serial/HTTP object must not let a new physical client
+        // inherit ownership of an abandoned settings transaction.
+        rotateExternalStateSessionToken();
+#endif
         onConnectionChanged(true);
         observe(&service->fromNumChanged);
 #ifdef FSCom
@@ -357,6 +412,11 @@ void PhoneAPI::handleStartConfig()
 void PhoneAPI::close()
 {
     LOG_DEBUG("PhoneAPI::close()");
+#if defined(HELTEC_V4_OLED)
+    // Invalidate ownership immediately, even if state was already SEND_NOTHING
+    // because a transport callback raced disconnect cleanup.
+    rotateExternalStateSessionToken();
+#endif
     if (service->api_state == service->STATE_BLE && api_type == TYPE_BLE)
         service->api_state = service->STATE_DISCONNECTED;
     else if (service->api_state == service->STATE_WIFI && api_type == TYPE_WIFI)
@@ -435,13 +495,41 @@ bool PhoneAPI::checkConnectionTimeout()
  */
 bool PhoneAPI::handleToRadio(const uint8_t *buf, size_t bufLength)
 {
+#if defined(HELTEC_V4_OLED)
+    if (api_type == TYPE_HTTP)
+        rotateExternalStateSessionToken();
+#endif
+    ExternalStateAccessGuard stateAccess(this);
+    if (!stateAccess) {
+        LOG_WARN("Ignore phone ingress during destructive storage mutation");
+        return false;
+    }
     powerFSM.trigger(EVENT_CONTACT_FROM_PHONE); // As long as the phone keeps talking to us, don't let the radio go to sleep
     lastContactMsec = millis();
 
     memset(&toRadioScratch, 0, sizeof(toRadioScratch));
     if (pb_decode_from_bytes(buf, bufLength, &meshtastic_ToRadio_msg, &toRadioScratch)) {
         switch (toRadioScratch.which_payload_variant) {
-        case meshtastic_ToRadio_packet_tag:
+        case meshtastic_ToRadio_packet_tag: {
+#if defined(HELTEC_V4_OLED)
+            const bool persistentConfigUsable =
+                shouldUsePersistentConfiguration(shouldUseFilesystemPersistence(fsIsMounted()), nodeDB->requiresConfigRecovery());
+            if (!persistentConfigUsable) {
+                // A failed mount or unreadable config boots with a provisional
+                // in-memory identity and LoRa disabled. Keep only self-addressed
+                // Admin traffic available so BLE/USB can diagnose, reboot, or
+                // explicitly factory-reset the node; reject normal local
+                // dispatch and mesh injection.
+                const NodeNum ourNum = nodeDB->getNodeNum();
+                const bool decodedAdmin = toRadioScratch.packet.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+                                          toRadioScratch.packet.decoded.portnum == meshtastic_PortNum_ADMIN_APP;
+                const bool addressedToLocalNode = ourNum != 0 && toRadioScratch.packet.to == ourNum;
+                if (!shouldAllowPhonePacketWhileRecovering(persistentConfigUsable, decodedAdmin, addressedToLocalNode)) {
+                    LOG_WARN("Persistent configuration unavailable: drop non-admin ToRadio packet");
+                    return false;
+                }
+            }
+#endif
 #ifdef MESHTASTIC_PHONEAPI_ACCESS_CONTROL
             if (!getAdminAuthorized()) {
                 // Allow admin messages addressed to this device - passphrase delivery must get through.
@@ -463,6 +551,7 @@ bool PhoneAPI::handleToRadio(const uint8_t *buf, size_t bufLength)
             }
 #endif
             return handleToRadioPacket(toRadioScratch.packet);
+        }
         case meshtastic_ToRadio_want_config_id_tag:
             config_nonce = toRadioScratch.want_config_id;
             LOG_INFO("Client wants config, nonce=%u", config_nonce);
@@ -473,6 +562,17 @@ bool PhoneAPI::handleToRadio(const uint8_t *buf, size_t bufLength)
             close();
             break;
         case meshtastic_ToRadio_xmodemPacket_tag:
+#if defined(HELTEC_V4_OLED)
+            // XMODEM has no protocol-level authentication. Keep it on local,
+            // proximity transports only; exposing arbitrary file transfer on
+            // TCP/HTTP/UDP would turn a trusted-LAN assumption into a raw
+            // filesystem interface. Protected preference paths are denied by
+            // XModemAdapter as a second, transport-independent boundary.
+            if (!IS_ONE_OF(api_type, TYPE_BLE, TYPE_SERIAL)) {
+                LOG_WARN("Drop XMODEM request from network PhoneAPI transport");
+                break;
+            }
+#endif
 #ifdef MESHTASTIC_PHONEAPI_ACCESS_CONTROL
             if (!getAdminAuthorized()) {
                 LOG_INFO("Lockdown: Drop xmodem packet from unauthorized client");
@@ -509,6 +609,12 @@ bool PhoneAPI::handleToRadio(const uint8_t *buf, size_t bufLength)
             // Default nonce (0) remains a plain keepalive that triggers
             // a queue-status reply.
             if (toRadioScratch.heartbeat.nonce == 1) {
+#if defined(HELTEC_V4_OLED)
+                if (!shouldUseFilesystemPersistence(fsIsMounted()) || nodeDB->requiresConfigRecovery()) {
+                    LOG_WARN("Persistent configuration unavailable: suppress nodeinfo broadcast");
+                    break;
+                }
+#endif
                 if (nodeInfoModule) {
                     LOG_INFO("Broadcast nodeinfo ping (serial)");
                     nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, true, 0, true);
@@ -551,6 +657,13 @@ bool PhoneAPI::handleToRadio(const uint8_t *buf, size_t bufLength)
 
 size_t PhoneAPI::getFromRadio(uint8_t *buf)
 {
+    ExternalStateAccessGuard stateAccess(this);
+    // A full reset is a privacy boundary. Even a packet cached before the
+    // reset (for example a SECURITY response) must not drain afterward. The
+    // reset command may therefore lose its ACK; the guarded reboot is the
+    // authoritative completion signal.
+    if (!stateAccess)
+        return 0;
     // Respond to heartbeat by sending queue status
     if (heartbeatReceived) {
         memset(&fromRadioScratch, 0, sizeof(fromRadioScratch));
@@ -1084,7 +1197,7 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
                 fromRadioScratch.packet = *packetForPhone;
                 releasePhonePacket();
             }
-        } else if (replayPending()) {
+        } else if (stateAccess && replayPending()) {
             // No live packet pending - feed the phone one cached satellite-DB packet.
             // popReplayPacket advances through positions->telemetry->environment->status,
             // and flips replayPhase back to IDLE when everything has been drained.
@@ -1655,6 +1768,9 @@ void PhoneAPI::releaseClientNotification()
  */
 bool PhoneAPI::available()
 {
+    ExternalStateAccessGuard stateAccess(this);
+    if (!stateAccess)
+        return false;
     switch (state) {
     case STATE_SEND_NOTHING:
         return false;

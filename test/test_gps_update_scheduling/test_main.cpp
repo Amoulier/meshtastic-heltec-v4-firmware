@@ -167,6 +167,39 @@ static void test_reset_clears_the_search_state(void)
     TEST_ASSERT_EQUAL_UINT32(0, s.elapsedSearchMs());
 }
 
+static void test_valid_fix_is_remembered_until_search_finishes(void)
+{
+    GPSUpdateScheduling s;
+    s.informSearching();
+
+    TEST_ASSERT_FALSE(s.hasValidFixSinceSearchStarted());
+    s.informValidFix();
+    TEST_ASSERT_TRUE(s.hasValidFixSinceSearchStarted());
+
+    Time::advanceTestMillis(30 * 1000);
+    TEST_ASSERT_TRUE(s.hasValidFixSinceSearchStarted());
+    s.informGotLock();
+    TEST_ASSERT_FALSE(s.hasValidFixSinceSearchStarted());
+}
+
+static void test_valid_fix_state_is_scoped_to_one_search(void)
+{
+    GPSUpdateScheduling s;
+
+    s.informValidFix();
+    TEST_ASSERT_FALSE(s.hasValidFixSinceSearchStarted());
+
+    s.informSearching();
+    s.informValidFix();
+    TEST_ASSERT_TRUE(s.hasValidFixSinceSearchStarted());
+
+    s.informSearching();
+    TEST_ASSERT_FALSE(s.hasValidFixSinceSearchStarted());
+    s.informValidFix();
+    s.reset();
+    TEST_ASSERT_FALSE(s.hasValidFixSinceSearchStarted());
+}
+
 void setup()
 {
     delay(10);
@@ -185,6 +218,8 @@ void setup()
     RUN_TEST(test_search_ending_after_the_wrap_reads_as_idle);
     RUN_TEST(test_search_starting_after_the_wrap_reads_as_searching);
     RUN_TEST(test_reset_clears_the_search_state);
+    RUN_TEST(test_valid_fix_is_remembered_until_search_finishes);
+    RUN_TEST(test_valid_fix_state_is_scoped_to_one_search);
     exit(UNITY_END());
 }
 

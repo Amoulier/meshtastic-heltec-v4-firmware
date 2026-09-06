@@ -21,6 +21,8 @@
 #include "TestUtil.h"
 #include "graphics/draw/MenuHandler.h"
 #include "mesh/Channels.h"
+#include "mesh/CryptoEngine.h" // crypto global: the tests swap in a stub engine to drive key derivation
+#include "mesh/Default.h"
 #include "mesh/Router.h" // router global: allocErrorResponse() allocates the reply through it
 #include "modules/AdminModule.h"
 #include "modules/NodeInfoModule.h"
@@ -34,14 +36,18 @@
 #include "meshtastic/config.pb.h"
 #include "support/AdminModuleTestShim.h"
 
-// hash() is a file-scope function in RadioInterface.cpp; link it in for slot-formula tests
+// hash() is a file-scope function in RadioInterface.cpp; link it in for
+// slot-formula tests
 extern uint32_t hash(const char *str);
 
-// Every client notification the AdminModule emits flows through sendClientNotification();
-// capture each formatted message so the warning/coalescing tests can assert on the exact
-// set of messages produced by a sequence of admin messages. This shadows test/support/MockMeshService.h's
-// release-only stub because these tests need to inspect the captured message text, not just avoid leaks.
+// Every client notification the AdminModule emits flows through
+// sendClientNotification(); capture each formatted message so the
+// warning/coalescing tests can assert on the exact set of messages produced by
+// a sequence of admin messages. This shadows test/support/MockMeshService.h's
+// release-only stub because these tests need to inspect the captured message
+// text, not just avoid leaks.
 static std::vector<std::string> capturedWarnings;
+static bool capturedWarningsContain(const char *needle);
 
 class MockMeshService : public MeshService
 {
@@ -108,7 +114,8 @@ static void test_validateConfigRegion_validRegionReturnsTrue()
     meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
     cfg.region = meshtastic_Config_LoRaConfig_RegionCode_US;
 
-    // Ensure owner is not licensed (should not matter for non-licensed-only regions)
+    // Ensure owner is not licensed (should not matter for non-licensed-only
+    // regions)
     devicestate.owner.is_licensed = false;
 
     TEST_ASSERT_TRUE(RadioInterface::validateConfigRegion(cfg));
@@ -132,8 +139,8 @@ static void test_validateConfigRegion_unknownCodeReturnsFalse()
 
     devicestate.owner.is_licensed = false;
 
-    // Unknown code is not in the regions table; getRegion() returns the UNSET sentinel,
-    // whose .code != 255, so validateConfigRegion should reject it.
+    // Unknown code is not in the regions table; getRegion() returns the UNSET
+    // sentinel, whose .code != 255, so validateConfigRegion should reject it.
     TEST_ASSERT_FALSE(RadioInterface::validateConfigRegion(cfg));
 }
 
@@ -208,7 +215,8 @@ static const RegionProfile TEST_PROFILE_TURBO = {
     /* telemetryThrottle */ 0,
 };
 
-// A preset list for the preset-hash override slot test (LONG_FAST + MEDIUM_FAST)
+// A preset list for the preset-hash override slot test (LONG_FAST +
+// MEDIUM_FAST)
 static const meshtastic_Config_LoRaConfig_ModemPreset TEST_PRESETS_PRESET_HASH[] = {
     meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST,
     meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_FAST,
@@ -216,7 +224,8 @@ static const meshtastic_Config_LoRaConfig_ModemPreset TEST_PRESETS_PRESET_HASH[]
 };
 
 // Profile with overrideSlot = OVERRIDE_SLOT_PRESET_HASH (-1):
-// slot selection always uses hash(presetDisplayName), ignoring the primary channel name.
+// slot selection always uses hash(presetDisplayName), ignoring the primary
+// channel name.
 static const RegionProfile TEST_PROFILE_PRESET_HASH = {
     TEST_PRESETS_PRESET_HASH,
     /* spacing */ 0.0f,
@@ -228,8 +237,9 @@ static const RegionProfile TEST_PROFILE_PRESET_HASH = {
     /* telemetryThrottle */ 0,
 };
 
-// Standalone test region using US frequencies (26 MHz span → 104 slots at 250 kHz BW)
-// Used to verify OVERRIDE_SLOT_PRESET_HASH slot formula; not inserted into testRegions[].
+// Standalone test region using US frequencies (26 MHz span → 104 slots at 250
+// kHz BW) Used to verify OVERRIDE_SLOT_PRESET_HASH slot formula; not inserted
+// into testRegions[].
 static const RegionInfo TEST_REGION_PRESET_HASH = {
     meshtastic_Config_LoRaConfig_RegionCode_US,
     902.0f,
@@ -277,7 +287,8 @@ static const RegionInfo *getTestRegion(meshtastic_Config_LoRaConfig_RegionCode c
 // Shadow table tests
 // -----------------------------------------------------------------------
 
-// Helper: replicate the numFreqSlots formula from RadioInterface so tests can compute expected values.
+// Helper: replicate the numFreqSlots formula from RadioInterface so tests can
+// compute expected values.
 static uint32_t testComputeNumFreqSlots(const RegionInfo *r, float bw_kHz)
 {
     float w = r->profile->spacing + (r->profile->padding * 2) + (bw_kHz / 1000.0f);
@@ -372,7 +383,8 @@ static void test_shadowTable_presetHashProfileHasCorrectOverrideSlot()
 //   overrideSlot = -1  → slot = hash(presetDisplayName) % numSlots
 //     regardless of what the primary channel is named
 //   overrideSlot = 0   → slot = hash(channelName) % numSlots
-//     when channel name = preset display name, these two modes give identical slots
+//     when channel name = preset display name, these two modes give identical
+//     slots
 // -----------------------------------------------------------------------
 
 static void test_overrideSlotPresetHash_longFast_customChannelMatchesDefaultNameSlot()
@@ -391,7 +403,8 @@ static void test_overrideSlotPresetHash_longFast_customChannelMatchesDefaultName
     //   channel is "MyCustomNetwork" but slot still uses preset name hash
     uint32_t slotPresetHashMode = hash(presetName) % numSlots;
 
-    // OVERRIDE_SLOT_DEFAULT_CHANNEL_HASH (0) with channel name = preset name (user never renamed it):
+    // OVERRIDE_SLOT_DEFAULT_CHANNEL_HASH (0) with channel name = preset name
+    // (user never renamed it):
     //   channelName == presetName → same hash → same slot
     const char *defaultChannelName = presetName;
     uint32_t slotChannelHashModeDefaultName = hash(defaultChannelName) % numSlots;
@@ -427,7 +440,8 @@ static void test_overrideSlotPresetHash_mediumFast_customChannelMatchesDefaultNa
 
 static void test_overrideSlotPresetHash_longFast_slotIsStableAcrossCustomNames()
 {
-    // Mode -1 must give the same slot for LONG_FAST regardless of which custom name is in use.
+    // Mode -1 must give the same slot for LONG_FAST regardless of which custom
+    // name is in use.
     const RegionInfo *us = getRegion(meshtastic_Config_LoRaConfig_RegionCode_US);
     float bw = modemPresetToBwKHz(meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, us->wideLora);
     uint32_t numSlots = testComputeNumFreqSlots(us, bw);
@@ -466,9 +480,9 @@ static void test_overrideSlotPresetHash_mediumFast_slotIsStableAcrossCustomNames
 
 static void test_overrideSlotPresetHash_longFastAndMediumFast_slotsAreDifferentPresets()
 {
-    // LONG_FAST and MEDIUM_FAST have different display names → likely different hash slots.
-    // This verifies the two presets genuinely occupy distinct positions, so the equivalence
-    // tests above are not trivially vacuous.
+    // LONG_FAST and MEDIUM_FAST have different display names → likely different
+    // hash slots. This verifies the two presets genuinely occupy distinct
+    // positions, so the equivalence tests above are not trivially vacuous.
     const RegionInfo *us = getRegion(meshtastic_Config_LoRaConfig_RegionCode_US);
     float bw_lf = modemPresetToBwKHz(meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, false);
     float bw_mf = modemPresetToBwKHz(meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_FAST, false);
@@ -484,8 +498,8 @@ static void test_overrideSlotPresetHash_longFastAndMediumFast_slotsAreDifferentP
 
     uint32_t slotLF = hash(nameLF) % numSlots_lf;
     uint32_t slotMF = hash(nameMF) % numSlots_mf;
-    // They use the same numSlots (both 250 kHz on US), so a difference in display name
-    // should produce a different slot.
+    // They use the same numSlots (both 250 kHz on US), so a difference in display
+    // name should produce a different slot.
     TEST_ASSERT_NOT_EQUAL(slotLF, slotMF);
 }
 
@@ -611,8 +625,9 @@ static void test_validateConfigLora_bogusPresetRejected()
 
 static void test_validateConfigLora_unsetRegionAcceptsAnyRealPreset()
 {
-    // UNSET is "no region chosen yet", not a regulatory domain, so it must not invalidate
-    // a preset the user already picked - whichever region that preset belongs to.
+    // UNSET is "no region chosen yet", not a regulatory domain, so it must not
+    // invalidate a preset the user already picked - whichever region that preset
+    // belongs to.
     meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
     cfg.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
     cfg.use_preset = true;
@@ -677,7 +692,8 @@ static void test_clampConfigLora_invalidPresetClampedToDefault()
     meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
     cfg.region = meshtastic_Config_LoRaConfig_RegionCode_EU_868;
     cfg.use_preset = true;
-    cfg.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_SHORT_TURBO; // not in EU_868 preset list
+    cfg.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_SHORT_TURBO; // not in EU_868
+                                                                             // preset list
 
     RadioInterface::clampConfigLora(cfg);
 
@@ -699,7 +715,8 @@ static void test_clampConfigLora_validPresetUnchanged()
 
 static void test_clampConfigLora_customBwTooWideClampedToDefaultBw()
 {
-    // EU_868 span is 250kHz. A 500kHz custom BW should be clamped to default preset BW.
+    // EU_868 span is 250kHz. A 500kHz custom BW should be clamped to default
+    // preset BW.
     meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
     cfg.region = meshtastic_Config_LoRaConfig_RegionCode_EU_868;
     cfg.use_preset = false;
@@ -743,8 +760,9 @@ static void test_clampConfigLora_bogusPresetOnUnsetClampedToLongFast()
 
 static void test_clampConfigLora_unsetRegionKeepsRealPreset()
 {
-    // The boot-time clamp (NodeDB::loadFromDisk) runs on every boot. While the region is
-    // unset it must leave a real preset alone rather than rewriting it to LONG_FAST.
+    // The boot-time clamp (NodeDB::loadFromDisk) runs on every boot. While the
+    // region is unset it must leave a real preset alone rather than rewriting it
+    // to LONG_FAST.
     meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
     cfg.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
     cfg.use_preset = true;
@@ -758,7 +776,8 @@ static void test_clampConfigLora_unsetRegionKeepsRealPreset()
 
 static void test_clampConfigLora_invalidPresetOnLORA24ClampedToDefault()
 {
-    // LORA_24 uses PROFILE_STD; a bogus preset should clamp to LONG_FAST (first in PRESETS_STD)
+    // LORA_24 uses PROFILE_STD; a bogus preset should clamp to LONG_FAST (first
+    // in PRESETS_STD)
     meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
     cfg.region = meshtastic_Config_LoRaConfig_RegionCode_LORA_24;
     cfg.use_preset = true;
@@ -815,8 +834,8 @@ static void test_clampConfigLora_eu868PresetOnEUN868SwapsToEU868()
 
 static void test_clampConfigLora_litePresetOnUSDoesNotSwap()
 {
-    // Previous region is not one of the swappable trio, so the preset clamps to the
-    // region default instead of swapping regions.
+    // Previous region is not one of the swappable trio, so the preset clamps to
+    // the region default instead of swapping regions.
     meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
     cfg.region = meshtastic_Config_LoRaConfig_RegionCode_US;
     cfg.use_preset = true;
@@ -831,7 +850,8 @@ static void test_clampConfigLora_litePresetOnUSDoesNotSwap()
 
 static void test_clampConfigLora_narrowPresetOnHam125cmDoesNotSwap()
 {
-    // ITU2_125CM shares the NARROW presets, so they are valid there and nothing changes
+    // ITU2_125CM shares the NARROW presets, so they are valid there and nothing
+    // changes
     meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
     cfg.region = meshtastic_Config_LoRaConfig_RegionCode_ITU2_125CM;
     cfg.use_preset = true;
@@ -845,8 +865,8 @@ static void test_clampConfigLora_narrowPresetOnHam125cmDoesNotSwap()
 
 static void test_validateConfigLora_siblingLockedPresetStillFailsValidation()
 {
-    // Validation (no clamp) must keep failing so callers route into clampConfigLora,
-    // which performs the region swap.
+    // Validation (no clamp) must keep failing so callers route into
+    // clampConfigLora, which performs the region swap.
     meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
     cfg.region = meshtastic_Config_LoRaConfig_RegionCode_EU_866;
     cfg.use_preset = true;
@@ -861,7 +881,8 @@ static void test_validateConfigLora_siblingLockedPresetStillFailsValidation()
 
 static void test_presetsStd_hasTenEntries()
 {
-    // PROFILE_STD should have exactly 10 presets (adds MEDIUM_TURBO to the turbo cluster)
+    // PROFILE_STD should have exactly 10 presets (adds MEDIUM_TURBO to the turbo
+    // cluster)
     const RegionInfo *us = getRegion(meshtastic_Config_LoRaConfig_RegionCode_US);
     TEST_ASSERT_EQUAL(10, us->getNumPresets());
     TEST_ASSERT_EQUAL_PTR(PROFILE_STD.presets, us->getAvailablePresets());
@@ -883,7 +904,8 @@ static void test_presetsUndef_hasOneEntry()
 
 static void test_defaultPresetIsInAvailablePresets()
 {
-    // For every region, the defaultPreset must appear in its own availablePresets list
+    // For every region, the defaultPreset must appear in its own availablePresets
+    // list
     const RegionInfo *r = regions;
     while (true) {
         bool found = false;
@@ -905,7 +927,8 @@ static void test_defaultPresetIsInAvailablePresets()
 
 static void test_regionFieldsAreSane()
 {
-    // Basic sanity check: all regions have freqEnd > freqStart and a non-null name
+    // Basic sanity check: all regions have freqEnd > freqStart and a non-null
+    // name
     const RegionInfo *r = regions;
     while (true) {
         char msg[80];
@@ -975,24 +998,27 @@ static void test_channelSpacingCalculation_EU868_LONG_FAST()
     TEST_ASSERT_EQUAL_UINT32(1, numChannels);
 }
 
-// Placeholder: when protobuf region definitions include non-zero padding/spacing,
-// add tests here to verify the channel count and frequency calculations.
+// Placeholder: when protobuf region definitions include non-zero
+// padding/spacing, add tests here to verify the channel count and frequency
+// calculations.
 static void test_channelSpacingCalculation_placeholder()
 {
-    // TODO: Once protobuf RegionInfo entries have non-zero padding or spacing values,
-    // verify:
+    // TODO: Once protobuf RegionInfo entries have non-zero padding or spacing
+    // values, verify:
     //  - Channel count matches expected value for each (region, preset) pair
     //  - First channel frequency = freqStart + (bw/2000) + padding
     //  - Nth channel frequency = first + (n * channelSpacing)
     //  - overrideSlot, when non-zero, forces the channel_num
-    TEST_PASS_MESSAGE("Placeholder for future channel spacing tests with updated protobuf region fields");
+    TEST_PASS_MESSAGE("Placeholder for future channel spacing tests with updated "
+                      "protobuf region fields");
 }
 
 // -----------------------------------------------------------------------
 // handleSetConfig fromOthers dispatch tests
 // -----------------------------------------------------------------------
 
-// AdminModuleTestShim comes from test/support - the friend seam AdminModule.h declares.
+// AdminModuleTestShim comes from test/support - the friend seam AdminModule.h
+// declares.
 static AdminModuleTestShim *testAdmin;
 static NodeDB *savedNodeDB;
 static NodeDB *replacementNodeDB;
@@ -1001,14 +1027,16 @@ static meshtastic_DeviceState savedDeviceState;
 static meshtastic_User savedOwner;
 static meshtastic_LocalConfig savedConfig;
 static meshtastic_ChannelFile savedChannelFile;
-// Only the ham dispatcher test installs a router (allocErrorResponse() allocates through it).
-// Saved/torn down for every test so a failed assertion's longjmp cannot leave one dangling.
+// Only the ham dispatcher test installs a router (allocErrorResponse()
+// allocates through it). Saved/torn down for every test so a failed assertion's
+// longjmp cannot leave one dangling.
 static Router *savedRouter;
 static Router *hamMockRouter;
 
-// Called from setUp/tearDown for every test, not opted into by a handful. A shared NodeDB plus
-// unrestored config/owner/devicestate/channelFile means each test inherits whatever its
-// predecessors left, and the admin handlers under test write all four.
+// Called from setUp/tearDown for every test, not opted into by a handful. A
+// shared NodeDB plus unrestored config/owner/devicestate/channelFile means each
+// test inherits whatever its predecessors left, and the admin handlers under
+// test write all four.
 static void replaceAdminRadioGlobals()
 {
     savedNodeDB = nodeDB;
@@ -1022,8 +1050,13 @@ static void replaceAdminRadioGlobals()
     nodeDB = replacementNodeDB;
 }
 
+// Defined with the crypto stub below; tearDown must undo an install even when a
+// failed assertion longjmped out of the test body before it could.
+static void dropRestoreCryptoStub();
+
 static void restoreAdminRadioGlobals()
 {
+    dropRestoreCryptoStub();
     nodeInfoModule = savedNodeInfoModule;
     nodeDB = savedNodeDB;
     router = savedRouter;
@@ -1093,13 +1126,49 @@ static void test_handleSetOwner_persistsLicensedChannelSanitation()
     TEST_ASSERT_FALSE_MESSAGE(channels.ensureLicensedOperation(), "sanitized reload must not trigger another persistence write");
 }
 
+static void test_handleSetOwner_delicensingLicensedRegionAtomicallyDisablesRadio()
+{
+    owner = meshtastic_User_init_zero;
+    owner.is_licensed = true;
+    channels.initDefaults();
+    config.has_lora = true;
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_ITU2_70CM;
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_NARROW_SLOW;
+    config.lora.tx_enabled = true;
+    config.lora.override_frequency = 433.65f;
+    config.lora.frequency_offset = 1.25f;
+    config.lora.channel_num = 7;
+    initRegion();
+    TEST_ASSERT_TRUE(getRegion(config.lora.region)->profile->licensedOnly);
+
+    meshtastic_User unlicensed = meshtastic_User_init_zero;
+    unlicensed.is_licensed = false;
+    testAdmin->deferSaves();
+    nodeInfoModule = reinterpret_cast<NodeInfoModule *>(1);
+    testAdmin->handleSetOwner(unlicensed);
+
+    TEST_ASSERT_FALSE(owner.is_licensed);
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RegionCode_UNSET, config.lora.region);
+    TEST_ASSERT_FALSE(config.lora.tx_enabled);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, config.lora.override_frequency);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, config.lora.frequency_offset);
+    TEST_ASSERT_EQUAL_UINT32(0, config.lora.channel_num);
+    TEST_ASSERT_EQUAL_INT(SEGMENT_CONFIG | SEGMENT_DEVICESTATE | SEGMENT_NODEDATABASE, testAdmin->savedSegments());
+
+    initRegion();
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RegionCode_UNSET, myRegion->code);
+}
+
 // -----------------------------------------------------------------------
 // handleSetHamMode() name assembly: the ham long_name rides behind the call
 // sign with the "//" separator hams already use on the air.
 // -----------------------------------------------------------------------
 
-// Licensing a node touches channels, the NodeDB and the owner struct; an UNSET region keeps the
-// keygen/identity-migration path out of these name-only assertions.
+// Licensing a node touches channels, the NodeDB and the owner struct; an UNSET
+// region keeps the keygen/identity-migration path out of these name-only
+// assertions.
 static void primeHamModeTest()
 {
     owner = meshtastic_User_init_zero;
@@ -1124,8 +1193,8 @@ static void test_handleSetHamMode_appendsLongNameToCallSign()
     TEST_ASSERT_TRUE(owner.is_licensed);
 }
 
-// The widest pair the proto can carry (7 + 2 + 14) still has to arrive whole, or the operator
-// silently loses the tail of the name they typed.
+// The widest pair the proto can carry (7 + 2 + 14) still has to arrive whole,
+// or the operator silently loses the tail of the name they typed.
 static void test_handleSetHamMode_widestPairSurvivesTheLongNameCap()
 {
     primeHamModeTest();
@@ -1151,8 +1220,9 @@ static void test_handleSetHamMode_omittedLongNameKeepsCallSignAlone()
     TEST_ASSERT_TRUE(owner.is_licensed);
 }
 
-// long_name is optional both ways a client can leave it empty: a whitespace-only one is dropped
-// (no dangling "//" on the air) instead of costing the operator the whole licensing request.
+// long_name is optional both ways a client can leave it empty: a
+// whitespace-only one is dropped (no dangling "//" on the air) instead of
+// costing the operator the whole licensing request.
 static void test_handleSetHamMode_blankLongNameIsIgnoredNotRejected()
 {
     primeHamModeTest();
@@ -1166,8 +1236,9 @@ static void test_handleSetHamMode_blankLongNameIsIgnoredNotRejected()
     TEST_ASSERT_TRUE(owner.is_licensed);
 }
 
-// The call sign is required, unlike the two optional name fields: an empty one would license a
-// node that never identifies itself, and once a long_name is set it would compose to a dangling
+// The call sign is required, unlike the two optional name fields: an empty one
+// would license a node that never identifies itself, and once a long_name is
+// set it would compose to a dangling
 // "//Attic Heltec".
 static void test_handleSetHamMode_blankCallSignIsRejected()
 {
@@ -1190,8 +1261,9 @@ static void test_handleSetHamMode_blankCallSignIsRejected()
     TEST_ASSERT_FALSE(owner.is_licensed);
 }
 
-// short_name is optional too, so a blank one keeps whatever the node was already called instead of
-// blanking it - licensing the node must not cost the operator their existing short name.
+// short_name is optional too, so a blank one keeps whatever the node was
+// already called instead of blanking it - licensing the node must not cost the
+// operator their existing short name.
 static void test_handleSetHamMode_blankShortNameKeepsTheExistingOne()
 {
     for (const char *blank : {"", "  "}) {
@@ -1209,14 +1281,16 @@ static void test_handleSetHamMode_blankShortNameKeepsTheExistingOne()
     }
 }
 
-// A rejection has to reach the client, not just the log: allocErrorResponse() builds the reply
-// through the router, so this is the one ham test that needs one.
+// A rejection has to reach the client, not just the log: allocErrorResponse()
+// builds the reply through the router, so this is the one ham test that needs
+// one.
 class HamModeMockRouter : public Router
 {
   public:
     ~HamModeMockRouter()
     {
-        delete cryptLock; // the Router ctor asserts this is clear, so a later suite can construct one
+        delete cryptLock; // the Router ctor asserts this is clear, so a later suite
+                          // can construct one
         cryptLock = nullptr;
     }
     ErrorCode send(meshtastic_MeshPacket *p) override
@@ -1242,10 +1316,11 @@ static bool decodeRoutingError(meshtastic_MeshPacket *reply, meshtastic_Routing_
     return true;
 }
 
-// Handler-level rejection is invisible to a want_response client on its own: with no reply queued,
-// handleReceivedProtobuf() falls through to its generic "ACK" and answers Routing_Error_NONE, so the
-// app reports ham mode as enabled on a node that changed nothing. The dispatcher has to say
-// BAD_REQUEST before that fallback runs.
+// Handler-level rejection is invisible to a want_response client on its own:
+// with no reply queued, handleReceivedProtobuf() falls through to its generic
+// "ACK" and answers Routing_Error_NONE, so the app reports ham mode as enabled
+// on a node that changed nothing. The dispatcher has to say BAD_REQUEST before
+// that fallback runs.
 static void test_handleSetHamMode_blankCallSignRepliesBadRequest()
 {
     primeHamModeTest();
@@ -1257,7 +1332,8 @@ static void test_handleSetHamMode_blankCallSignRepliesBadRequest()
     strncpy(m.set_ham_mode.long_name, "Attic Heltec", sizeof(m.set_ham_mode.long_name) - 1);
 
     meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
-    mp.from = 0; // local client, so the passkey gate is bypassed and the switch body runs
+    mp.from = 0; // local client, so the passkey gate is bypassed and the switch
+                 // body runs
     mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
     mp.decoded.want_response = true;
     testAdmin->handleReceivedProtobuf(mp, &m);
@@ -1269,9 +1345,10 @@ static void test_handleSetHamMode_blankCallSignRepliesBadRequest()
     testAdmin->drainReply();
 }
 
-// The other half of the pair: an accepted request still answers Routing_Error_NONE. Asserting both
-// sides is the point - NONE is what the rejection path used to borrow, so a test that only checked
-// the reject case could pass against a handler that answered NONE to everything.
+// The other half of the pair: an accepted request still answers
+// Routing_Error_NONE. Asserting both sides is the point - NONE is what the
+// rejection path used to borrow, so a test that only checked the reject case
+// could pass against a handler that answered NONE to everything.
 static void test_handleSetHamMode_acceptedRequestAcksSuccess()
 {
     primeHamModeTest();
@@ -1365,10 +1442,15 @@ static void test_handleSetConfig_persistsLicensedFirstRegionIdentity()
     TEST_ASSERT_EQUAL_INT(expectedSegments, testAdmin->savedSegments());
     TEST_ASSERT_EQUAL(32, config.security.private_key.size);
     TEST_ASSERT_EQUAL(32, owner.public_key.size);
+    TEST_ASSERT_FALSE_MESSAGE(capturedWarningsContain(licensedIdentityMigrationMessage),
+                              "a deferred edit must not announce identity migration before COMMIT");
+    TEST_ASSERT_TRUE_MESSAGE(nodeDB->licensedIdentityMigrationPending,
+                             "the durable migration notice must remain pending until COMMIT");
 }
 
-// Unlicensed twin of the test above. Without the re-derivation the node signs broadcasts every receiver
-// drops (verifyFirstContactNodeInfo: crc32(user.public_key) != from).
+// Unlicensed twin of the test above. Without the re-derivation the node signs
+// broadcasts every receiver drops (verifyFirstContactNodeInfo:
+// crc32(user.public_key) != from).
 static void test_handleSetConfig_persistsUnlicensedFirstRegionIdentity()
 {
     owner = meshtastic_User_init_zero;
@@ -1406,10 +1488,13 @@ static void test_handleSetConfig_fromOthers_invalidPresetRejected()
     meshtastic_Config c = makeLoraSetConfig(meshtastic_Config_LoRaConfig_RegionCode_EU_868, true,
                                             meshtastic_Config_LoRaConfig_ModemPreset_SHORT_TURBO);
 
-    testAdmin->handleSetConfig(c, true); // fromOthers = true
+    const meshtastic_Config_LoRaConfig before = config.lora;
+    testAdmin->deferSaves();
+    TEST_ASSERT_FALSE(testAdmin->handleSetConfig(c, true));
 
     // fromOthers=true: invalid preset should be rejected, old preset preserved
-    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, config.lora.modem_preset);
+    TEST_ASSERT_EQUAL_MEMORY(&before, &config.lora, sizeof(before));
+    TEST_ASSERT_EQUAL_INT(0, testAdmin->savedSegments());
 }
 
 static void test_handleSetConfig_fromLocal_invalidPresetClamped()
@@ -1453,8 +1538,8 @@ static void test_handleSetConfig_fromOthers_validPresetAccepted()
 
 static void test_handleSetConfig_fromOthers_invalidChannelNumFullyRejected()
 {
-    // Rejecting a remote config must reject ALL of it: an invalid channel_num must not
-    // leak into config.lora alongside the restored region/preset.
+    // Rejecting a remote config must reject ALL of it: an invalid channel_num
+    // must not leak into config.lora alongside the restored region/preset.
     config.lora = meshtastic_Config_LoRaConfig_init_zero;
     config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
     config.lora.use_preset = true;
@@ -1466,14 +1551,75 @@ static void test_handleSetConfig_fromOthers_invalidChannelNumFullyRejected()
         makeLoraSetConfig(meshtastic_Config_LoRaConfig_RegionCode_US, true, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST);
     c.payload_variant.lora.channel_num = 5000; // far beyond US slot count
 
-    testAdmin->handleSetConfig(c, true); // fromOthers = true
+    const meshtastic_Config_LoRaConfig before = config.lora;
+    RadioInterface::uses_default_frequency_slot = true;
+    RadioInterface::uses_custom_channel_name = true;
+    testAdmin->deferSaves();
+    TEST_ASSERT_FALSE(testAdmin->handleSetConfig(c, true));
 
-    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RegionCode_US, config.lora.region);
-    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, config.lora.modem_preset);
-    TEST_ASSERT_EQUAL_UINT32(0, config.lora.channel_num);
+    TEST_ASSERT_EQUAL_MEMORY(&before, &config.lora, sizeof(before));
+    TEST_ASSERT_TRUE(RadioInterface::uses_default_frequency_slot);
+    TEST_ASSERT_TRUE(RadioInterface::uses_custom_channel_name);
+    TEST_ASSERT_EQUAL_INT(0, testAdmin->savedSegments());
 }
 
-// clampBandwidthCode: an unset (0) bandwidth code maps to the default; any other code is left as-is.
+static void test_handleSetConfig_invalidRegionRejectedLocallyAndRemotely()
+{
+    for (bool fromOthers : {false, true}) {
+        config.lora = meshtastic_Config_LoRaConfig_init_zero;
+        config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+        config.lora.use_preset = true;
+        config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+        config.lora.tx_enabled = true;
+        initRegion();
+
+        const meshtastic_Config_LoRaConfig before = config.lora;
+        meshtastic_Config c = makeLoraSetConfig(static_cast<meshtastic_Config_LoRaConfig_RegionCode>(254), true,
+                                                meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST);
+        c.payload_variant.lora.tx_enabled = false;
+        c.payload_variant.lora.channel_num = 7;
+
+        testAdmin->deferSaves();
+        TEST_ASSERT_FALSE(testAdmin->handleSetConfig(c, fromOthers));
+        TEST_ASSERT_EQUAL_MEMORY(&before, &config.lora, sizeof(before));
+        TEST_ASSERT_EQUAL_INT(0, testAdmin->savedSegments());
+    }
+}
+
+static void test_handleSetConfig_rejectionRepliesBadRequest()
+{
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    config.lora.tx_enabled = true;
+    initRegion();
+    const meshtastic_Config_LoRaConfig before = config.lora;
+
+    hamMockRouter = new HamModeMockRouter();
+    router = hamMockRouter;
+
+    meshtastic_AdminMessage m = meshtastic_AdminMessage_init_zero;
+    m.which_payload_variant = meshtastic_AdminMessage_set_config_tag;
+    m.set_config = makeLoraSetConfig(static_cast<meshtastic_Config_LoRaConfig_RegionCode>(254), true,
+                                     meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST);
+
+    meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+    mp.from = 0;
+    mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    mp.decoded.want_response = true;
+    testAdmin->handleReceivedProtobuf(mp, &m);
+
+    meshtastic_Routing_Error err = meshtastic_Routing_Error_NONE;
+    TEST_ASSERT_TRUE_MESSAGE(decodeRoutingError(testAdmin->reply(), err), "rejected config must queue an error reply");
+    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_BAD_REQUEST, err);
+    TEST_ASSERT_EQUAL_MEMORY(&before, &config.lora, sizeof(before));
+    TEST_ASSERT_EQUAL_INT(0, testAdmin->savedSegments());
+    testAdmin->drainReply();
+}
+
+// clampBandwidthCode: an unset (0) bandwidth code maps to the default; any
+// other code is left as-is.
 static void test_clampBandwidthCode_zeroMapsToDefaultOthersUnchanged()
 {
     TEST_ASSERT_NOT_EQUAL_UINT16(0, clampBandwidthCode(0)); // the point of the fix: 0 must not stay 0
@@ -1483,9 +1629,10 @@ static void test_clampBandwidthCode_zeroMapsToDefaultOthersUnchanged()
     TEST_ASSERT_EQUAL_UINT16(31, clampBandwidthCode(31));
 }
 
-// A custom (non-preset) config that leaves bandwidth at its proto zero-value must not persist as 0.
-// Pre-fix it slipped past validateConfigLora() and the radio silently ran at the default while
-// get_config still reported bandwidth 0. It is now coerced to the default code on ingest.
+// A custom (non-preset) config that leaves bandwidth at its proto zero-value
+// must not persist as 0. Pre-fix it slipped past validateConfigLora() and the
+// radio silently ran at the default while get_config still reported bandwidth
+// 0. It is now coerced to the default code on ingest.
 static void test_handleSetConfig_fromLocal_customBandwidthZeroClampedToDefault()
 {
     config.lora = meshtastic_Config_LoRaConfig_init_zero;
@@ -1503,14 +1650,15 @@ static void test_handleSetConfig_fromLocal_customBandwidthZeroClampedToDefault()
     testAdmin->handleSetConfig(c, false); // fromOthers = false (local client)
 
     TEST_ASSERT_FALSE(config.lora.use_preset);
-    TEST_ASSERT_NOT_EQUAL_UINT16(0, config.lora.bandwidth); // must not persist as 0
+    TEST_ASSERT_NOT_EQUAL_UINT16(0,
+                                 config.lora.bandwidth); // must not persist as 0
     TEST_ASSERT_EQUAL_UINT16(bwKHzToCode(LORA_BW_DEFAULT_KHZ), config.lora.bandwidth);
 }
 
-// Remote admin (fromOthers) is subject to the same ingest clamp: a custom bandwidth 0 from another
-// node is normalized to the default rather than persisted as 0 (it does not weaken the wholesale
-// rejection of configs that actually fail validation - a 0 bandwidth already passed validation).
-static void test_handleSetConfig_fromOthers_customBandwidthZeroClampedToDefault()
+// A remote controller must see failure rather than success for a malformed
+// tuple. Silently normalizing bandwidth 0 makes its ACK describe a generation
+// that was never installed byte-for-byte.
+static void test_handleSetConfig_fromOthers_customBandwidthZeroRejected()
 {
     config.lora = meshtastic_Config_LoRaConfig_init_zero;
     config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
@@ -1524,14 +1672,16 @@ static void test_handleSetConfig_fromOthers_customBandwidthZeroClampedToDefault(
     c.payload_variant.lora.coding_rate = 5;
     c.payload_variant.lora.bandwidth = 0;
 
-    testAdmin->handleSetConfig(c, true); // fromOthers = true
+    const meshtastic_Config_LoRaConfig before = config.lora;
+    testAdmin->deferSaves();
+    TEST_ASSERT_FALSE(testAdmin->handleSetConfig(c, true));
 
-    TEST_ASSERT_FALSE(config.lora.use_preset);
-    TEST_ASSERT_EQUAL_UINT16(bwKHzToCode(LORA_BW_DEFAULT_KHZ), config.lora.bandwidth);
+    TEST_ASSERT_EQUAL_MEMORY(&before, &config.lora, sizeof(before));
+    TEST_ASSERT_EQUAL_INT(0, testAdmin->savedSegments());
 }
 
-// In preset mode bandwidth 0 is the norm (the preset supplies it); the ingest clamp must leave it
-// untouched so preset configs still read back bandwidth 0.
+// In preset mode bandwidth 0 is the norm (the preset supplies it); the ingest
+// clamp must leave it untouched so preset configs still read back bandwidth 0.
 static void test_handleSetConfig_fromLocal_presetBandwidthZeroLeftUntouched()
 {
     config.lora = meshtastic_Config_LoRaConfig_init_zero;
@@ -1550,7 +1700,8 @@ static void test_handleSetConfig_fromLocal_presetBandwidthZeroLeftUntouched()
     TEST_ASSERT_EQUAL_UINT16(0, config.lora.bandwidth);
 }
 
-// A custom (non-preset) config with an already-valid bandwidth must be preserved verbatim.
+// A custom (non-preset) config with an already-valid bandwidth must be
+// preserved verbatim.
 static void test_handleSetConfig_fromLocal_customBandwidthNonZeroPreserved()
 {
     config.lora = meshtastic_Config_LoRaConfig_init_zero;
@@ -1571,9 +1722,10 @@ static void test_handleSetConfig_fromLocal_customBandwidthNonZeroPreserved()
     TEST_ASSERT_EQUAL_UINT16(125, config.lora.bandwidth);
 }
 
-// A security-config SET that omits the private key (partial/legacy client editing some other security field)
-// must NOT regenerate our keypair: our NodeNum is crc32(public_key), so a new keypair would silently change
-// our identity. The existing keypair has to be preserved.
+// A security-config SET that omits the private key (partial/legacy client
+// editing some other security field) must NOT regenerate our keypair: our
+// NodeNum is crc32(public_key), so a new keypair would silently change our
+// identity. The existing keypair has to be preserved.
 static void test_handleSetConfig_security_preservesKeypairWhenPrivateOmitted()
 {
     config.security = meshtastic_Config_SecurityConfig_init_zero;
@@ -1602,7 +1754,8 @@ static void test_handleSetConfig_security_preservesKeypairWhenPrivateOmitted()
     TEST_ASSERT_TRUE(config.security.serial_enabled);
 }
 
-// A SET that DOES supply a full 32-byte keypair (legitimate key import) must apply it, not preserve the old one.
+// A SET that DOES supply a full 32-byte keypair (legitimate key import) must
+// apply it, not preserve the old one.
 static void test_handleSetConfig_security_acceptsSuppliedKeypair()
 {
     config.security = meshtastic_Config_SecurityConfig_init_zero;
@@ -1629,8 +1782,9 @@ static void test_handleSetConfig_security_acceptsSuppliedKeypair()
     TEST_ASSERT_EQUAL_MEMORY(expectedPub, config.security.public_key.bytes, 32);
 }
 
-// Issue #11073: "regenerate keys" sends a blank SecurityConfig holding only the new private key. Replacing
-// the whole struct with it wiped the admin keys, locking the owner out of remote admin.
+// Issue #11073: "regenerate keys" sends a blank SecurityConfig holding only the
+// new private key. Replacing the whole struct with it wiped the admin keys,
+// locking the owner out of remote admin.
 static void test_handleSetConfig_security_rotationPreservesAdminKeys()
 {
     config.security = meshtastic_Config_SecurityConfig_init_zero;
@@ -1676,7 +1830,8 @@ static void test_handleSetConfig_security_rotationPreservesAdminKeys()
                       config.security.packet_signature_policy);
 }
 
-// The escape hatch: a SET that leaves the private key alone still clears admin keys.
+// The escape hatch: a SET that leaves the private key alone still clears admin
+// keys.
 static void test_handleSetConfig_security_clearsAdminKeysWhenKeypairUnchanged()
 {
     config.security = meshtastic_Config_SecurityConfig_init_zero;
@@ -1703,6 +1858,434 @@ static void test_handleSetConfig_security_clearsAdminKeysWhenKeypairUnchanged()
     TEST_ASSERT_EQUAL_UINT(0, config.security.admin_key[0].size);
 }
 
+// No low-entropy private key is published, so stand in for the engine to derive
+// a blacklisted public key on demand. hash() is left real: the blacklist lookup
+// runs through it.
+static const uint8_t COMPROMISED_PUBLIC_KEY[32] = {0xac, 0xaf, 0x8c, 0x1c, 0x3c, 0x1c, 0x37, 0xac, 0x4f, 0x03, 0xa1,
+                                                   0xe9, 0xfc, 0x37, 0x23, 0x29, 0xc8, 0xa3, 0x5d, 0x7f, 0x05, 0x26,
+                                                   0xeb, 0x00, 0xbd, 0x26, 0xb8, 0x2e, 0xb1, 0x94, 0x7d, 0x24};
+
+class RestoreDerivingCryptoEngine : public CryptoEngine
+{
+  public:
+    bool regenerateSucceeds = true;
+    bool derivesLowEntropy = true;
+    bool regeneratePublicKey(uint8_t *pubKey, uint8_t *privKey) override
+    {
+        if (!regenerateSucceeds)
+            return false;
+        if (derivesLowEntropy)
+            memcpy(pubKey, COMPROMISED_PUBLIC_KEY, 32);
+        else
+            memset(pubKey, 0x7C, 32);
+        memcpy(public_key, pubKey, 32);
+        memcpy(private_key, privKey, 32);
+        return true;
+    }
+    bool mintsLowEntropy = false;
+    void generateKeyPair(uint8_t *pubKey, uint8_t *privKey) override
+    {
+        if (mintsLowEntropy)
+            memcpy(pubKey, COMPROMISED_PUBLIC_KEY, 32);
+        else
+            memset(pubKey, 0x5E, 32);
+        memset(privKey, 0x5F, 32);
+        memcpy(public_key, pubKey, 32);
+        memcpy(private_key, privKey, 32);
+    }
+};
+
+static CryptoEngine *savedCrypto;
+static RestoreDerivingCryptoEngine *restoreCrypto;
+
+// Installed here and torn down in restoreAdminRadioGlobals(), not at the end of
+// the test body: a failed TEST_ASSERT longjmps straight out, which would leave
+// later tests running against a freed stub.
+static RestoreDerivingCryptoEngine *installRestoreCrypto()
+{
+    savedCrypto = crypto;
+    restoreCrypto = new RestoreDerivingCryptoEngine();
+    crypto = restoreCrypto;
+    return restoreCrypto;
+}
+
+static void assertLiveCryptoIdentityCleared()
+{
+    const uint8_t zeroKey[32] = {};
+    TEST_ASSERT_NOT_NULL(restoreCrypto);
+    TEST_ASSERT_EQUAL_MEMORY(zeroKey, restoreCrypto->private_key, sizeof(zeroKey));
+    TEST_ASSERT_EQUAL_MEMORY(zeroKey, restoreCrypto->public_key, sizeof(zeroKey));
+}
+
+static void dropRestoreCryptoStub()
+{
+    if (!restoreCrypto)
+        return;
+    crypto = savedCrypto;
+    delete restoreCrypto;
+    restoreCrypto = nullptr;
+}
+
+// Arms a bare private-key restore: region set so keygen runs, private key
+// present, public key absent.
+static meshtastic_Config makeBareKeyRestoreConfig()
+{
+    config.security = meshtastic_Config_SecurityConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    initRegion();
+
+    meshtastic_Config c = meshtastic_Config_init_zero;
+    c.which_payload_variant = meshtastic_Config_security_tag;
+    c.payload_variant.security.private_key.size = 32;
+    memset(c.payload_variant.security.private_key.bytes, 0x11, 32);
+    return c;
+}
+
+static bool capturedWarningsContain(const char *needle)
+{
+    for (const std::string &w : capturedWarnings)
+        if (w.find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+
+// A restored private key deriving a blacklisted public key is rejected and
+// rotated at set time, and the client is told why - not left to discover it
+// after the next reboot.
+static void test_handleSetConfig_security_lowEntropyRestoreWarnsAndRotates()
+{
+    installRestoreCrypto();
+
+    const meshtastic_Config c = makeBareKeyRestoreConfig();
+    testAdmin->deferSaves();
+    testAdmin->handleSetConfig(c, false);
+
+    TEST_ASSERT_TRUE(nodeDB->keyIsLowEntropy);
+    TEST_ASSERT_EQUAL_UINT(32, config.security.public_key.size);
+    TEST_ASSERT_TRUE(memcmp(COMPROMISED_PUBLIC_KEY, config.security.public_key.bytes, 32) != 0);
+    TEST_ASSERT_FALSE(nodeDB->checkLowEntropyPublicKey(config.security.public_key));
+    TEST_ASSERT_TRUE(capturedWarningsContain(LOW_ENTROPY_RESTORE_WARNING));
+}
+
+// A restore carrying a whole blacklisted pair must not skip validation just
+// because it populated the public key too - that path reaches neither keygen
+// branch, so the weak identity used to be kept.
+static void test_handleSetConfig_security_lowEntropyFullKeypairRestoreIsRejected()
+{
+    installRestoreCrypto();
+
+    config.security = meshtastic_Config_SecurityConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    initRegion();
+
+    meshtastic_Config c = meshtastic_Config_init_zero;
+    c.which_payload_variant = meshtastic_Config_security_tag;
+    c.payload_variant.security.private_key.size = 32;
+    memset(c.payload_variant.security.private_key.bytes, 0x11, 32);
+    c.payload_variant.security.public_key.size = 32;
+    memcpy(c.payload_variant.security.public_key.bytes, COMPROMISED_PUBLIC_KEY, 32);
+
+    testAdmin->deferSaves();
+    testAdmin->handleSetConfig(c, false);
+
+    TEST_ASSERT_EQUAL_UINT(32, config.security.public_key.size);
+    TEST_ASSERT_TRUE(memcmp(COMPROMISED_PUBLIC_KEY, config.security.public_key.bytes, 32) != 0);
+    TEST_ASSERT_FALSE(nodeDB->checkLowEntropyPublicKey(config.security.public_key));
+    TEST_ASSERT_TRUE(capturedWarningsContain(LOW_ENTROPY_RESTORE_WARNING));
+}
+
+// A blacklisted public key whose private key derives a clean one is only
+// re-derived - the user's key does stick, so the "a new secure key was
+// generated" warning would be a lie here.
+static void test_handleSetConfig_security_reDerivedCleanKeyDoesNotWarn()
+{
+    installRestoreCrypto()->derivesLowEntropy = false;
+
+    config.security = meshtastic_Config_SecurityConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    initRegion();
+
+    meshtastic_Config c = meshtastic_Config_init_zero;
+    c.which_payload_variant = meshtastic_Config_security_tag;
+    c.payload_variant.security.private_key.size = 32;
+    memset(c.payload_variant.security.private_key.bytes, 0x11, 32);
+    c.payload_variant.security.public_key.size = 32;
+    memcpy(c.payload_variant.security.public_key.bytes, COMPROMISED_PUBLIC_KEY, 32);
+
+    testAdmin->deferSaves();
+    testAdmin->handleSetConfig(c, false);
+
+    // The supplied private key survives, and the blacklisted public key is
+    // replaced by its derivation.
+    uint8_t expectedPriv[32];
+    memset(expectedPriv, 0x11, 32);
+    TEST_ASSERT_EQUAL_MEMORY(expectedPriv, config.security.private_key.bytes, 32);
+    TEST_ASSERT_FALSE(nodeDB->checkLowEntropyPublicKey(config.security.public_key));
+    TEST_ASSERT_TRUE(memcmp(COMPROMISED_PUBLIC_KEY, config.security.public_key.bytes, 32) != 0);
+    TEST_ASSERT_FALSE(capturedWarningsContain(LOW_ENTROPY_RESTORE_WARNING));
+}
+
+// A replacement that is itself blacklisted leaves no identity behind -
+// persisting a known-weak key would defeat the rejection this whole path exists
+// for.
+static void test_handleSetConfig_security_blacklistedMintLeavesNoKey()
+{
+    installRestoreCrypto()->mintsLowEntropy = true;
+
+    const meshtastic_Config c = makeBareKeyRestoreConfig();
+    testAdmin->deferSaves();
+    testAdmin->handleSetConfig(c, false);
+
+    TEST_ASSERT_EQUAL_UINT(0, config.security.private_key.size);
+    TEST_ASSERT_EQUAL_UINT(0, config.security.public_key.size);
+    assertLiveCryptoIdentityCleared();
+    TEST_ASSERT_FALSE(capturedWarningsContain(LOW_ENTROPY_RESTORE_WARNING));
+}
+
+// Selecting the first region also makes LoRa eligible to transmit. If PKI
+// activation fails, the request must be rejected as a unit instead of saving
+// an enabled radio config with no authenticatable node identity.
+static void test_handleSetConfig_firstRegionIdentityFailureRollsBackAndRepliesBadRequest()
+{
+    installRestoreCrypto()->mintsLowEntropy = true;
+
+    owner = meshtastic_User_init_zero;
+    config.has_security = true;
+    config.security = meshtastic_Config_SecurityConfig_init_zero;
+    config.has_lora = true;
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    config.lora.tx_enabled = false;
+    nodeDB->keyIsLowEntropy = true;
+    nodeDB->licensedIdentityMigrationPending = true;
+    initRegion();
+
+    const meshtastic_Config_LoRaConfig oldLora = config.lora;
+    const meshtastic_Config_SecurityConfig oldSecurity = config.security;
+    const meshtastic_User oldOwner = owner;
+    const NodeNum oldNodeNum = nodeDB->getNodeNum();
+    RadioInterface::uses_default_frequency_slot = false;
+    RadioInterface::uses_custom_channel_name = true;
+
+    hamMockRouter = new HamModeMockRouter();
+    router = hamMockRouter;
+
+    meshtastic_AdminMessage m = meshtastic_AdminMessage_init_zero;
+    m.which_payload_variant = meshtastic_AdminMessage_set_config_tag;
+    m.set_config =
+        makeLoraSetConfig(meshtastic_Config_LoRaConfig_RegionCode_US, true, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST);
+
+    meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+    mp.from = 0;
+    mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    mp.decoded.want_response = true;
+    testAdmin->handleReceivedProtobuf(mp, &m);
+
+    meshtastic_Routing_Error err = meshtastic_Routing_Error_NONE;
+    TEST_ASSERT_TRUE_MESSAGE(decodeRoutingError(testAdmin->reply(), err), "identity failure must queue an error reply");
+    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_BAD_REQUEST, err);
+    TEST_ASSERT_EQUAL_MEMORY(&oldLora, &config.lora, sizeof(oldLora));
+    TEST_ASSERT_EQUAL_MEMORY(&oldSecurity, &config.security, sizeof(oldSecurity));
+    TEST_ASSERT_EQUAL_MEMORY(&oldOwner, &owner, sizeof(oldOwner));
+    TEST_ASSERT_EQUAL_UINT32(oldNodeNum, nodeDB->getNodeNum());
+    TEST_ASSERT_FALSE(RadioInterface::uses_default_frequency_slot);
+    TEST_ASSERT_TRUE(RadioInterface::uses_custom_channel_name);
+    TEST_ASSERT_TRUE(nodeDB->keyIsLowEntropy);
+    TEST_ASSERT_TRUE(nodeDB->licensedIdentityMigrationPending);
+    assertLiveCryptoIdentityCleared();
+    TEST_ASSERT_EQUAL_INT(0, testAdmin->savedSegments());
+    testAdmin->drainReply();
+}
+
+static void test_handleSetOwner_licensingIdentityFailureRollsBackAndRepliesBadRequest()
+{
+    RestoreDerivingCryptoEngine *engine = installRestoreCrypto();
+    engine->mintsLowEntropy = true;
+
+    owner = meshtastic_User_init_zero;
+    config.has_security = true;
+    config.security = meshtastic_Config_SecurityConfig_init_zero;
+    config.security.private_key.size = 32;
+    memset(config.security.private_key.bytes, 0x31, 32);
+    config.security.public_key.size = 32;
+    memcpy(config.security.public_key.bytes, COMPROMISED_PUBLIC_KEY, 32);
+    owner.public_key.size = 32;
+    memcpy(owner.public_key.bytes, COMPROMISED_PUBLIC_KEY, 32);
+    uint8_t installedPublicKey[32];
+    TEST_ASSERT_TRUE(engine->regeneratePublicKey(installedPublicKey, config.security.private_key.bytes));
+    config.has_lora = true;
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    installEncryptedAndAdminChannels();
+    nodeDB->keyIsLowEntropy = true;
+    nodeDB->licensedIdentityMigrationPending = true;
+    initRegion();
+
+    const meshtastic_User oldOwner = owner;
+    const meshtastic_Config_SecurityConfig oldSecurity = config.security;
+    const meshtastic_ChannelFile oldChannels = channelFile;
+    const NodeNum oldNodeNum = nodeDB->getNodeNum();
+
+    hamMockRouter = new HamModeMockRouter();
+    router = hamMockRouter;
+    meshtastic_AdminMessage m = meshtastic_AdminMessage_init_zero;
+    m.which_payload_variant = meshtastic_AdminMessage_set_owner_tag;
+    m.set_owner.is_licensed = true;
+    meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+    mp.from = 0;
+    mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    mp.decoded.want_response = true;
+    testAdmin->handleReceivedProtobuf(mp, &m);
+
+    meshtastic_Routing_Error err = meshtastic_Routing_Error_NONE;
+    TEST_ASSERT_TRUE_MESSAGE(decodeRoutingError(testAdmin->reply(), err), "failed licensing must queue an error reply");
+    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_BAD_REQUEST, err);
+    TEST_ASSERT_EQUAL_MEMORY(&oldOwner, &owner, sizeof(oldOwner));
+    TEST_ASSERT_EQUAL_MEMORY(&oldSecurity, &config.security, sizeof(oldSecurity));
+    TEST_ASSERT_EQUAL_MEMORY(&oldChannels, &channelFile, sizeof(oldChannels));
+    TEST_ASSERT_EQUAL_UINT32(oldNodeNum, nodeDB->getNodeNum());
+    TEST_ASSERT_TRUE(nodeDB->keyIsLowEntropy);
+    TEST_ASSERT_TRUE(nodeDB->licensedIdentityMigrationPending);
+    TEST_ASSERT_EQUAL_MEMORY(oldSecurity.private_key.bytes, restoreCrypto->private_key, 32);
+    TEST_ASSERT_EQUAL_MEMORY(oldSecurity.public_key.bytes, restoreCrypto->public_key, 32);
+    TEST_ASSERT_EQUAL_INT(0, testAdmin->savedSegments());
+    TEST_ASSERT_TRUE(capturedWarnings.empty());
+    testAdmin->drainReply();
+}
+
+static void test_handleSetHamMode_identityFailureRollsBackAndRepliesBadRequest()
+{
+    installRestoreCrypto()->mintsLowEntropy = true;
+
+    owner = meshtastic_User_init_zero;
+    config.has_security = true;
+    config.security = meshtastic_Config_SecurityConfig_init_zero;
+    config.has_lora = true;
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    config.device = meshtastic_Config_DeviceConfig_init_zero;
+    installEncryptedAndAdminChannels();
+    nodeDB->keyIsLowEntropy = true;
+    nodeDB->licensedIdentityMigrationPending = true;
+    initRegion();
+
+    const meshtastic_User oldOwner = owner;
+    const meshtastic_Config_DeviceConfig oldDevice = config.device;
+    const meshtastic_Config_LoRaConfig oldLora = config.lora;
+    const meshtastic_Config_SecurityConfig oldSecurity = config.security;
+    const meshtastic_ChannelFile oldChannels = channelFile;
+    const NodeNum oldNodeNum = nodeDB->getNodeNum();
+
+    hamMockRouter = new HamModeMockRouter();
+    router = hamMockRouter;
+    meshtastic_AdminMessage m = meshtastic_AdminMessage_init_zero;
+    m.which_payload_variant = meshtastic_AdminMessage_set_ham_mode_tag;
+    strncpy(m.set_ham_mode.call_sign, "KD2ABC", sizeof(m.set_ham_mode.call_sign) - 1);
+    strncpy(m.set_ham_mode.short_name, "ABC", sizeof(m.set_ham_mode.short_name) - 1);
+    meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+    mp.from = 0;
+    mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    mp.decoded.want_response = true;
+    testAdmin->handleReceivedProtobuf(mp, &m);
+
+    meshtastic_Routing_Error err = meshtastic_Routing_Error_NONE;
+    TEST_ASSERT_TRUE_MESSAGE(decodeRoutingError(testAdmin->reply(), err), "failed ham mode must queue an error reply");
+    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_BAD_REQUEST, err);
+    TEST_ASSERT_EQUAL_MEMORY(&oldOwner, &owner, sizeof(oldOwner));
+    TEST_ASSERT_EQUAL_MEMORY(&oldDevice, &config.device, sizeof(oldDevice));
+    TEST_ASSERT_EQUAL_MEMORY(&oldLora, &config.lora, sizeof(oldLora));
+    TEST_ASSERT_EQUAL_MEMORY(&oldSecurity, &config.security, sizeof(oldSecurity));
+    TEST_ASSERT_EQUAL_MEMORY(&oldChannels, &channelFile, sizeof(oldChannels));
+    TEST_ASSERT_EQUAL_UINT32(oldNodeNum, nodeDB->getNodeNum());
+    TEST_ASSERT_TRUE(nodeDB->keyIsLowEntropy);
+    TEST_ASSERT_TRUE(nodeDB->licensedIdentityMigrationPending);
+    assertLiveCryptoIdentityCleared();
+    TEST_ASSERT_EQUAL_INT(0, testAdmin->savedSegments());
+    TEST_ASSERT_TRUE(capturedWarnings.empty());
+    testAdmin->drainReply();
+}
+
+// factory_reset_config keeps the private key and clears the public one, so the
+// entry check sees no key and the boot-time derive path used to adopt whatever
+// it produced - including a known-weak key.
+static void test_generateCryptoKeyPair_derivedFromStoredPrivateIsChecked()
+{
+    installRestoreCrypto();
+    config.security = meshtastic_Config_SecurityConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    initRegion();
+    config.security.private_key.size = 32;
+    memset(config.security.private_key.bytes, 0x11, 32);
+    config.security.public_key.size = 0; // as installDefaultConfig(preserveKey = true) leaves it
+
+    TEST_ASSERT_TRUE(nodeDB->generateCryptoKeyPair());
+
+    TEST_ASSERT_TRUE(nodeDB->keyIsLowEntropy);
+    TEST_ASSERT_TRUE(memcmp(COMPROMISED_PUBLIC_KEY, config.security.public_key.bytes, 32) != 0);
+    TEST_ASSERT_FALSE(nodeDB->checkLowEntropyPublicKey(config.security.public_key));
+}
+
+// Same clear-and-fail on the boot path: a stored private key that derives
+// nothing must not leave both sizes at 32, claiming a pair the node never got.
+static void test_generateCryptoKeyPair_failedDerivationFromStoredPrivateClearsKeySizes()
+{
+    installRestoreCrypto()->regenerateSucceeds = false;
+    config.security = meshtastic_Config_SecurityConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    initRegion();
+    config.security.private_key.size = 32;
+    memset(config.security.private_key.bytes, 0x11, 32);
+    config.security.public_key.size = 0;
+
+    TEST_ASSERT_FALSE(nodeDB->generateCryptoKeyPair());
+
+    TEST_ASSERT_EQUAL_UINT(0, config.security.private_key.size);
+    TEST_ASSERT_EQUAL_UINT(0, config.security.public_key.size);
+}
+
+// keyIsLowEntropy survives from a boot-time regeneration, and
+// generateCryptoKeyPair returns early on an unset region without clearing it.
+// The restore warning must stay gated on this keygen running.
+static void test_handleSetConfig_security_staleLowEntropyFlagDoesNotWarn()
+{
+    config.security = meshtastic_Config_SecurityConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+    initRegion();
+    nodeDB->keyIsLowEntropy = true;
+
+    meshtastic_Config c = meshtastic_Config_init_zero;
+    c.which_payload_variant = meshtastic_Config_security_tag;
+    c.payload_variant.security.private_key.size = 32;
+    memset(c.payload_variant.security.private_key.bytes, 0x11, 32);
+
+    testAdmin->deferSaves();
+    testAdmin->handleSetConfig(c, false);
+
+    TEST_ASSERT_FALSE(capturedWarningsContain(LOW_ENTROPY_RESTORE_WARNING));
+}
+
+// A private key that derives nothing usable must not leave sizes claiming a
+// 32-byte pair behind: that state gets persisted, and every later keygen
+// re-derives from the same dead key.
+static void test_handleSetConfig_security_failedDerivationClearsKeySizes()
+{
+    installRestoreCrypto()->regenerateSucceeds = false;
+
+    const meshtastic_Config c = makeBareKeyRestoreConfig();
+    testAdmin->deferSaves();
+    testAdmin->handleSetConfig(c, false);
+
+    TEST_ASSERT_EQUAL_UINT(0, config.security.private_key.size);
+    TEST_ASSERT_EQUAL_UINT(0, config.security.public_key.size);
+    TEST_ASSERT_FALSE(capturedWarningsContain(LOW_ENTROPY_RESTORE_WARNING));
+}
+
 static void test_regionInfo_supportsPreset()
 {
     const RegionInfo *eu868 = getRegion(meshtastic_Config_LoRaConfig_RegionCode_EU_868);
@@ -1714,8 +2297,9 @@ static void test_regionInfo_supportsPreset()
     TEST_ASSERT_TRUE(eu866->supportsPreset(meshtastic_Config_LoRaConfig_ModemPreset_LITE_SLOW));
     TEST_ASSERT_FALSE(eu866->supportsPreset(meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST));
 
-    // UNSET enforces nothing (the radio is silent regardless), so it supports every real
-    // preset - not just the LONG_FAST its own profile advertises as the default.
+    // UNSET enforces nothing (the radio is silent regardless), so it supports
+    // every real preset - not just the LONG_FAST its own profile advertises as
+    // the default.
     const RegionInfo *unset = getRegion(meshtastic_Config_LoRaConfig_RegionCode_UNSET);
     TEST_ASSERT_TRUE(unset->supportsPreset(meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST));
     TEST_ASSERT_TRUE(unset->supportsPreset(meshtastic_Config_LoRaConfig_ModemPreset_SHORT_TURBO));
@@ -1754,7 +2338,8 @@ static void test_handleSetConfig_fromOthers_siblingLockedPresetSwapsRegion()
     config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LITE_FAST;
     initRegion();
 
-    // Remote admin keeps the region but selects a NARROW preset (locked to EU_N_868)
+    // Remote admin keeps the region but selects a NARROW preset (locked to
+    // EU_N_868)
     meshtastic_Config c = makeLoraSetConfig(meshtastic_Config_LoRaConfig_RegionCode_EU_866, true,
                                             meshtastic_Config_LoRaConfig_ModemPreset_NARROW_FAST);
 
@@ -1770,7 +2355,8 @@ static void test_handleSetConfig_fromOthers_siblingLockedPresetSwapsRegion()
 
 static void test_handleSetConfig_fromOthers_lockedPresetFromNonTrioRegionRejected()
 {
-    // Baseline: US is not one of the swappable trio, so a LITE preset must be rejected
+    // Baseline: US is not one of the swappable trio, so a LITE preset must be
+    // rejected
     config.lora = meshtastic_Config_LoRaConfig_init_zero;
     config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
     config.lora.use_preset = true;
@@ -1788,8 +2374,8 @@ static void test_handleSetConfig_fromOthers_lockedPresetFromNonTrioRegionRejecte
 
 static void test_handleSetConfig_presetChosenBeforeRegionSurvives()
 {
-    // A fresh device: the user picks a preset in the app before choosing a region. The
-    // unset region must not clamp that choice back to LONG_FAST.
+    // A fresh device: the user picks a preset in the app before choosing a
+    // region. The unset region must not clamp that choice back to LONG_FAST.
     config.lora = meshtastic_Config_LoRaConfig_init_zero;
     config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
     config.lora.use_preset = true;
@@ -1807,8 +2393,9 @@ static void test_handleSetConfig_presetChosenBeforeRegionSurvives()
 
 static void test_handleSetConfig_unsettingRegionKeepsPreset()
 {
-    // Clearing the region is a valid request in its own right. It must take effect (and
-    // disable tx) without discarding the config because the preset outlives the region.
+    // Clearing the region is a valid request in its own right. It must take
+    // effect (and disable tx) without discarding the config because the preset
+    // outlives the region.
     config.lora = meshtastic_Config_LoRaConfig_init_zero;
     config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
     config.lora.use_preset = true;
@@ -1830,13 +2417,292 @@ static void test_handleSetConfig_unsettingRegionKeepsPreset()
     initRegion();
 }
 
+static void resetRoleTransitionState()
+{
+    config = meshtastic_LocalConfig_init_default;
+    moduleConfig = meshtastic_LocalModuleConfig_init_default;
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+    owner.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+    owner.has_is_unmessagable = false;
+    owner.is_unmessagable = false;
+}
+
+static void enterRole(meshtastic_Config_DeviceConfig_Role role)
+{
+    const meshtastic_Config_DeviceConfig_Role previous = config.device.role;
+    config.device.role = role;
+    nodeDB->installRoleDefaults(role, previous);
+}
+
+static void leaveRoleForClientMute(meshtastic_Config_DeviceConfig_Role previous)
+{
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE;
+    nodeDB->installRoleDefaults(config.device.role, previous);
+}
+
+#ifdef USERPREFS_CONFIG_GPS_UPDATE_INTERVAL
+static constexpr uint32_t expectedNormalGpsUpdateInterval = USERPREFS_CONFIG_GPS_UPDATE_INTERVAL;
+#else
+static constexpr uint32_t expectedNormalGpsUpdateInterval = 2 * 60;
+#endif
+#ifdef USERPREFS_CONFIG_POSITION_BROADCAST_INTERVAL
+static constexpr uint32_t expectedNormalPositionBroadcastInterval = USERPREFS_CONFIG_POSITION_BROADCAST_INTERVAL;
+#else
+static constexpr uint32_t expectedNormalPositionBroadcastInterval = 60 * 60;
+#endif
+#ifdef USERPREFS_CONFIG_DEVICE_TELEM_UPDATE_INTERVAL
+static constexpr uint32_t expectedNormalDeviceTelemetryInterval = USERPREFS_CONFIG_DEVICE_TELEM_UPDATE_INTERVAL;
+#else
+static constexpr uint32_t expectedNormalDeviceTelemetryInterval = MAX_INTERVAL;
+#endif
+#ifdef USERPREFS_CONFIG_SMART_POSITION_ENABLED
+static constexpr bool expectedNormalSmartPositionEnabled = USERPREFS_CONFIG_SMART_POSITION_ENABLED;
+#else
+static constexpr bool expectedNormalSmartPositionEnabled = true;
+#endif
+
+static void assertMessagingOwnerRole()
+{
+    TEST_ASSERT_TRUE(owner.has_is_unmessagable);
+    TEST_ASSERT_FALSE(owner.is_unmessagable);
+    TEST_ASSERT_EQUAL(meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE, owner.role);
+    const meshtastic_NodeInfoLite *self = nodeDB->getMeshNode(nodeDB->getNodeNum());
+    TEST_ASSERT_NOT_NULL(self);
+    TEST_ASSERT_EQUAL(meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE, self->role);
+}
+
+static void test_roleTransitions_clearInfrastructureDefaultsAndUnmessagable()
+{
+    constexpr uint32_t normalPositionFlags =
+        meshtastic_Config_PositionConfig_PositionFlags_ALTITUDE | meshtastic_Config_PositionConfig_PositionFlags_ALTITUDE_MSL |
+        meshtastic_Config_PositionConfig_PositionFlags_SPEED | meshtastic_Config_PositionConfig_PositionFlags_HEADING |
+        meshtastic_Config_PositionConfig_PositionFlags_DOP | meshtastic_Config_PositionConfig_PositionFlags_SATINVIEW;
+
+    for (const auto previous : {meshtastic_Config_DeviceConfig_Role_ROUTER, meshtastic_Config_DeviceConfig_Role_ROUTER_LATE,
+                                meshtastic_Config_DeviceConfig_Role_SENSOR, meshtastic_Config_DeviceConfig_Role_TRACKER,
+                                meshtastic_Config_DeviceConfig_Role_TAK_TRACKER}) {
+        resetRoleTransitionState();
+        enterRole(previous);
+        TEST_ASSERT_TRUE(owner.is_unmessagable);
+
+        leaveRoleForClientMute(previous);
+        assertMessagingOwnerRole();
+
+        switch (previous) {
+        case meshtastic_Config_DeviceConfig_Role_ROUTER:
+            TEST_ASSERT_EQUAL(meshtastic_Config_DeviceConfig_RebroadcastMode_ALL, config.device.rebroadcast_mode);
+            TEST_ASSERT_EQUAL_UINT32(expectedNormalGpsUpdateInterval, config.position.gps_update_interval);
+            TEST_ASSERT_EQUAL_UINT32(expectedNormalPositionBroadcastInterval, config.position.position_broadcast_secs);
+            TEST_ASSERT_EQUAL_UINT32(5 * 60, config.power.ls_secs);
+            TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, config.power.sds_secs);
+#ifdef USE_POWERSAVE
+            TEST_ASSERT_EQUAL_UINT32(30, config.power.wait_bluetooth_secs);
+            TEST_ASSERT_EQUAL_UINT32(30, config.display.screen_on_secs);
+#else
+            TEST_ASSERT_EQUAL_UINT32(60, config.power.wait_bluetooth_secs);
+            TEST_ASSERT_EQUAL_UINT32(60 * 10, config.display.screen_on_secs);
+#endif
+            TEST_ASSERT_EQUAL_UINT32(expectedNormalDeviceTelemetryInterval, moduleConfig.telemetry.device_update_interval);
+            break;
+        case meshtastic_Config_DeviceConfig_Role_ROUTER_LATE:
+            TEST_ASSERT_EQUAL_UINT32(expectedNormalDeviceTelemetryInterval, moduleConfig.telemetry.device_update_interval);
+            break;
+        case meshtastic_Config_DeviceConfig_Role_SENSOR:
+            TEST_ASSERT_EQUAL_UINT32(expectedNormalDeviceTelemetryInterval, moduleConfig.telemetry.device_update_interval);
+#ifdef USERPREFS_CONFIG_ENVIRONMENT_MEASUREMENT_ENABLED
+            TEST_ASSERT_EQUAL(USERPREFS_CONFIG_ENVIRONMENT_MEASUREMENT_ENABLED,
+                              moduleConfig.telemetry.environment_measurement_enabled);
+#else
+            TEST_ASSERT_FALSE(moduleConfig.telemetry.environment_measurement_enabled);
+#endif
+#ifdef USERPREFS_CONFIG_ENV_TELEM_UPDATE_INTERVAL
+            TEST_ASSERT_EQUAL_UINT32(USERPREFS_CONFIG_ENV_TELEM_UPDATE_INTERVAL,
+                                     moduleConfig.telemetry.environment_update_interval);
+#else
+            TEST_ASSERT_EQUAL_UINT32(0, moduleConfig.telemetry.environment_update_interval);
+#endif
+            break;
+        case meshtastic_Config_DeviceConfig_Role_TRACKER:
+            TEST_ASSERT_EQUAL_UINT32(expectedNormalDeviceTelemetryInterval, moduleConfig.telemetry.device_update_interval);
+            break;
+        case meshtastic_Config_DeviceConfig_Role_TAK_TRACKER:
+            TEST_ASSERT_EQUAL_UINT32(default_node_info_broadcast_secs, config.device.node_info_broadcast_secs);
+            TEST_ASSERT_EQUAL(expectedNormalSmartPositionEnabled, config.position.position_broadcast_smart_enabled);
+            TEST_ASSERT_EQUAL_UINT32(expectedNormalPositionBroadcastInterval, config.position.position_broadcast_secs);
+            TEST_ASSERT_EQUAL_UINT32(100, config.position.broadcast_smart_minimum_distance);
+            TEST_ASSERT_EQUAL_UINT32(default_broadcast_smart_minimum_interval_secs,
+                                     config.position.broadcast_smart_minimum_interval_secs);
+            TEST_ASSERT_EQUAL_UINT32(normalPositionFlags, config.position.position_flags);
+            TEST_ASSERT_EQUAL_UINT32(expectedNormalDeviceTelemetryInterval, moduleConfig.telemetry.device_update_interval);
+            break;
+        default:
+            TEST_FAIL_MESSAGE("unexpected role in transition table");
+        }
+    }
+}
+
+static void test_roleTransitions_cleanupHiddenTakAndLostAndFoundDefaults()
+{
+    resetRoleTransitionState();
+    enterRole(meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN);
+    leaveRoleForClientMute(meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN);
+    TEST_ASSERT_EQUAL(meshtastic_Config_DeviceConfig_RebroadcastMode_ALL, config.device.rebroadcast_mode);
+    TEST_ASSERT_EQUAL_UINT32(default_node_info_broadcast_secs, config.device.node_info_broadcast_secs);
+    TEST_ASSERT_EQUAL(expectedNormalSmartPositionEnabled, config.position.position_broadcast_smart_enabled);
+    TEST_ASSERT_EQUAL_UINT32(expectedNormalPositionBroadcastInterval, config.position.position_broadcast_secs);
+    TEST_ASSERT_EQUAL_UINT32(0, moduleConfig.neighbor_info.update_interval);
+    TEST_ASSERT_EQUAL_UINT32(expectedNormalDeviceTelemetryInterval, moduleConfig.telemetry.device_update_interval);
+#ifdef USERPREFS_CONFIG_ENV_TELEM_UPDATE_INTERVAL
+    TEST_ASSERT_EQUAL_UINT32(USERPREFS_CONFIG_ENV_TELEM_UPDATE_INTERVAL, moduleConfig.telemetry.environment_update_interval);
+#else
+    TEST_ASSERT_EQUAL_UINT32(0, moduleConfig.telemetry.environment_update_interval);
+#endif
+#ifdef USERPREFS_CONFIG_AQ_TELEM_UPDATE_INTERVAL
+    TEST_ASSERT_EQUAL_UINT32(USERPREFS_CONFIG_AQ_TELEM_UPDATE_INTERVAL, moduleConfig.telemetry.air_quality_interval);
+#else
+    TEST_ASSERT_EQUAL_UINT32(0, moduleConfig.telemetry.air_quality_interval);
+#endif
+    TEST_ASSERT_EQUAL_UINT32(0, moduleConfig.telemetry.health_update_interval);
+
+    resetRoleTransitionState();
+    enterRole(meshtastic_Config_DeviceConfig_Role_TAK);
+    leaveRoleForClientMute(meshtastic_Config_DeviceConfig_Role_TAK);
+    TEST_ASSERT_EQUAL_UINT32(default_node_info_broadcast_secs, config.device.node_info_broadcast_secs);
+    TEST_ASSERT_EQUAL(expectedNormalSmartPositionEnabled, config.position.position_broadcast_smart_enabled);
+    TEST_ASSERT_EQUAL_UINT32(expectedNormalPositionBroadcastInterval, config.position.position_broadcast_secs);
+    TEST_ASSERT_EQUAL_UINT32(expectedNormalDeviceTelemetryInterval, moduleConfig.telemetry.device_update_interval);
+
+    resetRoleTransitionState();
+    enterRole(meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND);
+    leaveRoleForClientMute(meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND);
+    TEST_ASSERT_EQUAL(expectedNormalSmartPositionEnabled, config.position.position_broadcast_smart_enabled);
+    TEST_ASSERT_EQUAL_UINT32(expectedNormalPositionBroadcastInterval, config.position.position_broadcast_secs);
+}
+
+static void test_roleTransitions_preserveCustomizedFormerRoleValues()
+{
+    resetRoleTransitionState();
+    enterRole(meshtastic_Config_DeviceConfig_Role_ROUTER);
+    config.device.rebroadcast_mode = meshtastic_Config_DeviceConfig_RebroadcastMode_LOCAL_ONLY;
+    config.position.gps_update_interval = ONE_DAY + 7;
+    config.position.position_broadcast_secs = ONE_DAY / 2 + 7;
+    config.power.ls_secs = ONE_DAY + 7;
+    config.power.sds_secs = ONE_DAY + 7;
+    config.power.wait_bluetooth_secs = 7;
+    config.display.screen_on_secs = 7;
+    moduleConfig.telemetry.device_update_interval = ONE_DAY / 2 + 7;
+    leaveRoleForClientMute(meshtastic_Config_DeviceConfig_Role_ROUTER);
+    TEST_ASSERT_EQUAL(meshtastic_Config_DeviceConfig_RebroadcastMode_LOCAL_ONLY, config.device.rebroadcast_mode);
+    TEST_ASSERT_EQUAL_UINT32(ONE_DAY + 7, config.position.gps_update_interval);
+    TEST_ASSERT_EQUAL_UINT32(ONE_DAY / 2 + 7, config.position.position_broadcast_secs);
+    TEST_ASSERT_EQUAL_UINT32(ONE_DAY + 7, config.power.ls_secs);
+    TEST_ASSERT_EQUAL_UINT32(ONE_DAY + 7, config.power.sds_secs);
+    TEST_ASSERT_EQUAL_UINT32(7, config.power.wait_bluetooth_secs);
+    TEST_ASSERT_EQUAL_UINT32(7, config.display.screen_on_secs);
+    TEST_ASSERT_EQUAL_UINT32(ONE_DAY / 2 + 7, moduleConfig.telemetry.device_update_interval);
+
+    resetRoleTransitionState();
+    enterRole(meshtastic_Config_DeviceConfig_Role_SENSOR);
+    moduleConfig.telemetry.device_update_interval = 3607;
+    moduleConfig.telemetry.environment_measurement_enabled = false;
+    moduleConfig.telemetry.environment_update_interval = 307;
+    leaveRoleForClientMute(meshtastic_Config_DeviceConfig_Role_SENSOR);
+    TEST_ASSERT_EQUAL_UINT32(3607, moduleConfig.telemetry.device_update_interval);
+    TEST_ASSERT_FALSE(moduleConfig.telemetry.environment_measurement_enabled);
+    TEST_ASSERT_EQUAL_UINT32(307, moduleConfig.telemetry.environment_update_interval);
+
+    resetRoleTransitionState();
+    enterRole(meshtastic_Config_DeviceConfig_Role_TAK_TRACKER);
+    config.device.node_info_broadcast_secs = ONE_DAY + 7;
+    config.position.position_broadcast_secs = 187;
+    config.position.broadcast_smart_minimum_distance = 27;
+    config.position.broadcast_smart_minimum_interval_secs = 17;
+    config.position.position_broadcast_smart_enabled = false;
+    config.position.position_flags = meshtastic_Config_PositionConfig_PositionFlags_ALTITUDE;
+    moduleConfig.telemetry.device_update_interval = ONE_DAY + 7;
+    leaveRoleForClientMute(meshtastic_Config_DeviceConfig_Role_TAK_TRACKER);
+    TEST_ASSERT_EQUAL_UINT32(ONE_DAY + 7, config.device.node_info_broadcast_secs);
+    TEST_ASSERT_EQUAL_UINT32(187, config.position.position_broadcast_secs);
+    TEST_ASSERT_EQUAL_UINT32(27, config.position.broadcast_smart_minimum_distance);
+    TEST_ASSERT_EQUAL_UINT32(17, config.position.broadcast_smart_minimum_interval_secs);
+    TEST_ASSERT_FALSE(config.position.position_broadcast_smart_enabled);
+    TEST_ASSERT_EQUAL_UINT32(meshtastic_Config_PositionConfig_PositionFlags_ALTITUDE, config.position.position_flags);
+    TEST_ASSERT_EQUAL_UINT32(ONE_DAY + 7, moduleConfig.telemetry.device_update_interval);
+
+    resetRoleTransitionState();
+    enterRole(meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN);
+    config.device.rebroadcast_mode = meshtastic_Config_DeviceConfig_RebroadcastMode_CORE_PORTNUMS_ONLY;
+    config.device.node_info_broadcast_secs = MAX_INTERVAL - 1;
+    config.position.position_broadcast_smart_enabled = true;
+    config.position.position_broadcast_secs = MAX_INTERVAL - 2;
+    moduleConfig.neighbor_info.update_interval = MAX_INTERVAL - 3;
+    moduleConfig.telemetry.device_update_interval = MAX_INTERVAL - 4;
+    moduleConfig.telemetry.environment_update_interval = MAX_INTERVAL - 5;
+    moduleConfig.telemetry.air_quality_interval = MAX_INTERVAL - 6;
+    moduleConfig.telemetry.health_update_interval = MAX_INTERVAL - 7;
+    leaveRoleForClientMute(meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN);
+    TEST_ASSERT_EQUAL(meshtastic_Config_DeviceConfig_RebroadcastMode_CORE_PORTNUMS_ONLY, config.device.rebroadcast_mode);
+    TEST_ASSERT_EQUAL_UINT32(MAX_INTERVAL - 1, config.device.node_info_broadcast_secs);
+    TEST_ASSERT_TRUE(config.position.position_broadcast_smart_enabled);
+    TEST_ASSERT_EQUAL_UINT32(MAX_INTERVAL - 2, config.position.position_broadcast_secs);
+    TEST_ASSERT_EQUAL_UINT32(MAX_INTERVAL - 3, moduleConfig.neighbor_info.update_interval);
+    TEST_ASSERT_EQUAL_UINT32(MAX_INTERVAL - 4, moduleConfig.telemetry.device_update_interval);
+    TEST_ASSERT_EQUAL_UINT32(MAX_INTERVAL - 5, moduleConfig.telemetry.environment_update_interval);
+    TEST_ASSERT_EQUAL_UINT32(MAX_INTERVAL - 6, moduleConfig.telemetry.air_quality_interval);
+    TEST_ASSERT_EQUAL_UINT32(MAX_INTERVAL - 7, moduleConfig.telemetry.health_update_interval);
+}
+
+static void test_clientAndClientMuteTransitionsDoNotRewriteUserPreferences()
+{
+    resetRoleTransitionState();
+    owner.has_is_unmessagable = true;
+    owner.is_unmessagable = true;
+    config.device.rebroadcast_mode = meshtastic_Config_DeviceConfig_RebroadcastMode_LOCAL_ONLY;
+    config.position.position_broadcast_secs = 4242;
+    moduleConfig.telemetry.device_update_interval = 4343;
+
+    enterRole(meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE);
+    TEST_ASSERT_TRUE(owner.is_unmessagable);
+    TEST_ASSERT_EQUAL(meshtastic_Config_DeviceConfig_RebroadcastMode_LOCAL_ONLY, config.device.rebroadcast_mode);
+    TEST_ASSERT_EQUAL_UINT32(4242, config.position.position_broadcast_secs);
+    TEST_ASSERT_EQUAL_UINT32(4343, moduleConfig.telemetry.device_update_interval);
+
+    enterRole(meshtastic_Config_DeviceConfig_Role_CLIENT);
+    TEST_ASSERT_TRUE(owner.is_unmessagable);
+    TEST_ASSERT_EQUAL(meshtastic_Config_DeviceConfig_RebroadcastMode_LOCAL_ONLY, config.device.rebroadcast_mode);
+    TEST_ASSERT_EQUAL_UINT32(4242, config.position.position_broadcast_secs);
+    TEST_ASSERT_EQUAL_UINT32(4343, moduleConfig.telemetry.device_update_interval);
+}
+
+static void test_handleSetConfig_roleTransitionPersistsEveryDerivedSegment()
+{
+    resetRoleTransitionState();
+    enterRole(meshtastic_Config_DeviceConfig_Role_ROUTER);
+
+    meshtastic_Config c = meshtastic_Config_init_zero;
+    c.which_payload_variant = meshtastic_Config_device_tag;
+    c.payload_variant.device = config.device;
+    c.payload_variant.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    testAdmin->deferSaves();
+    TEST_ASSERT_TRUE(testAdmin->handleSetConfig(c, false));
+    TEST_ASSERT_EQUAL_INT(SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_NODEDATABASE,
+                          testAdmin->savedSegments());
+    TEST_ASSERT_FALSE(owner.is_unmessagable);
+    TEST_ASSERT_EQUAL(meshtastic_Config_DeviceConfig_Role_CLIENT, owner.role);
+    const meshtastic_NodeInfoLite *self = nodeDB->getMeshNode(nodeDB->getNodeNum());
+    TEST_ASSERT_NOT_NULL(self);
+    TEST_ASSERT_EQUAL(meshtastic_Config_DeviceConfig_Role_CLIENT, self->role);
+}
+
 // -----------------------------------------------------------------------
 // Channel-configuration warning + coalescing tests
 //
 // These exercise the real incoming-admin-message path (handleReceivedProtobuf):
-// begin_edit_settings / set_channel / commit_edit_settings. Warnings raised while a
-// transaction is open must be deferred and collapsed into a single notification at
-// commit; outside a transaction each save emits its own single message immediately.
+// begin_edit_settings / set_channel / commit_edit_settings. Warnings raised
+// while a transaction is open must be deferred and collapsed into a single
+// notification at commit; outside a transaction each save emits its own single
+// message immediately.
 // -----------------------------------------------------------------------
 
 static const uint8_t DEFAULT_KEY[] = {0x01};      // the well-known "default" PSK (AQ==)
@@ -1866,13 +2732,14 @@ static meshtastic_Channel makeChannel(int8_t index, meshtastic_Channel_Role role
     return ch;
 }
 
-// Dispatch one admin message as if it arrived from a local (from==0) client, which bypasses
-// the passkey/authorization gates so the switch body runs.
+// Dispatch one admin message as if it arrived from a local (from==0) client,
+// which bypasses the passkey/authorization gates so the switch body runs.
 static void sendAdmin(meshtastic_AdminMessage &m)
 {
     meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
     mp.from = 0;
-    mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag; // required: handler drops non-decoded packets
+    mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag; // required: handler drops non-decoded
+                                                                  // packets
     testAdmin->handleReceivedProtobuf(mp, &m);
 }
 
@@ -1900,7 +2767,8 @@ static void sendCommitEdit()
     sendAdmin(m);
 }
 
-// An admin message that changes nothing. It answers, so drain the reply or the packet pool leaks.
+// An admin message that changes nothing. It answers, so drain the reply or the
+// packet pool leaks.
 static void sendGetDeviceMetadata()
 {
     meshtastic_AdminMessage m = meshtastic_AdminMessage_init_zero;
@@ -1910,7 +2778,8 @@ static void sendGetDeviceMetadata()
     testAdmin->drainReply();
 }
 
-// Preset = LongFast on US, unlicensed owner. "LongFast" is the display name we compare against.
+// Preset = LongFast on US, unlicensed owner. "LongFast" is the display name we
+// compare against.
 static void usePresetLongFast()
 {
     config.lora = meshtastic_Config_LoRaConfig_init_zero;
@@ -1924,7 +2793,8 @@ static void usePresetLongFast()
 static void test_warn_singleChannel_variantName_oneSpecificMessage()
 {
     usePresetLongFast();
-    // Name is a case/space variant of the preset with the default key: a single name issue.
+    // Name is a case/space variant of the preset with the default key: a single
+    // name issue.
     sendSetChannel(makeChannel(0, meshtastic_Channel_Role_PRIMARY, "long fast", DEFAULT_KEY, 1));
     TEST_ASSERT_EQUAL_INT(1, (int)capturedWarnings.size());
     TEST_ASSERT_EQUAL_INT(1, warningsContaining("looks like a mistype of 'LongFast'"));
@@ -1933,7 +2803,8 @@ static void test_warn_singleChannel_variantName_oneSpecificMessage()
 static void test_warn_singleChannel_nameAndPsk_collapsedToCatchAll()
 {
     usePresetLongFast();
-    // Variant name AND a non-default key: two issues on one channel collapse to one catch-all.
+    // Variant name AND a non-default key: two issues on one channel collapse to
+    // one catch-all.
     sendSetChannel(makeChannel(0, meshtastic_Channel_Role_PRIMARY, "long fast", CUSTOM_KEY, 2));
     TEST_ASSERT_EQUAL_INT(1, (int)capturedWarnings.size());
     TEST_ASSERT_EQUAL_INT(1, warningsContaining("There may be name and PSK issues on channel 0"));
@@ -1970,19 +2841,22 @@ static void test_warn_transaction_singleChannel_keepsSpecificMessage()
     TEST_ASSERT_EQUAL_INT(0, (int)capturedWarnings.size());
 
     sendCommitEdit();
-    // One flagged channel: the specific message verbatim, not the plural catch-all.
+    // One flagged channel: the specific message verbatim, not the plural
+    // catch-all.
     TEST_ASSERT_EQUAL_INT(1, (int)capturedWarnings.size());
     TEST_ASSERT_EQUAL_INT(1, warningsContaining("looks like a mistype of 'LongFast'"));
     TEST_ASSERT_EQUAL_INT(0, warningsContaining("on channels"));
 }
 
-// An idle transaction is retired by the next admin message, flushing the warnings it held.
+// An idle transaction is retired by the next admin message, flushing the
+// warnings it held.
 static void test_editTransaction_abandoned_isRetiredOnNextAdminMessage()
 {
     usePresetLongFast();
     sendBeginEdit();
     sendSetChannel(makeChannel(0, meshtastic_Channel_Role_PRIMARY, "long fast", DEFAULT_KEY, 1));
-    // Deferred, exactly as before: nothing emitted while the transaction looks alive.
+    // Deferred, exactly as before: nothing emitted while the transaction looks
+    // alive.
     TEST_ASSERT_EQUAL_INT(0, (int)capturedWarnings.size());
     TEST_ASSERT_TRUE(testAdmin->editTransactionOpen());
 
@@ -1993,7 +2867,8 @@ static void test_editTransaction_abandoned_isRetiredOnNextAdminMessage()
     TEST_ASSERT_EQUAL_INT(1, warningsContaining("looks like a mistype of 'LongFast'"));
 }
 
-// A write arriving after abandonment is saved, not deferred to a commit that never comes.
+// A write arriving after abandonment is saved, not deferred to a commit that
+// never comes.
 static void test_editTransaction_abandoned_laterWriteIsNoLongerDeferred()
 {
     usePresetLongFast();
@@ -2002,7 +2877,8 @@ static void test_editTransaction_abandoned_laterWriteIsNoLongerDeferred()
 
     sendSetChannel(makeChannel(0, meshtastic_Channel_Role_PRIMARY, "long fast", DEFAULT_KEY, 1));
 
-    // The write itself retired the stale transaction, so its own warning is emitted immediately.
+    // The write itself retired the stale transaction, so its own warning is
+    // emitted immediately.
     TEST_ASSERT_FALSE(testAdmin->editTransactionOpen());
     TEST_ASSERT_EQUAL_INT(1, warningsContaining("looks like a mistype of 'LongFast'"));
 }
@@ -2027,7 +2903,8 @@ static void test_warn_license_noTransaction_emittedImmediately()
 {
     usePresetLongFast();
     owner.is_licensed = true;
-    // Setting a channel that still carries a key triggers ensureLicensedOperation() to strip it.
+    // Setting a channel that still carries a key triggers
+    // ensureLicensedOperation() to strip it.
     sendSetChannel(makeChannel(0, meshtastic_Channel_Role_PRIMARY, "", CUSTOM_KEY, 2));
     TEST_ASSERT_EQUAL_INT(1, warningsContaining("Licensed mode activated"));
 }
@@ -2037,13 +2914,15 @@ static void test_warn_license_transaction_coalescedToSingleMessage()
     usePresetLongFast();
     owner.is_licensed = true;
     sendBeginEdit();
-    // Two separate triggers within one transaction (two channels with keys to strip).
+    // Two separate triggers within one transaction (two channels with keys to
+    // strip).
     sendSetChannel(makeChannel(0, meshtastic_Channel_Role_PRIMARY, "", CUSTOM_KEY, 2));
     sendSetChannel(makeChannel(1, meshtastic_Channel_Role_SECONDARY, "", CUSTOM_KEY, 2));
     TEST_ASSERT_EQUAL_INT(0, (int)capturedWarnings.size());
 
     sendCommitEdit();
-    // Collapsed to a single licensed-mode notice (and no channel warning, since names are blank).
+    // Collapsed to a single licensed-mode notice (and no channel warning, since
+    // names are blank).
     TEST_ASSERT_EQUAL_INT(1, warningsContaining("Licensed mode activated"));
     TEST_ASSERT_EQUAL_INT(1, (int)capturedWarnings.size());
 }
@@ -2052,17 +2931,19 @@ static void test_warn_license_transaction_coalescedToSingleMessage()
 // Node-DB admin metadata: favorite / ignore / mute
 // -----------------------------------------------------------------------
 //
-// MeshService::reloadConfig() only re-derives the region and fires configChanged - which drives the
-// live SX126x/RadioInterface reconfigure - when saveWhat includes SEGMENT_CONFIG or
-// SEGMENT_CHANNELS. A pure node-DB metadata save must skip that reconfigure entirely. These watch
-// service->configChanged directly, so widening the saveWhat mask or reordering the check is caught
-// even though they run outside an edit transaction.
+// MeshService::reloadConfig() only re-derives the region and fires
+// configChanged - which drives the live SX126x/RadioInterface reconfigure -
+// when saveWhat includes SEGMENT_CONFIG or SEGMENT_CHANNELS. A pure node-DB
+// metadata save must skip that reconfigure entirely. These watch
+// service->configChanged directly, so widening the saveWhat mask or reordering
+// the check is caught even though they run outside an edit transaction.
 //
-// Characterization: all three already hold on develop. They are worth pinning because that reload
-// is the path implicated in the WisMesh Tag favourite-node crash, and nothing asserted it.
+// Characterization: all three already hold on develop. They are worth pinning
+// because that reload is the path implicated in the WisMesh Tag favourite-node
+// crash, and nothing asserted it.
 
-// Counts configChanged.notifyObservers() calls - the only externally visible signal that
-// reloadConfig() took the radio-reconfigure branch.
+// Counts configChanged.notifyObservers() calls - the only externally visible
+// signal that reloadConfig() took the radio-reconfigure branch.
 class ConfigChangedCounter : public Observer<void *>
 {
   public:
@@ -2127,8 +3008,9 @@ static void test_toggleMutedNode_skipsRadioReload_butPersists()
 // Node menu mute toggle (graphics::menuHandler::toggleNodeMuted)
 // -----------------------------------------------------------------------
 //
-// Reachable only since the mute branch was lifted out of its banner-callback lambda; the lambda
-// runs via screen->showOverlayBanner(), so nothing in MenuHandler.cpp was testable before.
+// Reachable only since the mute branch was lifted out of its banner-callback
+// lambda; the lambda runs via screen->showOverlayBanner(), so nothing in
+// MenuHandler.cpp was testable before.
 
 #if HAS_SCREEN
 static void test_toggleNodeMuted_flipsBitAndSkipsRadioReload()
@@ -2157,13 +3039,14 @@ static void test_toggleNodeMuted_unknownNodeDoesNothing()
     TEST_ASSERT_NULL(nodeDB->getMeshNode(0xDEADBEEF));
 }
 
-// CHARACTERIZATION OF A KNOWN DEFECT, not an endorsement. Flipping one NodeInfoLite bit currently
-// calls bare nodeDB->saveToDisk(), which rewrites all five segments. saveToDisk() is not virtual,
-// so the mask is observed through its effect: every prefs file reappears after being removed.
+// CHARACTERIZATION OF A KNOWN DEFECT, not an endorsement. Flipping one
+// NodeInfoLite bit currently calls bare nodeDB->saveToDisk(), which rewrites
+// all five segments. saveToDisk() is not virtual, so the mask is observed
+// through its effect: every prefs file reappears after being removed.
 //
-// A pending fix narrows this to SEGMENT_NODEDATABASE. When it lands, only nodes.proto should come
-// back and this assertion is EXPECTED to change - that diff is the point, so the improvement is
-// visible instead of silent.
+// A pending fix narrows this to SEGMENT_NODEDATABASE. When it lands, only
+// nodes.proto should come back and this assertion is EXPECTED to change - that
+// diff is the point, so the improvement is visible instead of silent.
 static void test_toggleNodeMuted_currentlyRewritesEverySegment()
 {
     nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
@@ -2180,11 +3063,13 @@ static void test_toggleNodeMuted_currentlyRewritesEverySegment()
 }
 
 // -----------------------------------------------------------------------
-// BaseUI region chooser preset default (graphics::menuHandler::presetForRegionSelection)
+// BaseUI region chooser preset default
+// (graphics::menuHandler::presetForRegionSelection)
 // -----------------------------------------------------------------------
 //
-// Out-of-box US setup starts on LongTurbo. Each guard below is load-bearing: widening the rule past
-// "first region ever chosen, US, no preset on record" re-presets nodes that already have an opinion.
+// Out-of-box US setup starts on LongTurbo. Each guard below is load-bearing:
+// widening the rule past "first region ever chosen, US, no preset on record"
+// re-presets nodes that already have an opinion.
 
 // `region` is the region still in place when the user highlights `selected`.
 static meshtastic_Config_LoRaConfig loraAt(meshtastic_Config_LoRaConfig_RegionCode region,
@@ -2206,7 +3091,8 @@ static void test_presetForRegionSelection_firstUsSelectionDefaultsToLongTurbo()
     TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_ModemPreset_LONG_TURBO,
                       graphics::menuHandler::presetForRegionSelection(lora, meshtastic_Config_LoRaConfig_RegionCode_US));
 
-    // Unusable unless US offers it: applyLoraRegion()'s reconciliation would throw it straight back.
+    // Unusable unless US offers it: applyLoraRegion()'s reconciliation would
+    // throw it straight back.
     TEST_ASSERT_TRUE_MESSAGE(getRegion(meshtastic_Config_LoRaConfig_RegionCode_US)
                                  ->supportsPreset(meshtastic_Config_LoRaConfig_ModemPreset_LONG_TURBO),
                              "US no longer supports LongTurbo");
@@ -2222,7 +3108,8 @@ static void test_presetForRegionSelection_pinnedUserprefWins()
 }
 #endif
 
-// US on a node that already has a region is a region change, not first-time setup.
+// US on a node that already has a region is a region change, not first-time
+// setup.
 static void test_presetForRegionSelection_laterUsSelectionKeepsCurrentPreset()
 {
     const meshtastic_Config_LoRaConfig lora =
@@ -2244,7 +3131,8 @@ static void test_presetForRegionSelection_firstNonUsSelectionKeepsCurrentPreset(
                           graphics::menuHandler::presetForRegionSelection(lora, region));
 }
 
-// A preset off the install default is a preference on record (phone app, admin, preset menu).
+// A preset off the install default is a preference on record (phone app, admin,
+// preset menu).
 static void test_presetForRegionSelection_respectsAPresetAlreadyChosen()
 {
     const meshtastic_Config_LoRaConfig lora =
@@ -2254,7 +3142,8 @@ static void test_presetForRegionSelection_respectsAPresetAlreadyChosen()
                       graphics::menuHandler::presetForRegionSelection(lora, meshtastic_Config_LoRaConfig_RegionCode_US));
 }
 
-// use_preset false means raw bandwidth/SF/CR: rewriting modem_preset only misleads the preset menu.
+// use_preset false means raw bandwidth/SF/CR: rewriting modem_preset only
+// misleads the preset menu.
 static void test_presetForRegionSelection_ignoresNodesOnRawModemSettings()
 {
     const meshtastic_Config_LoRaConfig lora = loraAt(meshtastic_Config_LoRaConfig_RegionCode_UNSET,
@@ -2275,7 +3164,8 @@ void setUp(void)
     service = mockMeshService;
     testAdmin = new AdminModuleTestShim();
     capturedWarnings.clear();
-    // Every test gets its own NodeDB and its own copy of the globals the admin handlers write.
+    // Every test gets its own NodeDB and its own copy of the globals the admin
+    // handlers write.
     replaceAdminRadioGlobals();
 }
 void tearDown(void)
@@ -2299,6 +3189,7 @@ void setup()
 
     // getRegion()
     RUN_TEST(test_handleSetOwner_persistsLicensedChannelSanitation);
+    RUN_TEST(test_handleSetOwner_delicensingLicensedRegionAtomicallyDisablesRadio);
     RUN_TEST(test_handleSetHamMode_appendsLongNameToCallSign);
     RUN_TEST(test_handleSetHamMode_widestPairSurvivesTheLongNameCap);
     RUN_TEST(test_handleSetHamMode_omittedLongNameKeepsCallSignAlone);
@@ -2388,15 +3279,28 @@ void setup()
     RUN_TEST(test_handleSetConfig_fromLocal_invalidPresetClamped);
     RUN_TEST(test_handleSetConfig_fromOthers_validPresetAccepted);
     RUN_TEST(test_handleSetConfig_fromOthers_invalidChannelNumFullyRejected);
+    RUN_TEST(test_handleSetConfig_invalidRegionRejectedLocallyAndRemotely);
+    RUN_TEST(test_handleSetConfig_rejectionRepliesBadRequest);
     RUN_TEST(test_clampBandwidthCode_zeroMapsToDefaultOthersUnchanged);
     RUN_TEST(test_handleSetConfig_fromLocal_customBandwidthZeroClampedToDefault);
-    RUN_TEST(test_handleSetConfig_fromOthers_customBandwidthZeroClampedToDefault);
+    RUN_TEST(test_handleSetConfig_fromOthers_customBandwidthZeroRejected);
     RUN_TEST(test_handleSetConfig_fromLocal_presetBandwidthZeroLeftUntouched);
     RUN_TEST(test_handleSetConfig_fromLocal_customBandwidthNonZeroPreserved);
     RUN_TEST(test_handleSetConfig_security_preservesKeypairWhenPrivateOmitted);
     RUN_TEST(test_handleSetConfig_security_acceptsSuppliedKeypair);
     RUN_TEST(test_handleSetConfig_security_rotationPreservesAdminKeys);
     RUN_TEST(test_handleSetConfig_security_clearsAdminKeysWhenKeypairUnchanged);
+    RUN_TEST(test_handleSetConfig_security_lowEntropyRestoreWarnsAndRotates);
+    RUN_TEST(test_handleSetConfig_security_lowEntropyFullKeypairRestoreIsRejected);
+    RUN_TEST(test_handleSetConfig_security_reDerivedCleanKeyDoesNotWarn);
+    RUN_TEST(test_handleSetConfig_security_blacklistedMintLeavesNoKey);
+    RUN_TEST(test_handleSetConfig_firstRegionIdentityFailureRollsBackAndRepliesBadRequest);
+    RUN_TEST(test_handleSetOwner_licensingIdentityFailureRollsBackAndRepliesBadRequest);
+    RUN_TEST(test_handleSetHamMode_identityFailureRollsBackAndRepliesBadRequest);
+    RUN_TEST(test_generateCryptoKeyPair_derivedFromStoredPrivateIsChecked);
+    RUN_TEST(test_generateCryptoKeyPair_failedDerivationFromStoredPrivateClearsKeySizes);
+    RUN_TEST(test_handleSetConfig_security_staleLowEntropyFlagDoesNotWarn);
+    RUN_TEST(test_handleSetConfig_security_failedDerivationClearsKeySizes);
     RUN_TEST(test_regionInfo_supportsPreset);
     RUN_TEST(test_checkConfigRegion_quietCheckReportsReason);
     RUN_TEST(test_checkConfigRegion_allowsProspectiveLicensedOwner);
@@ -2404,6 +3308,11 @@ void setup()
     RUN_TEST(test_handleSetConfig_fromOthers_lockedPresetFromNonTrioRegionRejected);
     RUN_TEST(test_handleSetConfig_presetChosenBeforeRegionSurvives);
     RUN_TEST(test_handleSetConfig_unsettingRegionKeepsPreset);
+    RUN_TEST(test_roleTransitions_clearInfrastructureDefaultsAndUnmessagable);
+    RUN_TEST(test_roleTransitions_cleanupHiddenTakAndLostAndFoundDefaults);
+    RUN_TEST(test_roleTransitions_preserveCustomizedFormerRoleValues);
+    RUN_TEST(test_clientAndClientMuteTransitionsDoNotRewriteUserPreferences);
+    RUN_TEST(test_handleSetConfig_roleTransitionPersistsEveryDerivedSegment);
 
     // Channel-configuration warning + coalescing
     RUN_TEST(test_warn_singleChannel_variantName_oneSpecificMessage);

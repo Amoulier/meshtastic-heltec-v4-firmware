@@ -171,6 +171,16 @@ class PhoneAPI
 
     bool isConnected() { return state != STATE_SEND_NOTHING; }
     bool isSendingPackets() { return state == STATE_SEND_PACKETS; }
+#if defined(HELTEC_V4_OLED)
+    /// Opaque, process-unique physical-session token used to bind an OPEN
+    /// settings transaction to this connection rather than to a long-lived
+    /// PhoneAPI object.
+    uintptr_t externalStateAccessToken() const
+    {
+        return externalStateSessionToken.load(std::memory_order_acquire) |
+               (api_type == TYPE_HTTP ? uintptr_t{1} : uintptr_t{0});
+    }
+#endif
 
 #ifdef MESHTASTIC_PHONEAPI_ACCESS_CONTROL
     /// Per-connection auth: tracked in a small file-scope slot table keyed
@@ -221,6 +231,11 @@ class PhoneAPI
 
     /** the last msec we heard from the client on the other side of this link */
     uint32_t lastContactMsec = 0;
+
+#if defined(HELTEC_V4_OLED)
+    std::atomic<uintptr_t> externalStateSessionToken{0};
+    void rotateExternalStateSessionToken();
+#endif
 
     /// Hookable to find out when connection changes
     virtual void onConnectionChanged(bool connected) {}

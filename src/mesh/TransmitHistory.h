@@ -1,6 +1,7 @@
 #pragma once
 
 #include "configuration.h"
+#include "concurrency/Lock.h"
 #include <Arduino.h>
 #include <map>
 
@@ -81,7 +82,11 @@ class TransmitHistory
      * alongside rmDir("/prefs") in factoryReset - otherwise the 5-min
      * auto-flush resurrects the file from the still-populated maps.
      */
-    void clear();
+    bool clear(bool requireDestructivePower = false);
+
+    /// Wait for a persistence operation admitted before a destructive-storage
+    /// fence. New Heltec saves are rejected while that fence is active.
+    void drainPersistenceWrites();
 
   private:
     TransmitHistory() = default;
@@ -128,7 +133,10 @@ class TransmitHistory
 
     std::map<uint16_t, StoredTimestamp> history; // key -> persisted transmit time
     std::map<uint16_t, uint32_t> lastMillis;     // key -> millis() value (for runtime throttle)
+    mutable concurrency::Lock stateLock;
+    concurrency::Lock persistenceLock;
     bool dirty = false;
+    uint32_t mutationGeneration = 0;
     uint32_t lastDiskSave = 0; // millis() of last disk flush
 };
 

@@ -21,9 +21,12 @@
 #include "Throttle.h"
 #include "WaypointStore.h"
 #include "buzz/buzz.h"
+#include "concurrency/LockGuard.h"
 #include "configuration.h"
+#include "FilesystemMountPolicy.h"
 #include "main.h"
 #include "meshUtils.h"
+#include "power/BatteryCriticalPolicy.h"
 #include "power/PowerHAL.h"
 #include "power/SGM41562.h"
 #include "sleep.h"
@@ -33,6 +36,9 @@
 #include <esp_adc/adc_cali_scheme.h>
 #include <esp_adc/adc_oneshot.h>
 #include <esp_err.h>
+#if defined(HELTEC_V4_OLED) && defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+#include <HWCDC.h>
+#endif
 #endif
 
 #if defined(ARCH_PORTDUINO)
@@ -52,7 +58,6 @@
 
 #if defined(ARCH_NRF52)
 #include "Nrf52SaadcLock.h"
-#include "concurrency/LockGuard.h"
 #endif
 
 #if defined(ARCH_STM32) && defined(BATTERY_PIN)
@@ -279,9 +284,20 @@ class HasBatteryLevel
     virtual int getBatteryPercent() { return -1; }
 
     /**
-     * The raw voltage of the battery or NAN if unknown
+     * The reported battery voltage, which implementations may filter
      */
     virtual uint16_t getBattVoltage() { return 0; }
+
+    /**
+     * The latest averaged, unfiltered voltage sample, or getBattVoltage() when no filter is used
+     */
+    virtual uint16_t getBattVoltageRaw() { return getBattVoltage(); }
+
+    /**
+     * A newly acquired unfiltered voltage sample when the implementation can
+     * bypass its normal polling throttle.
+     */
+    virtual uint16_t getBattVoltageRawFresh() { return getBattVoltageRaw(); }
 
     /**
      * return true if there is a battery installed in this unit
@@ -407,20 +423,22 @@ class AnalogBatteryLevel : public HasBatteryLevel
     }
 
     /**
-     * The raw voltage of the batteryin millivolts or NAN if unknown
+     * The filtered battery voltage in millivolts, or 0 if unknown
      */
     virtual uint16_t getBattVoltage() override
     {
 
 #if HAS_TELEMETRY && defined(HAS_RAKPROT) && !defined(HAS_PMU) && !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR
         if (hasRAK()) {
-            return getRAKVoltage();
+            latest_raw_read_value = getRAKVoltage();
+            return latest_raw_read_value;
         }
 #endif
 
 #if HAS_TELEMETRY && !defined(HAS_PMU) && !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR
         if (hasINA()) {
-            return getINAVoltage();
+            latest_raw_read_value = getINAVoltage();
+            return latest_raw_read_value;
         }
 #endif
 
@@ -440,7 +458,7 @@ class AnalogBatteryLevel : public HasBatteryLevel
             config.power.adc_multiplier_override > 0 ? config.power.adc_multiplier_override : ADC_MULTIPLIER;
         // Do not call analogRead() often.
         const uint32_t min_read_interval = 5000;
-        if (!initial_read_done || !Throttle::isWithinTimespanMs(last_read_time_ms, min_read_interval)) {
+        if (forceFreshRawRead || !initial_read_done || !Throttle::isWithinTimespanMs(last_read_time_ms, min_read_interval)) {
             last_read_time_ms = millis();
 
             uint32_t raw = 0;
@@ -480,12 +498,20 @@ class AnalogBatteryLevel : public HasBatteryLevel
             scaled = operativeAdcMultiplier * ((1000 * AREF_VOLTAGE) / pow(2, BATTERY_SENSE_RESOLUTION_BITS)) * raw;
 #endif
             battery_adcDisable();
+            latest_raw_read_value = static_cast<uint16_t>(scaled);
 
             if (!initial_read_done) {
-                // Flush the smoothing filter with an ADC reading, if the reading is
-                // plausibly correct
-                if (scaled > last_read_value)
-                    last_read_value = scaled;
+                // Heltec's 15-sample average is also how we distinguish its
+                // open ~2.2 V divider from a real cell. Keeping the OCV floor
+                // here made an absent battery look present. Other boards retain
+                // the historical below-floor rejection.
+#if defined(HELTEC_V4_OLED)
+                constexpr bool trustFirstSampleBelowFloor = true;
+#else
+                constexpr bool trustFirstSampleBelowFloor = false;
+#endif
+                last_read_value =
+                    initialAnalogBatteryFilteredVoltage(last_read_value, scaled, trustFirstSampleBelowFloor);
                 initial_read_done = true;
             } else {
                 // Already initialized - filter this reading
@@ -498,6 +524,20 @@ class AnalogBatteryLevel : public HasBatteryLevel
         return last_read_value;
 #endif // BATTERY_PIN
         return 0;
+    }
+
+    virtual uint16_t getBattVoltageRaw() override
+    {
+        getBattVoltage();
+        return latest_raw_read_value;
+    }
+
+    virtual uint16_t getBattVoltageRawFresh() override
+    {
+        forceFreshRawRead = true;
+        getBattVoltage();
+        forceFreshRawRead = false;
+        return latest_raw_read_value;
     }
 
 #if defined(ARCH_ESP32) && !defined(HAS_PMU) && defined(BATTERY_PIN)
@@ -564,6 +604,13 @@ class AnalogBatteryLevel : public HasBatteryLevel
 #ifdef HAS_SGM41562
         if (sgm41562 && sgm41562->refresh())
             return sgm41562->isInputPowerGood();
+#endif
+#if defined(HELTEC_V4_OLED) && defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+        // Voltage alone cannot distinguish an open Heltec battery divider from
+        // a low cell. USB SOF provides a reliable positive signal when a data
+        // host is attached; charge-only sources retain the conservative path.
+        if (HWCDC::isPlugged())
+            return true;
 #endif
 #ifdef EXT_PWR_DETECT
         if (digitalRead(EXT_PWR_DETECT) == EXT_PWR_DETECT_VALUE)
@@ -648,7 +695,9 @@ class AnalogBatteryLevel : public HasBatteryLevel
     // This value is over-written by the first ADC reading, it the voltage seems
     // reasonable.
     bool initial_read_done = false;
+    bool forceFreshRawRead = false;
     float last_read_value = (OCV[NUM_OCV_POINTS - 1] * NUM_CELLS);
+    uint16_t latest_raw_read_value = 0;
     uint32_t last_read_time_ms = 0;
 #ifdef ARCH_STM32
     // 3300mV placeholder for STM32 errata where VREFINT factory calibration may be missing
@@ -775,7 +824,7 @@ class ADS1115BatteryLevel : public AnalogBatteryLevel
             return 0;
 
         static constexpr uint32_t MIN_READ_INTERVAL_MS = 30000;
-        if (!initial_read_done || !Throttle::isWithinTimespanMs(last_read_ms, MIN_READ_INTERVAL_MS)) {
+        if (forceFreshRawRead || !initial_read_done || !Throttle::isWithinTimespanMs(last_read_ms, MIN_READ_INTERVAL_MS)) {
             last_read_ms = millis();
             float sum = 0;
             {
@@ -788,9 +837,10 @@ class ADS1115BatteryLevel : public AnalogBatteryLevel
 
             // Voltage divider scales by 2.0; convert volts to millivolts
             float v = (sum / (float)SAMPLE_COUNT) * 2.0f * 1000.0f;
+            latest_raw_mv = static_cast<uint16_t>(v);
 
             if (!initial_read_done) {
-                cached_mv = static_cast<uint16_t>(v);
+                cached_mv = latest_raw_mv;
                 initial_read_done = true;
             } else {
                 // Exponential moving average filter (50% smoothing)
@@ -798,6 +848,20 @@ class ADS1115BatteryLevel : public AnalogBatteryLevel
             }
         }
         return cached_mv;
+    }
+
+    virtual uint16_t getBattVoltageRaw() override
+    {
+        getBattVoltage();
+        return latest_raw_mv;
+    }
+
+    virtual uint16_t getBattVoltageRawFresh() override
+    {
+        forceFreshRawRead = true;
+        getBattVoltage();
+        forceFreshRawRead = false;
+        return latest_raw_mv;
     }
 
     virtual bool isVbusIn() override
@@ -829,7 +893,9 @@ class ADS1115BatteryLevel : public AnalogBatteryLevel
 
     bool initialized = false;
     bool initial_read_done = false;
+    bool forceFreshRawRead = false;
     uint16_t cached_mv = 0;
+    uint16_t latest_raw_mv = 0;
     uint32_t last_read_ms = 0;
 };
 
@@ -1080,32 +1146,48 @@ void Power::shutdown()
 void Power::readPowerStatus()
 {
     int32_t batteryVoltageMv = -1; // Assume unknown
+    int32_t batteryVoltageRawMv = -1;
     int8_t batteryChargePercent = -1;
     OptionalBool usbPowered = OptUnknown;
     OptionalBool hasBattery = OptUnknown; // These must be static because NRF_APM
                                           // code doesn't run every time
     OptionalBool isChargingNow = OptUnknown;
+    bool hasBatteryLevel = false;
 
-    if (batteryLevel) {
-        hasBattery = batteryLevel->isBatteryConnect() ? OptTrue : OptFalse;
-#ifndef NRF_APM
-        usbPowered = batteryLevel->isVbusIn() ? OptTrue : OptFalse;
-        isChargingNow = batteryLevel->isCharging() ? OptTrue : OptFalse;
+    {
+#if defined(HELTEC_V4_OLED)
+        concurrency::LockGuard batteryGuard(&batteryLevelLock);
 #endif
-        if (hasBattery) {
-            batteryVoltageMv = batteryLevel->getBattVoltage();
-            // If the AXP192 returns a valid battery percentage, use it
-            if (batteryLevel->getBatteryPercent() >= 0) {
-                batteryChargePercent = batteryLevel->getBatteryPercent();
-            } else {
-                // If the AXP192 returns a percentage less than 0, the feature is either
-                // not supported or there is an error In that case, we compute an
-                // estimate of the charge percent based on open circuit voltage table
-                // defined in power.h
-                batteryChargePercent = clamp((int)(((batteryVoltageMv - (OCV[NUM_OCV_POINTS - 1] * NUM_CELLS)) * 1e2) /
-                                                   ((OCV[0] * NUM_CELLS) - (OCV[NUM_OCV_POINTS - 1] * NUM_CELLS))),
-                                             0, 100);
+        hasBatteryLevel = batteryLevel != nullptr;
+        if (batteryLevel) {
+            hasBattery = batteryLevel->isBatteryConnect() ? OptTrue : OptFalse;
+#ifndef NRF_APM
+            usbPowered = batteryLevel->isVbusIn() ? OptTrue : OptFalse;
+            isChargingNow = batteryLevel->isCharging() ? OptTrue : OptFalse;
+#endif
+            if (hasBattery) {
+                batteryVoltageMv = batteryLevel->getBattVoltage();
+                // If the AXP192 returns a valid battery percentage, use it
+                if (batteryLevel->getBatteryPercent() >= 0) {
+                    batteryChargePercent = batteryLevel->getBatteryPercent();
+                } else {
+                    // If the AXP192 returns a percentage less than 0, the feature is either
+                    // not supported or there is an error In that case, we compute an
+                    // estimate of the charge percent based on open circuit voltage table
+                    // defined in power.h
+                    batteryChargePercent = clamp((int)(((batteryVoltageMv - (OCV[NUM_OCV_POINTS - 1] * NUM_CELLS)) * 1e2) /
+                                                       ((OCV[0] * NUM_CELLS) - (OCV[NUM_OCV_POINTS - 1] * NUM_CELLS))),
+                                                 0, 100);
+                }
             }
+#if defined(HELTEC_V4_OLED) && !defined(HAS_PMU)
+            batteryVoltageRawMv = batteryLevel->getBattVoltageRaw();
+#else
+            // Other battery interfaces do not all expose an unfiltered sample. Preserve
+            // their existing behavior and API surface; only Heltec V4
+            // destructive-storage protection consumes raw ADC.
+            batteryVoltageRawMv = batteryVoltageMv;
+#endif
         }
     }
 
@@ -1218,20 +1300,99 @@ void Power::readPowerStatus()
 
 #endif
 
-    if (batteryLevel && powerStatus2.getHasBattery() && !powerStatus2.getHasUSB()) {
-        if (batteryVoltageMv > 0 && batteryVoltageMv <= BATTERY_CRITICAL_MILLIVOLTS) {
-            if (low_voltage_counter < BATTERY_CRITICAL_READINGS)
-                low_voltage_counter++;
+    int32_t criticalBatteryVoltageMv = batteryVoltageMv;
+    bool shouldEvaluateCriticalBattery = powerStatus2.getHasBattery() && !powerStatus2.getHasUSB();
+#if defined(HELTEC_V4_SOLAR_ROUTER_PROFILE) && HELTEC_V4_SOLAR_ROUTER_PROFILE
+    static bool solarBatteryPresenceConfirmed = false;
+    if (hasBatteryLevel) {
+        criticalBatteryVoltageMv =
+            criticalBatteryCutoffVoltage(batteryVoltageMv, batteryVoltageRawMv, shouldUseRawBatteryVoltageForCriticalCutoff());
+        if (shouldConfirmSolarBatteryPresence(criticalBatteryVoltageMv, BATTERY_CRITICAL_MILLIVOLTS)) {
+            solarBatteryPresenceConfirmed = true;
+        }
+        shouldEvaluateCriticalBattery = shouldEvaluateCriticalBatteryReading(
+            solarBatteryPresenceConfirmed, powerStatus2.getHasUSB(), criticalBatteryVoltageMv,
+            BATTERY_BOOT_GUARD_MIN_MILLIVOLTS,
+            shouldUseRawBatteryVoltageForCriticalCutoff());
+    }
+#endif
+
+    if (hasBatteryLevel && shouldEvaluateCriticalBattery) {
+        low_voltage_counter = nextCriticalBatteryReadingCount(
+            low_voltage_counter, criticalBatteryVoltageMv, BATTERY_CRITICAL_MILLIVOLTS, BATTERY_CRITICAL_READINGS);
+        if (low_voltage_counter > 0) {
             LOG_DEBUG("Low voltage counter: %d/%d", low_voltage_counter, BATTERY_CRITICAL_READINGS);
             if (low_voltage_counter >= BATTERY_CRITICAL_READINGS) {
-                LOG_INFO("Battery at %dmV; entering protective deep sleep", batteryVoltageMv);
+                LOG_INFO("Battery cutoff sample at %dmV; entering protective deep sleep", criticalBatteryVoltageMv);
                 powerFSM.trigger(EVENT_LOW_BATTERY);
             }
-        } else {
-            low_voltage_counter = 0;
         }
+#if defined(HELTEC_V4_SOLAR_ROUTER_PROFILE) && HELTEC_V4_SOLAR_ROUTER_PROFILE
+    } else {
+        // Solar protection requires consecutive eligible raw readings. Do not
+        // carry a partial count across USB power or an open battery input.
+        low_voltage_counter = 0;
+#endif
     }
 }
+
+#if defined(HELTEC_V4_OLED)
+bool Power::readDestructiveStoragePowerSnapshot(bool &batteryPresent, bool &externalPowerPresent,
+                                                int32_t &batteryVoltageRawMv)
+{
+    concurrency::LockGuard batteryGuard(&batteryLevelLock);
+    batteryPresent = false;
+    externalPowerPresent = false;
+    batteryVoltageRawMv = -1;
+    if (!batteryLevel)
+        return false;
+
+    batteryPresent = batteryLevel->isBatteryConnect();
+    externalPowerPresent = batteryLevel->isVbusIn();
+    if (batteryPresent) {
+#if defined(HELTEC_V4_OLED) && !defined(HAS_PMU)
+        batteryVoltageRawMv = batteryLevel->getBattVoltageRawFresh();
+#else
+        batteryVoltageRawMv = batteryLevel->getBattVoltage();
+#endif
+    }
+    return true;
+}
+
+namespace
+{
+bool heltecStoragePowerIsSafe(bool destructive)
+{
+    bool batteryPresent = false;
+    bool externalPowerPresent = false;
+    int32_t freshBatteryVoltageRawMv = -1;
+    const bool powerSnapshotAvailable =
+        power && power->readDestructiveStoragePowerSnapshot(batteryPresent, externalPowerPresent, freshBatteryVoltageRawMv);
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+    const bool usbDataHostConnected = HWCDC::isPlugged();
+#else
+    const bool usbDataHostConnected = false;
+#endif
+    // Do not treat charge-only/VBUS inference as proof that flash power is
+    // stable. The explicit alternative to a fresh ADC sample is an active USB
+    // data host. `externalPowerPresent` remains part of the status snapshot for
+    // callers, but is intentionally not an authorization input here.
+    (void)externalPowerPresent;
+    const bool sourceIsSafe =
+        destructive
+            ? shouldAllowHeltecDestructiveStorageMutation(powerSnapshotAvailable, powerSnapshotAvailable,
+                                                          usbDataHostConnected, batteryPresent, freshBatteryVoltageRawMv)
+            : shouldAllowHeltecPreferenceStorageMutation(powerSnapshotAvailable, powerSnapshotAvailable,
+                                                         usbDataHostConnected, batteryPresent, freshBatteryVoltageRawMv,
+                                                         heltecPreferenceStorageMinimumMillivolts(
+                                                             BATTERY_CRITICAL_MILLIVOLTS));
+    return powerHAL_isPowerLevelSafe() && sourceIsSafe;
+}
+} // namespace
+
+bool heltecDestructiveStoragePowerIsSafe() { return heltecStoragePowerIsSafe(true); }
+bool heltecPreferenceStoragePowerIsSafe() { return heltecStoragePowerIsSafe(false); }
+#endif
 
 /**
  * Emit a free-heap line to the debug log every HEAP_LOG_INTERVAL_MS, so a slow leak shows up
@@ -1268,6 +1429,13 @@ void Power::logHeapUsage()
 int32_t Power::runOnce()
 {
     readPowerStatus();
+#if defined(HELTEC_V4_OLED)
+    // A refused low-voltage core save stays dirty in NodeDB. Retry only after a
+    // later fresh sample (or USB data host) makes ordinary persistence safe.
+    if (nodeDB && shouldAttemptHeltecDeferredPreferenceRetry(true, isLowBattery(), rebootAtMsec != 0,
+                                                            shutdownAtMsec != 0))
+        nodeDB->retryPowerDeferredPreferenceWrites();
+#endif
     logHeapUsage();
     lipoChargerRetry();
 
@@ -1887,6 +2055,8 @@ class CW2015BatteryLevel : public AnalogBatteryLevel
         }
         return mv;
     }
+
+    virtual uint16_t getBattVoltageRaw() override { return getBattVoltage(); }
 };
 
 CW2015BatteryLevel cw2015Level;

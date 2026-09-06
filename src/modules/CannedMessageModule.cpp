@@ -1096,9 +1096,9 @@ void CannedMessageModule::sendText(NodeNum dest, ChannelIndex channel, const cha
 
     sm.sender = nodeDB->getNodeNum(); // us
     sm.channelIndex = channel;
+    sm.packetId = this->lastRequestId;
     size_t len = strnlen(message, MAX_MESSAGE_SIZE - 1);
-    sm.textOffset = MessageStore::storeText(message, len);
-    sm.textLength = len;
+    MessageStore::setText(sm, message, len);
 
     // Classify broadcast vs DM
     if (dest == NODENUM_BROADCAST) {
@@ -2193,21 +2193,13 @@ ProcessMessage CannedMessageModule::handleReceived(const meshtastic_MeshPacket &
                 waitingForAck = false;
             }
 
-            // Update last sent StoredMessage with ACK/NACK/RELAYED result
-            if (!messageStore.getMessages().empty()) {
-                StoredMessage &last = const_cast<StoredMessage &>(messageStore.getMessages().back());
-                if (last.sender == nodeDB->getNodeNum()) { // only update our own messages
-                    if (wasBroadcast && isAck) {
-                        last.ackStatus = AckStatus::ACKED;
-                    } else if (isFromDest && isAck) {
-                        last.ackStatus = AckStatus::ACKED;
-                    } else if (!isFromDest && isAck) {
-                        last.ackStatus = AckStatus::RELAYED;
-                    } else {
-                        last.ackStatus = AckStatus::NACKED;
-                    }
-                }
-            }
+            // Match the ACK to its exact in-RAM outgoing packet. Incoming
+            // traffic or a newer phone-originated message must not steal it.
+            const AckStatus storedStatus =
+                (wasBroadcast && isAck) || (isFromDest && isAck)
+                    ? AckStatus::ACKED
+                    : ((!isFromDest && isAck) ? AckStatus::RELAYED : AckStatus::NACKED);
+            messageStore.updateOwnMessageAck(nodeDB->getNodeNum(), mp.decoded.request_id, storedStatus);
 
             // Capture radio metrics
             this->lastRxRssi = mp.rx_rssi;
@@ -2341,9 +2333,10 @@ AdminMessageHandleResult CannedMessageModule::handleAdminMessageForModule(const 
         break;
 
     case meshtastic_AdminMessage_set_canned_message_module_messages_tag:
-        LOG_DEBUG("Client getting radio canned messages");
-        this->handleSetCannedMessageModuleMessages(request->set_canned_message_module_messages);
-        result = AdminMessageHandleResult::HANDLED;
+        LOG_DEBUG("Client setting radio canned messages");
+        result = this->handleSetCannedMessageModuleMessages(request->set_canned_message_module_messages)
+                     ? AdminMessageHandleResult::HANDLED
+                     : AdminMessageHandleResult::ERROR;
         break;
 
     default:
@@ -2363,22 +2356,29 @@ void CannedMessageModule::handleGetCannedMessageModuleMessages(const meshtastic_
     } // Don't send anything if not instructed to. Better than asserting.
 }
 
-void CannedMessageModule::handleSetCannedMessageModuleMessages(const char *from_msg)
+bool CannedMessageModule::handleSetCannedMessageModuleMessages(const char *from_msg)
 {
-    int changed = 0;
+    if (!from_msg || !*from_msg)
+        return true;
 
-    if (*from_msg) {
-        changed |= strcmp(cannedMessageModuleConfig.messages, from_msg);
-        strncpy(cannedMessageModuleConfig.messages, from_msg, sizeof(cannedMessageModuleConfig.messages));
-        LOG_TRACE("*** from_msg.text:%s", from_msg);
+    meshtastic_CannedMessageModuleConfig previous = cannedMessageModuleConfig;
+    strncpy(cannedMessageModuleConfig.messages, from_msg, sizeof(cannedMessageModuleConfig.messages) - 1);
+    cannedMessageModuleConfig.messages[sizeof(cannedMessageModuleConfig.messages) - 1] = '\0';
+    if (strcmp(previous.messages, cannedMessageModuleConfig.messages) == 0)
+        return true;
+
+    LOG_TRACE("Updating canned message text");
+    if (!saveProtoForModule()) {
+        cannedMessageModuleConfig = previous;
+        LOG_ERROR("Canned messages were not persisted");
+        return false;
     }
 
-    if (changed) {
-        this->saveProtoForModule();
-        if (splitConfiguredMessages()) {
-            moduleConfig.canned_message.enabled = true;
-        }
-    }
+    // Parsing updates the runtime list. Enabling/disabling the module remains
+    // an explicit ModuleConfig operation; coupling it implicitly to this
+    // separate auxiliary file cannot be made atomic across power loss.
+    splitConfiguredMessages();
+    return true;
 }
 
 String CannedMessageModule::drawWithCursor(String text, int cursor)

@@ -1,4 +1,5 @@
 #include "PowerFSM.h"
+#include "Power.h"
 #include "PowerMon.h"
 #include "configuration.h"
 #include "esp_task_wdt.h"
@@ -36,8 +37,11 @@
 // May be redefined by variant files.
 // noinline: weak default and call site share this TU, so LTO must not inline the empty body
 // instead of linking the variant's strong override.
-__attribute__((noinline)) void variant_shutdown() __attribute__((weak));
-__attribute__((noinline)) void variant_shutdown() {}
+__attribute__((noinline)) void variant_shutdown(bool radioSleepSucceeded) __attribute__((weak));
+__attribute__((noinline)) void variant_shutdown(bool radioSleepSucceeded)
+{
+    (void)radioSleepSucceeded;
+}
 
 #if !defined(CONFIG_IDF_TARGET_ESP32S2) && !MESHTASTIC_EXCLUDE_BLUETOOTH
 static bool bluetoothMemoryReleased;
@@ -251,15 +255,27 @@ void esp32Setup()
     preferences.begin("meshtastic", false);
 
     uint32_t rebootCounter = preferences.getUInt("rebootCounter", 0);
-    rebootCounter++;
-    preferences.putUInt("rebootCounter", rebootCounter);
-    // store firmware version and hwrevision for access from OTA firmware
-    String fwrev = preferences.getString("firmwareVersion", "");
-    if (fwrev.compareTo(optstr(APP_VERSION)) != 0)
-        preferences.putString("firmwareVersion", optstr(APP_VERSION));
-    uint8_t hwven = preferences.getUInt("hwVendor", 0);
-    if (hwven != HW_VENDOR)
-        preferences.putUInt("hwVendor", HW_VENDOR);
+#if defined(HELTEC_V4_OLED)
+    const bool bootMetadataPowerSafe = heltecPreferenceStoragePowerIsSafe();
+#else
+    constexpr bool bootMetadataPowerSafe = true;
+#endif
+    if (bootMetadataPowerSafe) {
+        rebootCounter++;
+        preferences.putUInt("rebootCounter", rebootCounter);
+        // Store firmware version and hw revision for access from OTA firmware.
+        String fwrev = preferences.getString("firmwareVersion", "");
+        if (fwrev.compareTo(optstr(APP_VERSION)) != 0)
+            preferences.putString("firmwareVersion", optstr(APP_VERSION));
+        uint8_t hwven = preferences.getUInt("hwVendor", 0);
+        if (hwven != HW_VENDOR)
+            preferences.putUInt("hwVendor", HW_VENDOR);
+    } else {
+        // A low cell can repeatedly brown out during boot. Do not turn that
+        // loop into repeated NVS erase/program cycles; retain the last durable
+        // counter and retry metadata on a later safe boot.
+        LOG_WARN("Skipping boot metadata NVS writes while fresh power is unsafe");
+    }
     preferences.end();
     LOG_DEBUG("Number of Device Reboots: %d", rebootCounter);
 #if !MESHTASTIC_EXCLUDE_WIFI
@@ -319,7 +335,7 @@ void esp32Loop()
     // radio.radioIf.canSleep();
 }
 
-void cpuDeepSleep(uint32_t msecToWake, DeepSleepWakePolicy wakePolicy)
+void cpuDeepSleep(uint32_t msecToWake, DeepSleepWakePolicy wakePolicy, bool radioSleepSucceeded)
 {
     /*
     Some ESP32 IOs have internal pullups or pulldowns, which are enabled by default.
@@ -385,7 +401,7 @@ void cpuDeepSleep(uint32_t msecToWake, DeepSleepWakePolicy wakePolicy)
 #endif // #end ESP32S3_WAKE_TYPE
     }
 #endif
-    variant_shutdown();
+    variant_shutdown(radioSleepSucceeded);
 
     if (!shouldEnableExternalWakeInDeepSleep(wakePolicy)) {
         esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);

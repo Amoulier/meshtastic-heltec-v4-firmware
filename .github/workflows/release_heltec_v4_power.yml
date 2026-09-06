@@ -9,18 +9,22 @@ on:
 
 permissions: read-all
 
+concurrency:
+  group: heltec-v4-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-standard:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: ${{ github.ref_name == 'main' && 'heltec-v4-standard-v2.8.0.6' || format('heltec-v4-standard-test-{0}', github.sha) }}
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-standard-v2.8.0.7' || format('heltec-v4-standard-test-{0}', github.sha) }}
       platform: esp32s3
       pio_env: heltec-v4-standard
 
   build-solar-router:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: ${{ github.ref_name == 'main' && 'heltec-v4-solar-router-v2.8.0.6' || format('heltec-v4-solar-router-test-{0}', github.sha) }}
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-solar-router-v2.8.0.7' || format('heltec-v4-solar-router-test-{0}', github.sha) }}
       platform: esp32s3
       pio_env: heltec-v4-solar-router
 
@@ -34,71 +38,339 @@ jobs:
       - build-standard
       - build-solar-router
     steps:
+      - name: Verify release provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: heltec-v4-profiles-v2.8.0.7
+        run: |
+          set -euo pipefail
+
+          test "$GITHUB_REF" = "refs/heads/main"
+
+          remote_main=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | awk '{print $1}')
+          test -n "$remote_main"
+          if [[ "$remote_main" != "$GITHUB_SHA" ]]; then
+            echo "Refusing release: origin/main is $remote_main, workflow SHA is $GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          if ! remote_tag=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${RELEASE_TAG}"); then
+            echo "Refusing release: unable to verify whether tag ${RELEASE_TAG} exists" >&2
+            exit 1
+          fi
+          if [[ -n "$remote_tag" ]]; then
+            echo "Refusing release: tag ${RELEASE_TAG} already exists" >&2
+            exit 1
+          fi
+
+          verify_release_tag_absent_including_drafts() {
+            local page=1 payload count
+            while true; do
+              if ! payload=$(curl --fail --silent --show-error \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}"); then
+                echo "Refusing release: unable to inventory existing releases and drafts" >&2
+                return 1
+              fi
+              if ! jq -e 'type == "array"' <<<"$payload" >/dev/null; then
+                echo "Refusing release: GitHub release inventory was not an array" >&2
+                return 1
+              fi
+              if jq -e --arg tag "$RELEASE_TAG" 'any(.[]; .tag_name == $tag)' <<<"$payload" >/dev/null; then
+                echo "Refusing release: an existing release or draft already uses ${RELEASE_TAG}" >&2
+                return 1
+              fi
+              if ! count=$(jq -er 'length' <<<"$payload"); then
+                echo "Refusing release: unable to count the GitHub release inventory" >&2
+                return 1
+              fi
+              [[ "$count" -eq 100 ]] || return 0
+              page=$((page + 1))
+            done
+          }
+          # Invoke as a plain command, not an `if` condition: Bash suppresses errexit
+          # inside functions used as conditions. Every API/JSON failure must block release.
+          verify_release_tag_absent_including_drafts
+
       - name: Download Standard firmware
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: firmware-esp32s3-heltec-v4-standard-heltec-v4-standard-v2.8.0.6
+          name: firmware-esp32s3-heltec-v4-standard-heltec-v4-standard-v2.8.0.7
           path: release-assets/standard
 
       - name: Download Solar Router firmware
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: firmware-esp32s3-heltec-v4-solar-router-heltec-v4-solar-router-v2.8.0.6
+          name: firmware-esp32s3-heltec-v4-solar-router-heltec-v4-solar-router-v2.8.0.7
           path: release-assets/solar-router
 
       - name: Verify and package profile assets
         run: |
           set -euo pipefail
 
-          test -n "$(find release-assets/standard -maxdepth 1 -type f -name 'firmware-heltec-v4-standard-*.bin' -print -quit)"
-          test -n "$(find release-assets/solar-router -maxdepth 1 -type f -name 'firmware-heltec-v4-solar-router-*.bin' -print -quit)"
+          firmware_version="2.8.0.${GITHUB_SHA::7}"
+
+          validate_profile() {
+            local directory="$1"
+            local target="$2"
+            local manifest="$directory/firmware-${target}-${firmware_version}.mt.json"
+            local normal_bin="firmware-${target}-${firmware_version}.bin"
+            local elf="firmware-${target}-${firmware_version}.elf"
+            local factory_bin="firmware-${target}-${firmware_version}.factory.bin"
+            local littlefs_bin="littlefs-${target}-${firmware_version}.bin"
+            local ota_bin="mt-esp32s3-ota.bin"
+            local manifest_rows="$directory/.verified-manifest-files.tsv"
+            local asset_rows
+            local file_count
+
+            file_count=$(find "$directory" -maxdepth 1 -type f | wc -l)
+            test "$file_count" -eq 10
+            test -z "$(find "$directory" -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+
+            asset_rows=$(mktemp)
+            find "$directory" -maxdepth 1 -type f -print0 > "$asset_rows"
+            while IFS= read -r -d '' asset; do
+              case "$(basename "$asset")" in
+                device-install.bat | device-install.sh | device-update.bat | device-update.sh | \
+                "firmware-${target}-${firmware_version}.bin" | \
+                "firmware-${target}-${firmware_version}.elf" | \
+                "firmware-${target}-${firmware_version}.factory.bin" | \
+                "firmware-${target}-${firmware_version}.mt.json" | \
+                "littlefs-${target}-${firmware_version}.bin" | mt-esp32s3-ota.bin) ;;
+                *)
+                  echo "Unexpected ${target} payload: $asset" >&2
+                  exit 1
+                  ;;
+              esac
+            done < "$asset_rows"
+            rm "$asset_rows"
+
+            test -s "$manifest"
+            jq -e --arg target "$target" --arg version "$firmware_version" \
+              --arg normal_bin "$normal_bin" --arg elf "$elf" --arg factory_bin "$factory_bin" \
+              --arg littlefs_bin "$littlefs_bin" --arg ota_bin "$ota_bin" \
+              '.platformioTarget == $target and .version == $version and .mcu == "esp32s3" and
+               .repo == "Amoulier/meshtastic-heltec-v4-firmware" and .hwModelSlug == "HELTEC_V4" and
+               .partitionScheme == "16MB" and
+               (.part | type == "array" and length == 6) and
+               ([.part[].name] | unique | length == 6) and
+               ([.part[].offset] | unique | length == 6) and
+               ([.part[] | select(.name == "nvs" and .type == "data" and .subtype == "nvs" and
+                    .offset == "0x9000" and .size == "0x5000" and .flags == "")] | length == 1) and
+               ([.part[] | select(.name == "otadata" and .type == "data" and .subtype == "ota" and
+                    .offset == "0xe000" and .size == "0x2000" and .flags == "")] | length == 1) and
+               ([.part[] | select(.name == "app0" and .type == "app" and .subtype == "ota_0" and
+                    .offset == "0x10000" and .size == "0x640000" and .flags == "")] | length == 1) and
+               ([.part[] | select(.name == "app1" and .type == "app" and .subtype == "ota_1" and
+                    .offset == "0x650000" and .size == "0x640000" and .flags == "")] | length == 1) and
+               ([.part[] | select(.name == "spiffs" and .type == "data" and .subtype == "spiffs" and
+                    .offset == "0xc90000" and .size == "0x360000" and .flags == "")] | length == 1) and
+               ([.part[] | select(.name == "coredump" and .type == "data" and .subtype == "coredump" and
+                    .offset == "0xFF0000" and .size == "0x10000" and .flags == "")] | length == 1) and
+               (.files | type == "array") and (.files | length == 5) and
+               ([.files[].name] | sort) == ([$normal_bin, $elf, $factory_bin, $littlefs_bin, $ota_bin] | sort) and
+               ([.files[].name] | unique | length == 5) and
+               (all(.files[];
+                 (.name | type == "string") and
+                 (.md5 | type == "string" and test("^[0-9a-f]{32}$")) and
+                 (.bytes | type == "number" and . > 0 and floor == .) and
+                 (if .name == $normal_bin then .part_name == "app0" and .bytes <= 6553600
+                  elif .name == $factory_bin then (has("part_name") | not) and .bytes <= 6619136
+                  elif .name == $littlefs_bin then .part_name == "spiffs" and .bytes <= 3538944
+                  elif .name == $ota_bin then .part_name == "app1" and .bytes == 636544
+                  elif .name == $elf then (has("part_name") | not)
+                  else false
+                  end)))' "$manifest" >/dev/null
+
+            jq -er '.files[] | [.name, .md5, (.bytes | tostring)] | @tsv' "$manifest" > "$manifest_rows"
+            test "$(wc -l < "$manifest_rows")" -eq 5
+
+            while IFS=$'\t' read -r name expected_md5 expected_bytes; do
+              case "$name" in
+                "firmware-${target}-${firmware_version}.bin" | \
+                "firmware-${target}-${firmware_version}.elf" | \
+                "firmware-${target}-${firmware_version}.factory.bin" | \
+                "littlefs-${target}-${firmware_version}.bin" | mt-esp32s3-ota.bin) ;;
+                *)
+                  echo "Unexpected file in ${target} manifest: $name" >&2
+                  exit 1
+                  ;;
+              esac
+
+              test -s "$directory/$name"
+              test "$(md5sum "$directory/$name" | awk '{print $1}')" = "$expected_md5"
+              test "$(stat -c%s "$directory/$name")" = "$expected_bytes"
+            done < "$manifest_rows"
+            rm "$manifest_rows"
+          }
+
+          validate_profile release-assets/standard heltec-v4-standard
+          validate_profile release-assets/solar-router heltec-v4-solar-router
+
+          cmp -s release-assets/standard/mt-esp32s3-ota.bin \
+            release-assets/solar-router/mt-esp32s3-ota.bin
+          echo '3e62c5451afda604bac372444f058fc689dd588a87772ad4be90c228e04c1995  release-assets/standard/mt-esp32s3-ota.bin' \
+            | sha256sum --check --strict
 
           mkdir -p publish
 
-          find release-assets/standard -maxdepth 1 -type f \( -name 'firmware-heltec-v4-standard-*.bin' -o -name 'firmware-heltec-v4-standard-*.mt.json' \) -exec cp {} publish/ \;
-          find release-assets/solar-router -maxdepth 1 -type f \( -name 'firmware-heltec-v4-solar-router-*.bin' -o -name 'firmware-heltec-v4-solar-router-*.mt.json' \) -exec cp {} publish/ \;
+          # Artifact transfer does not preserve POSIX executable bits. Restore and verify them
+          # before creating the clean-install bundles that users extract directly.
+          chmod 0755 \
+            release-assets/standard/device-install.sh release-assets/standard/device-update.sh \
+            release-assets/solar-router/device-install.sh release-assets/solar-router/device-update.sh
+          test -x release-assets/standard/device-install.sh
+          test -x release-assets/standard/device-update.sh
+          test -x release-assets/solar-router/device-install.sh
+          test -x release-assets/solar-router/device-update.sh
+
+          # Publish the normal application images individually for OTA updates. A factory image is
+          # intentionally available only inside its complete bundle: after an erase it must be flashed
+          # together with the OTA loader and LittleFS image by device-install.*.
+          cp "release-assets/standard/firmware-heltec-v4-standard-${firmware_version}.bin" publish/
+          cp "release-assets/solar-router/firmware-heltec-v4-solar-router-${firmware_version}.bin" publish/
 
           (
             cd release-assets/standard
-            zip -9 -r ../../publish/heltec-v4-standard-complete-v2.8.0.6.zip .
+            zip -9 -r ../../publish/heltec-v4-standard-complete-v2.8.0.7.zip .
           )
           (
             cd release-assets/solar-router
-            zip -9 -r ../../publish/heltec-v4-solar-router-complete-v2.8.0.6.zip .
+            zip -9 -r ../../publish/heltec-v4-solar-router-complete-v2.8.0.7.zip .
           )
 
+          standard_zip_listing=$(zipinfo -l publish/heltec-v4-standard-complete-v2.8.0.7.zip)
+          solar_zip_listing=$(zipinfo -l publish/heltec-v4-solar-router-complete-v2.8.0.7.zip)
+          grep -E '^-rwxr-xr-x .* device-install\.sh$' <<<"$standard_zip_listing" >/dev/null
+          grep -E '^-rwxr-xr-x .* device-update\.sh$' <<<"$standard_zip_listing" >/dev/null
+          grep -E '^-rwxr-xr-x .* device-install\.sh$' <<<"$solar_zip_listing" >/dev/null
+          grep -E '^-rwxr-xr-x .* device-update\.sh$' <<<"$solar_zip_listing" >/dev/null
+
+          test "$(find publish -maxdepth 1 -type f | wc -l)" -eq 4
           find publish -maxdepth 1 -type f -print | sort
 
+      - name: Verify main still points to this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: heltec-v4-profiles-v2.8.0.7
+        run: |
+          set -euo pipefail
+          remote_main=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | awk '{print $1}')
+          test -n "$remote_main"
+          if [[ "$remote_main" != "$GITHUB_SHA" ]]; then
+            echo "Refusing stale release: origin/main advanced to $remote_main" >&2
+            exit 1
+          fi
+
+          if ! remote_tag=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${RELEASE_TAG}"); then
+            echo "Refusing release: unable to recheck whether tag ${RELEASE_TAG} exists" >&2
+            exit 1
+          fi
+          if [[ -n "$remote_tag" ]]; then
+            echo "Refusing release: tag ${RELEASE_TAG} appeared during the build" >&2
+            exit 1
+          fi
+
+          verify_release_tag_absent_including_drafts() {
+            local page=1 payload count
+            while true; do
+              if ! payload=$(curl --fail --silent --show-error \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}"); then
+                echo "Refusing release: unable to inventory existing releases and drafts" >&2
+                return 1
+              fi
+              if ! jq -e 'type == "array"' <<<"$payload" >/dev/null; then
+                echo "Refusing release: GitHub release inventory was not an array" >&2
+                return 1
+              fi
+              if jq -e --arg tag "$RELEASE_TAG" 'any(.[]; .tag_name == $tag)' <<<"$payload" >/dev/null; then
+                echo "Refusing release: an existing release or draft appeared before publish for ${RELEASE_TAG}" >&2
+                return 1
+              fi
+              if ! count=$(jq -er 'length' <<<"$payload"); then
+                echo "Refusing release: unable to count the GitHub release inventory" >&2
+                return 1
+              fi
+              [[ "$count" -eq 100 ]] || return 0
+              page=$((page + 1))
+            done
+          }
+          # Keep the last boundary fail-closed on transport and JSON errors too.
+          verify_release_tag_absent_including_drafts
+
       - name: Publish Heltec V4 profile release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          tag_name: heltec-v4-profiles-v2.8.0.6
+          tag_name: heltec-v4-profiles-v2.8.0.7
           target_commitish: ${{ github.sha }}
-          name: Heltec V4 Standard and Solar Router v2.8.0.6
+          name: Heltec V4 Standard and Solar Router v2.8.0.7
           prerelease: false
           make_latest: true
           generate_release_notes: false
+          overwrite_files: false
           body: |
             Custom Meshtastic firmware exclusively for the Heltec V4 OLED, now distributed as two explicit profiles from one maintained codebase.
 
             Choose one profile:
 
             - `heltec-v4-standard`: regular personal or mobile nodes. It keeps the common OLED, GPS, Bluetooth, battery reporting, CPU and MQTT improvements, while retaining normal Meshtastic critical-battery thresholds and wake behavior.
-            - `heltec-v4-solar-router`: fixed solar infrastructure configured as `ROUTER` or `ROUTER_LATE`. It adds the aggressive 3.50 V protective shutdown, timer-only critical sleep, peripheral power isolation and 3.65 V recovery hysteresis.
+            - `heltec-v4-solar-router`: fixed solar infrastructure configured as `ROUTER` or `ROUTER_LATE`. It adds the aggressive 3.50 V protective shutdown, timer-only critical sleep, peripheral power isolation and 3.65 V recovery hysteresis, with a USB data-host bypass for local recovery.
 
             The legacy PlatformIO target `heltec-v4` remains a compatibility alias for `heltec-v4-solar-router`, but release files use only the explicit profile names.
 
             Common improvements:
 
             - Persistent `Display Options -> Disable Display` control.
+            - The confirmation explicitly warns that persistent display-off also cuts the shared OLED/VEXT rail; timer wakes preserve VEXT when an I2C accessory was detected.
             - Incoming messages and automatic events do not wake a persistently disabled OLED.
+            - Geofence, motion/tap and remotely injected input events do not create hidden display-wake intervals while it is disabled.
             - Holding PRG for about one second restores the display.
+            - The status/pairing LED stays dark in persistent display-off mode, including on headless timer wakes.
             - GPS is disabled by default on a clean installation and is not probed while disabled.
-            - Bluetooth remains discoverable and reconnectable without pressing PRG.
+            - A valid GPS fix observed during a search cycle remains credited at cycle end even if the final poll has no new fix.
+            - Bluetooth remains discoverable and reconnectable without pressing PRG, including on `ROUTER` and `ROUTER_LATE` while the OLED is disabled.
+            - Explicitly disabling Bluetooth restores the normal Router/power-saving sleep path.
+            - Disabling Bluetooth from the physical menu verifies the persisted setting before restarting, so a write failure retains the previous working state.
             - Profile-aligned battery curves: Standard represents the normal 3.10 V discharge tail, while Solar Router reaches 0% at its 3.50 V protective cutoff.
-            - Published battery percentage is slew-limited without delaying raw-voltage protection.
-            - At each profile's own critical threshold, the optional NodeDB save is skipped to reduce brownout-related configuration risk.
+            - Published battery percentage is slew-limited while Solar Router protection uses the latest unfiltered 15-sample ADC average.
+            - A confirmed battery remains protected through severe voltage sag without treating the open battery input at boot as a real cell.
+            - On battery, ordinary preference writes require a fresh usable reading of at least 3.30 V on Standard or strictly above 3.50 V on Solar Router (minimum integer reading 3.501 V); an active enumerated USB data host also authorizes the write, while charge-only/VBUS detection does not. Eligible transaction-free core saves retry when safe power returns.
+            - Reset, preference restore and OTA entry use the stricter fresh 3.65 V-or-USB-data-host power gate.
+            - Preference writes report verification failures and retry without formatting or wiping the filesystem.
+            - A failed LittleFS mount never auto-formats Heltec V4: the node boots fail-closed with LoRa TX and GPS off, accepts only local BLE/USB administration (including supported BLE OTA) for recovery, and rejects identity/settings writes.
+            - A mounted but unreadable identity/config file remains protected after boot: LoRa stays silent, ordinary Admin mutations and identity-bearing writes are rejected, and config-only reset cannot replace the unavailable key.
+            - A partial core generation is detected before any boot migration or automatic save: if any config/channel/module/device/node file or pending temporary exists while a peer file is missing, the node remains radio-silent and preserves the surviving files for local recovery.
+            - Recovery exposes only a bounded local BLE/USB allowlist: reboot/shutdown, DFU, supported BLE OTA, compatible preference restore and factory reset operations, plus NodeDB reset when the surviving state permits it. Destructive operations require an active USB data-host connection or an initialized raw battery reading of at least 3.65 V, refreshed immediately before each destructive boundary.
+            - Full reset clears unrelated files before `/prefs`; if its explicitly authorized preference removal becomes partial, it completes through a verified filesystem format instead of returning with a half-deleted generation.
+            - Config-only reset replaces each identity-bearing core file atomically before auxiliary preferences are removed, and cannot retain a stale node cache when no initialized identity can produce a fresh one; an incomplete multi-file reset reports failure and keeps recovery connectivity available for retry.
+            - Legacy preferences are replaced with clean defaults without an early-boot directory erase; the cryptographic identity is preserved, four identity/config-bearing files are verified, then the old node cache and obsolete marker are removed in retry-safe order. An unreadable legacy identity fails closed without replacing or deleting it.
             - Correct MQTT implicit acknowledgement handling without changing normal LoRa acknowledgements.
+            - MQTT configuration validation no longer opens a live TCP probe before committing a candidate configuration.
+            - A new incoming-message banner no longer replaces a text-message frame that is already being read; the message remains stored and unread.
+            - SX1262 state-loss recovery no longer compounds the Heltec V4 FEM power conversion; failed CAD defers TX, failed reconfiguration rearms RX, and failed critical-sleep entry asserts radio reset.
+            - Muted senders and channels do not wake the display or power state machine.
+            - Restored legacy low-entropy PKI keys are rejected and securely regenerated; ordinary existing keys and node identity remain unchanged.
+            - Unified OTA transport and firmware hash are read back from NVS before the OTA loader is selected, preventing a persistence failure from stranding the node in app1.
+            - BLE OTA cannot reactivate stale Wi-Fi credentials from an earlier Wi-Fi OTA, including during fail-closed storage recovery.
+            - Abandoned multi-setting Admin transactions expire on the real idle deadline, persist their applied values, and retain any restart required for Bluetooth/power-state changes.
+            - Multi-setting edits reject concurrent UI, HTTP and background persistence. Invalid radio candidates are rejected before commit; after a valid generation commits, traffic stays fenced until radio activation succeeds, and an activation failure leaves LoRa parked and schedules a guarded reboot.
+            - Settings BEGIN uses a lossless quiescing phase: it blocks new radio/network work, drains already admitted RX/TX, preserves a packet caught after dequeue, then parks the radio. Maintenance cannot rearm it, queues resume only after the transaction finishes, and a one-shot mutation without this pre-mutation fence is rejected.
+            - Message and waypoint persistence locks are drained before filesystem reset, and queued clear/autosave work cannot cross into the destructive transaction.
+            - Preference backup/restore validates complete segments, identity/keypair consistency, radio legality and backup layout before replacing live files; a durable marker makes an interrupted restore retry-safe and nested backups are rejected.
+            - Message and waypoint stores use locked snapshots and verified atomic writes. Saved messages own independent text storage, avoiding wraparound corruption, and malformed records or notification flags are rejected.
+            - Security SET validates key lengths/counts, private/public consistency and compromised low-entropy keys before mutation; Curve25519 shared-secret bytes are no longer logged.
+            - XMODEM is restricted to local BLE/serial, refuses preference/backup/recovery paths, and is disabled during recovery or storage transactions. Short uploads remove partial files and cancelling a download preserves its source.
+            - HTTP uploads and deletes are confined to the static-file tree; traversal and protected persistence paths are rejected, and state readers are fenced during reset/restore.
+            - Role changes undo only unchanged role-imposed defaults, preserve later user customizations and clear stale `is_unmessagable` state when appropriate.
+            - First event-profile use creates config and channels together without deleting the inactive profile or its backup; encrypted-storage unlock reloads and validates the persisted PKI identity rather than retaining the locked placeholder.
+            - Canned-message, ringtone and manual key-verification changes propagate persistence failure instead of acknowledging RAM-only state; canned text no longer implicitly toggles the separate module-enable setting.
+            - Removing licensed status in a licensed-only region atomically selects region `UNSET`, disables TX and clears frequency/channel overrides.
+            - Irreparable or physically unsupported LoRa configurations are rejected before persistence; modem setup recalculates the effective region after every safe repair and otherwise disables TX without guessing a regulatory domain.
             - Regional settings, configured LoRa transmit power and RX Boosted Gain behavior remain unchanged.
 
             Solar Router safeguards:
@@ -106,9 +378,17 @@ jobs:
             - Three consecutive raw battery readings at or below 3.50 V trigger protective deep sleep.
             - Critical sleep disables external wake sources and wakes only by timer.
             - OLED, GPS, LED, LoRa FEM and other retained power domains are forced off.
-            - Boot remains in recovery sleep until battery voltage reaches approximately 3.65 V.
+            - Without an active enumerated USB data host, boot remains in recovery sleep until battery voltage reaches approximately 3.65 V; a data-host connection permits local recovery.
 
-            Upstream base: Meshtastic `develop` through `7239fe886a30fa13cd35946fa5ae1a46a2807eeb`.
+            Upstream base: Meshtastic `develop` through `7239fe886a30fa13cd35946fa5ae1a46a2807eeb`, with audited stability backports selected through `fdb67309aa8fb9a019e07160ac72024c3d25ce2d`. This release intentionally remains on the 2.8.0 base and does not claim a full 2.8.1 synchronization.
+
+            Installation safety:
+
+            - For an OTA update, use the profile-specific normal `.bin` published as an individual asset.
+            - For a wired preserving update, extract the matching `complete` ZIP and run `device-update.sh` or `device-update.bat` with its normal `.bin`; the adjacent manifest is required for verification.
+            - For an erased or deliberately clean device, download the matching `complete` ZIP, extract every file, and run `device-install.sh` or `device-install.bat` with its `.factory.bin`. The installer writes the factory image, unified OTA loader and LittleFS image together.
+            - The included installers require esptool 4.5.1 or newer and an explicit serial port, verify ESP32-S3 identity and 16 MB flash, bind the selected profile/version filename exactly to manifest target/version, and validate repository provenance, partition metadata, sizes and digests before any erase or write. POSIX scripts also require `jq`.
+            - Do not erase flash and then write the `.factory.bin` alone; it deliberately remains inside the complete bundle to prevent that incomplete installation path.
 
             This is an independent release and is not an official Meshtastic build. Validate the complete low-voltage shutdown and recovery cycle on the target solar power system before unattended deployment.
           files: publish/*

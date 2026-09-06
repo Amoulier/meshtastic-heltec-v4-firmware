@@ -248,11 +248,11 @@ size_t WarmNodeStore::count() const
     return n;
 }
 
-bool WarmNodeStore::saveIfDirty()
+bool WarmNodeStore::saveIfDirty(bool requireDestructivePower)
 {
     if (!dirty)
         return true;
-    bool ok = save();
+    bool ok = save(requireDestructivePower);
     if (ok)
         dirty = false;
     return ok;
@@ -491,8 +491,9 @@ void WarmNodeStore::load()
              activePage, writeSlot);
 }
 
-bool WarmNodeStore::save()
+bool WarmNodeStore::save(bool requireDestructivePower)
 {
+    (void)requireDestructivePower;
     if (!powerHAL_isPowerLevelSafe()) {
         LOG_ERROR("Trying to save WarmStore on unsafe device power level");
         return false;
@@ -600,7 +601,7 @@ void WarmNodeStore::load()
              legacy ? " (migrated from an older format)" : "");
 }
 
-bool WarmNodeStore::save()
+bool WarmNodeStore::save(bool requireDestructivePower)
 {
     if (!entries)
         return false;
@@ -625,7 +626,12 @@ bool WarmNodeStore::save()
         FSCom.mkdir("/prefs");
     }
 
-    auto f = SafeFile(warmFileName, false);
+#if defined(HELTEC_V4_OLED)
+    constexpr bool keepPreviousGeneration = true;
+#else
+    constexpr bool keepPreviousGeneration = false;
+#endif
+    auto f = SafeFile(warmFileName, keepPreviousGeneration, requireDestructivePower);
 
     {
         concurrency::LockGuard g(spiLock);
@@ -644,8 +650,9 @@ bool WarmNodeStore::save()
 #else
 
 void WarmNodeStore::load() {}
-bool WarmNodeStore::save()
+bool WarmNodeStore::save(bool requireDestructivePower)
 {
+    (void)requireDestructivePower;
     return true;
 }
 

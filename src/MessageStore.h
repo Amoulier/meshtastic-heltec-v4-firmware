@@ -13,6 +13,7 @@
 #define ENABLE_MESSAGE_PERSISTENCE 1
 #endif
 
+#include "concurrency/Lock.h"
 #include "mesh/generated/meshtastic/mesh.pb.h"
 #include <cstdint>
 #include <deque>
@@ -36,15 +37,8 @@
 // Internal alias used everywhere in code - do NOT redefine elsewhere.
 #define MAX_MESSAGES_SAVED MESSAGE_HISTORY_LIMIT
 
-// Maximum text payload size per message in bytes.
-// This still defines the max message length, but we no longer reserve this space per message.
+// Maximum text payload size per message in bytes, including its terminator.
 #define MAX_MESSAGE_SIZE 220
-
-// Total shared text pool size for all messages combined.
-// The text pool is RAM-only. Text is re-stored from flash into the pool on boot.
-#ifndef MESSAGE_TEXT_POOL_SIZE
-#define MESSAGE_TEXT_POOL_SIZE (MAX_MESSAGES_SAVED * MAX_MESSAGE_SIZE)
-#endif
 
 // Explicit message classification
 enum class MessageType : uint8_t {
@@ -66,20 +60,20 @@ struct StoredMessage {
     uint32_t sender;      // NodeNum of sender
     uint8_t channelIndex; // Channel index used
     uint32_t dest;        // Destination node (broadcast or direct)
+    uint32_t packetId;    // RAM-only packet ID used to match this boot's ACK
     MessageType type;     // Derived from dest (explicit classification)
     bool isBootRelative;  // true = Time::getUptimeSecs() fallback; false = epoch/RTC absolute
     AckStatus ackStatus;  // Delivery status (only meaningful for our own sent messages)
 
-    // Text storage metadata - rebuilt from flash at boot
-    uint16_t textOffset; // Offset into global text pool (valid only after loadFromFlash())
-    uint16_t textLength; // Length of text in bytes
+    uint16_t textLength;
+    char text[MAX_MESSAGE_SIZE];
 
     bool xeddsaSigned; // true if packet carried a verified XEdDSA signature
 
     // Default constructor initializes all fields safely
     StoredMessage()
-        : timestamp(0), sender(0), channelIndex(0), dest(0xffffffff), type(MessageType::BROADCAST), isBootRelative(false),
-          ackStatus(AckStatus::NONE), textOffset(0), textLength(0), xeddsaSigned(false)
+        : timestamp(0), sender(0), channelIndex(0), dest(0xffffffff), packetId(0), type(MessageType::BROADCAST),
+          isBootRelative(false), ackStatus(AckStatus::NONE), textLength(0), text{}, xeddsaSigned(false)
     {
     }
 };
@@ -92,16 +86,20 @@ class MessageStore
     // Live RAM methods (always current, used by UI and runtime)
     void addLiveMessage(StoredMessage &&msg);
     void addLiveMessage(const StoredMessage &msg); // convenience overload
-    const std::deque<StoredMessage> &getLiveMessages() const { return liveMessages; }
-    // Add new messages from packets. Returns nullptr if the packet is filtered out.
-    const StoredMessage *tryAddFromPacket(const meshtastic_MeshPacket &mp); // Incoming/outgoing -> RAM only
+    std::deque<StoredMessage> getLiveMessages() const;
+    // Add from a packet and optionally return an independent copy. False means filtered/invalid.
+    bool tryAddFromPacket(const meshtastic_MeshPacket &mp, StoredMessage *stored = nullptr);
+    bool updateOwnMessageAck(uint32_t localNode, uint32_t packetId, AckStatus status);
 
     // Persistence methods (used only on boot/shutdown)
-    void saveToFlash();   // Save messages to flash
+    bool saveToFlash();   // Save messages to flash; false if verification failed
     void loadFromFlash(); // Load messages from flash
 
-    // Clear all messages (RAM + persisted queue + text pool)
-    void clearAllMessages();
+    // Clear all messages (RAM + persisted queue)
+    bool clearAllMessages(bool requireDestructivePower = false);
+    /// Wait for a save that entered immediately before NodeDB raised its
+    /// destructive-storage fence. New saves are rejected while that fence is active.
+    void drainPersistenceWrites();
 
     // Delete helpers
     void deleteOldestMessage(); // remove oldest from RAM (and flash on save)
@@ -110,8 +108,8 @@ class MessageStore
     void deleteAllMessagesInChannel(uint8_t channel);
     void deleteAllMessagesWithPeer(uint32_t peer);
     void deleteAllMessagesFromNode(uint32_t nodeNum);
-    // Unified accessor (for UI code, defaults to RAM buffer)
-    const std::deque<StoredMessage> &getMessages() const { return liveMessages; }
+    // Unified snapshot accessor for UI code.
+    std::deque<StoredMessage> getMessages() const;
     bool hasVisibleMessages() const;
 
     // Helper filters for future use
@@ -120,19 +118,28 @@ class MessageStore
     bool shouldStorePacket(const meshtastic_MeshPacket &mp) const;
     bool isMessageVisible(const StoredMessage &msg) const;
 
-    // Upgrade boot-relative timestamps once RTC is valid
+    // Upgrade boot-relative timestamps once RTC is valid.
     void upgradeBootRelativeTimestamps();
 
     // Retrieve the C-string text for a stored message
     static const char *getText(const StoredMessage &msg);
 
-    // Allocate text into pool (used by sender-side code)
-    static uint16_t storeText(const char *src, size_t len);
+    // Copy bounded text into a message so copies retain independent content.
+    static void setText(StoredMessage &msg, const char *src, size_t len);
+
+#if ENABLE_MESSAGE_PERSISTENCE
+    void autosaveTick();
+#endif
 
   private:
-    bool pruneHiddenMessages();
-    std::deque<StoredMessage> liveMessages; // Single in-RAM message buffer (also used for persistence)
+    void markUnsavedLocked();
+    bool pruneHiddenMessagesLocked();
+    mutable concurrency::Lock stateLock;
+    std::deque<StoredMessage> liveMessages; // Protected by stateLock
     std::string filename;                   // Flash filename for persistence
+    bool hasUnsavedChanges = false;         // Protected by stateLock
+    uint32_t lastAutoSaveMs = 0;            // Protected by stateLock
+    uint32_t mutationGeneration = 0;        // Protects saves from clearing a newer dirty state
 };
 
 #if ENABLE_MESSAGE_PERSISTENCE

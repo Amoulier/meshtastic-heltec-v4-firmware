@@ -1,7 +1,9 @@
 #include "configuration.h"
 #if !MESHTASTIC_EXCLUDE_WEBSERVER
 #include "NodeDB.h"
+#include "Power.h"
 #include "UptimeClock.h"
+#include "concurrency/LockGuard.h"
 #include "graphics/Screen.h"
 #include "main.h"
 #include "mesh/http/WebServer.h"
@@ -24,7 +26,6 @@
 
 // Persistent Data Storage
 #include <Preferences.h>
-Preferences prefs;
 
 /*
   Including the esp32_https_server library will trigger a compile time error. I've
@@ -122,21 +123,45 @@ static void handleWebResponse()
 
 static void taskCreateCert(void *parameter)
 {
-    prefs.begin("MeshtasticHTTPS", false);
-
     LOG_INFO("Checking if we have a saved SSL Certificate");
 
-    size_t pkLen = prefs.getBytesLength("PK");
-    size_t certLen = prefs.getBytesLength("cert");
+    size_t pkLen = 0;
+    size_t certLen = 0;
+    uint8_t *pkBuffer = nullptr;
+    uint8_t *certBuffer = nullptr;
+    {
+#if defined(HELTEC_V4_OLED)
+        // A full factory reset holds this lock across NVS erase/rebuild and
+        // raises the destructive fence before waiting for it. A certificate
+        // task already inside this section finishes first and is then erased;
+        // one arriving later skips NVS entirely until the guarded reboot.
+        concurrency::LockGuard nvsGuard(&heltecV4NvsMutationLock);
+#endif
+        if (!nodeDB || !nodeDB->isDestructiveStorageMutationActive()) {
+            Preferences certPreferences;
+            if (certPreferences.begin("MeshtasticHTTPS", true)) {
+                pkLen = certPreferences.getBytesLength("PK");
+                certLen = certPreferences.getBytesLength("cert");
+                if (pkLen && certLen) {
+                    pkBuffer = new uint8_t[pkLen];
+                    certBuffer = new uint8_t[certLen];
+                    if (certPreferences.getBytes("PK", pkBuffer, pkLen) != pkLen ||
+                        certPreferences.getBytes("cert", certBuffer, certLen) != certLen) {
+                        delete[] pkBuffer;
+                        delete[] certBuffer;
+                        pkBuffer = nullptr;
+                        certBuffer = nullptr;
+                        pkLen = 0;
+                        certLen = 0;
+                    }
+                }
+                certPreferences.end();
+            }
+        }
+    }
 
-    if (pkLen && certLen) {
+    if (pkBuffer && certBuffer) {
         LOG_INFO("Existing SSL Certificate found");
-
-        uint8_t *pkBuffer = new uint8_t[pkLen];
-        prefs.getBytes("PK", pkBuffer, pkLen);
-
-        uint8_t *certBuffer = new uint8_t[certLen];
-        prefs.getBytes("cert", certBuffer, certLen);
 
         cert = new SSLCert(certBuffer, certLen, pkBuffer, pkLen);
 
@@ -161,8 +186,36 @@ static void taskCreateCert(void *parameter)
 
             LOG_DEBUG("Created Certificate: %d Bytes", cert->getCertLength());
 
-            prefs.putBytes("PK", (uint8_t *)cert->getPKData(), cert->getPKLength());
-            prefs.putBytes("cert", (uint8_t *)cert->getCertData(), cert->getCertLength());
+            bool persisted = false;
+#if defined(HELTEC_V4_OLED)
+            const bool certificatePowerSafe = heltecPreferenceStoragePowerIsSafe();
+#else
+            constexpr bool certificatePowerSafe = true;
+#endif
+            {
+#if defined(HELTEC_V4_OLED)
+                concurrency::LockGuard nvsGuard(&heltecV4NvsMutationLock);
+                const bool certificatePowerStillSafe = heltecPreferenceStoragePowerIsSafe();
+#else
+                constexpr bool certificatePowerStillSafe = true;
+#endif
+                if (certificatePowerSafe && certificatePowerStillSafe &&
+                    (!nodeDB || !nodeDB->isDestructiveStorageMutationActive())) {
+                    Preferences certPreferences;
+                    if (certPreferences.begin("MeshtasticHTTPS", false)) {
+                        const size_t writtenPk =
+                            certPreferences.putBytes("PK", (uint8_t *)cert->getPKData(), cert->getPKLength());
+                        const size_t writtenCert =
+                            certPreferences.putBytes("cert", (uint8_t *)cert->getCertData(), cert->getCertLength());
+                        persisted = writtenPk == cert->getPKLength() && writtenCert == cert->getCertLength() &&
+                                    certPreferences.getBytesLength("PK") == cert->getPKLength() &&
+                                    certPreferences.getBytesLength("cert") == cert->getCertLength();
+                        certPreferences.end();
+                    }
+                }
+            }
+            if (!persisted)
+                LOG_WARN("SSL certificate remained ephemeral; power gate or NVS verification refused persistence");
         }
     }
 

@@ -14,6 +14,7 @@
  * @date [Insert Date]
  */
 #include "ExternalNotificationModule.h"
+#include "Channels.h"
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "Router.h"
@@ -23,6 +24,7 @@
 #include "main.h"
 #include "mesh/Throttle.h"
 #include "mesh/generated/meshtastic/rtttl.pb.h"
+#include "modules/AdminModule.h"
 #include <Arduino.h>
 
 #if defined(HAS_RGB_LED)
@@ -421,15 +423,8 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
                 }
             }
 
-            const meshtastic_NodeInfoLite *sender = nodeDB->getMeshNode(mp.from);
-            meshtastic_Channel ch = channels.getByIndex(mp.channel ? mp.channel : channels.getPrimaryIndex());
-
-            // If we receive a broadcast message, apply channel mute setting
-            // If we receive a direct message and the receipent is us, apply DM mute setting
-            // Else we just handle it as not muted.
             const bool isDmToUs = !isBroadcast(mp.to) && isToUs(&mp);
-            bool is_muted = isDmToUs ? nodeInfoLiteIsMuted(sender)
-                                     : (ch.settings.has_module_settings && ch.settings.module_settings.is_muted);
+            const bool is_muted = isMutedForPacket(mp);
 
             const bool buzzerModeIsDirectOnly =
                 (config.device.buzzer_mode == meshtastic_Config_DeviceConfig_BuzzerMode_DIRECT_MSG_ONLY);
@@ -589,8 +584,8 @@ AdminMessageHandleResult ExternalNotificationModule::handleAdminMessageForModule
 
     case meshtastic_AdminMessage_set_ringtone_message_tag:
         LOG_INFO("Client setting ringtone");
-        this->handleSetRingtone(request->set_canned_message_module_messages);
-        result = AdminMessageHandleResult::HANDLED;
+        result = this->handleSetRingtone(request->set_ringtone_message) ? AdminMessageHandleResult::HANDLED
+                                                                        : AdminMessageHandleResult::ERROR;
         break;
 #endif
 
@@ -611,19 +606,24 @@ void ExternalNotificationModule::handleGetRingtone(const meshtastic_MeshPacket &
     } // Don't send anything if not instructed to. Better than asserting.
 }
 
-void ExternalNotificationModule::handleSetRingtone(const char *from_msg)
+bool ExternalNotificationModule::handleSetRingtone(const char *from_msg)
 {
-    int changed = 0;
+    if (!from_msg || !*from_msg)
+        return true;
 
-    if (*from_msg) {
-        changed |= strcmp(rtttlConfig.ringtone, from_msg);
-        strncpy(rtttlConfig.ringtone, from_msg, sizeof(rtttlConfig.ringtone));
-        LOG_INFO("*** from_msg.text:%s", from_msg);
-    }
+    meshtastic_RTTTLConfig previous = rtttlConfig;
+    strncpy(rtttlConfig.ringtone, from_msg, sizeof(rtttlConfig.ringtone) - 1);
+    rtttlConfig.ringtone[sizeof(rtttlConfig.ringtone) - 1] = '\0';
+    if (strcmp(previous.ringtone, rtttlConfig.ringtone) == 0)
+        return true;
 
-    if (changed) {
-        nodeDB->saveProto(rtttlConfigFile, meshtastic_RTTTLConfig_size, &meshtastic_RTTTLConfig_msg, &rtttlConfig);
+    LOG_INFO("Updating ringtone");
+    if (!nodeDB->saveProto(rtttlConfigFile, meshtastic_RTTTLConfig_size, &meshtastic_RTTTLConfig_msg, &rtttlConfig)) {
+        rtttlConfig = previous;
+        LOG_ERROR("Ringtone was not persisted");
+        return false;
     }
+    return true;
 }
 #endif
 

@@ -3,6 +3,7 @@
 #include "BluetoothCommon.h"
 #include "NimbleBluetooth.h"
 #include "PowerFSM.h"
+#include "Power.h"
 #include "StaticPointerQueue.h"
 
 #include "concurrency/OSThread.h"
@@ -70,6 +71,13 @@ static void purgeIncompatibleBleBonds()
 
     bool wiped = false;
     if (mismatch) {
+#if defined(HELTEC_V4_OLED)
+        if (!heltecDestructiveStoragePowerIsSafe()) {
+            LOG_WARN("Deferring incompatible NimBLE bond cleanup until power is safe");
+            nvs_close(handle);
+            return;
+        }
+#endif
         LOG_WARN("Wiping incompatible NimBLE bonds (format changed)");
         wiped = nvs_erase_all(handle) == ESP_OK && nvs_commit(handle) == ESP_OK;
         if (!wiped) {

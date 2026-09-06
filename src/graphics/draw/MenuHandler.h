@@ -150,7 +150,6 @@ class menuHandler
                                                                              meshtastic_Config_LoRaConfig_RegionCode selected);
 
   private:
-    static void saveUIConfig();
     static void keyVerificationInitMenu();
     static void keyVerificationFinalPrompt();
     static void bluetoothToggleMenu();

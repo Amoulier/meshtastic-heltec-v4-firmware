@@ -2,9 +2,11 @@
 
 #include "MeshPacketQueue.h"
 #include "RadioInterface.h"
+#include "concurrency/Lock.h"
 #include "concurrency/NotifiedWorkerThread.h"
 
 #include <RadioLib.h>
+#include <atomic>
 #include <sys/types.h>
 
 // ESP32 has special rules about ISR code
@@ -53,6 +55,21 @@ class STM32WLx_ModuleWrapper : public STM32WLx_Module
 class RadioLibInterface : public RadioInterface, protected concurrency::NotifiedWorkerThread
 {
     MeshPacketQueue txQueue = MeshPacketQueue(MAX_TX_QUEUE);
+    mutable concurrency::Lock configDeferredPacketLock;
+    meshtastic_MeshPacket *configDeferredPacket = nullptr;
+    std::atomic<uint32_t> radioNotificationDepth{0};
+#if defined(HELTEC_V4_OLED)
+    std::atomic<uint32_t> sendAdmissionDepth{0};
+    std::atomic<bool> configResumeRequested{false};
+#endif
+
+    /** Return a packet dequeued at the configuration fence to the normal queue.
+     *  Must only run on the radio worker, which owns the deferred-to-queue handoff.
+     */
+    void restoreConfigDeferredPacket();
+
+    /** Snapshot whether the worker owns a packet dequeued across the configuration fence. */
+    bool hasConfigDeferredPacket() const;
 
   protected:
     /// Used as our notification from the ISR
@@ -180,6 +197,24 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      */
     virtual void resetAGC();
 
+    /** Periodic radio upkeep: re-arms RX if a failed startReceive() left it off, otherwise resets AGC. */
+    void periodicRadioMaintenance();
+
+    /** Chip-specific recovery of a chip that lost its state to a reset/brownout. Returns true if reprogrammed. */
+    virtual bool recoverChipStateLoss() { return false; }
+
+    /** Throttled recoverChipStateLoss(), so a dead chip can't stall the RX/TX hot paths with repeated begin(). */
+    bool maybeRecoverChipStateLoss();
+
+    uint32_t lastChipRecoveryMs = 0;
+
+    /// Consecutive recovery attempts that never got RX armed again, before rebooting to re-run init()
+    static constexpr uint8_t MAX_CHIP_RECOVERY_FAILURES = 5;
+    uint8_t chipRecoveryFailures = 0;
+
+    /// Set by a driver's startReceive() when it gives up and leaves RX off; cleared once RX is armed again.
+    bool rxOffline = false;
+
     /**
      * Debugging counts
      */
@@ -199,6 +234,10 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      * With deepSleep set, an in-flight transmission also vetoes sleep (see RadioInterface).
      */
     virtual bool canSleep(bool deepSleep) override;
+
+    bool canParkForConfig() override;
+    bool hasPendingTransmissionsForConfig() override;
+    void resumeQueuedTransmissions() override;
 
     /**
      * Start waiting to receive a message
@@ -310,6 +349,9 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     /**
      * If a send was in progress finish it and return the buffer to the pool */
     void completeSending();
+
+    /** Release an interrupted send without counting it as successfully transmitted. */
+    void abortSending();
 
     /**
      * Add SNR data to received messages

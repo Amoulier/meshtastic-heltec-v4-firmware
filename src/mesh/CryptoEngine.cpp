@@ -8,6 +8,7 @@
 #include "NodeDB.h"
 #include "aes-ccm.h"
 #include "meshUtils.h"
+#include "security/SecureZero.h"
 #include <Crypto.h>
 #include <Curve25519.h>
 #include <RNG.h>
@@ -81,6 +82,43 @@ bool CryptoEngine::regeneratePublicKey(uint8_t *pubKey, uint8_t *privKey)
 #endif
     } else {
         LOG_WARN("X25519 key generation failed due to blank private key");
+        return false;
+    }
+    return true;
+}
+
+bool CryptoEngine::restoreIdentity(const uint8_t *privKey)
+{
+    // Clear first so every failure is fail-closed. This also removes a key that
+    // generateKeyPair() installed internally before a caller rejected its
+    // public half (for example, the compromised-key blacklist).
+    const auto clearIdentity = [&]() {
+        meshtastic_security::secure_zero(private_key, sizeof(private_key));
+        meshtastic_security::secure_zero(public_key, sizeof(public_key));
+        meshtastic_security::secure_zero(shared_key, sizeof(shared_key));
+#if !(MESHTASTIC_EXCLUDE_XEDDSA)
+        meshtastic_security::secure_zero(xeddsa_private_key, sizeof(xeddsa_private_key));
+        meshtastic_security::secure_zero(xeddsa_public_key, sizeof(xeddsa_public_key));
+        meshtastic_security::secure_zero(cached_curve_pubkey, sizeof(cached_curve_pubkey));
+        meshtastic_security::secure_zero(cached_ed_pubkey, sizeof(cached_ed_pubkey));
+#endif
+    };
+    clearIdentity();
+    clearPendingPublicKey();
+
+    if (!privKey)
+        return true;
+
+    uint8_t privateCopy[32];
+    uint8_t restoredPublicKey[32];
+    memcpy(privateCopy, privKey, sizeof(privateCopy));
+    const bool restored = regeneratePublicKey(restoredPublicKey, privateCopy);
+    meshtastic_security::secure_zero(privateCopy, sizeof(privateCopy));
+    meshtastic_security::secure_zero(restoredPublicKey, sizeof(restoredPublicKey));
+    if (!restored) {
+        // A virtual regeneratePublicKey() implementation may have written
+        // partial state before returning false; wipe it again.
+        clearIdentity();
         return false;
     }
     return true;
@@ -243,7 +281,6 @@ bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtas
 
     // Calculate the shared secret with the destination node and encrypt
     printBytes("Attempt encrypt with nonce: ", nonce, 13);
-    printBytes("Attempt encrypt with shared_key starting with: ", shared_key, 8);
     aes_ccm_ae(shared_key, 32, nonce, 8, bytes, numBytes, nullptr, 0, bytesOut, auth);
     memcpy((uint8_t *)(auth + 8), &extraNonceTmp,
            sizeof(uint32_t)); // do not use dereference on potential non aligned pointers : *extraNonce = extraNonceTmp;
@@ -283,7 +320,6 @@ bool CryptoEngine::decryptCurve25519(uint32_t fromNode, meshtastic_NodeInfoLite_
 
     initNonce(fromNode, packetNum, extraNonce);
     printBytes("Attempt decrypt with nonce: ", nonce, 13);
-    printBytes("Attempt decrypt with shared_key starting with: ", shared_key, 8);
     return aes_ccm_ad(shared_key, 32, nonce, 8, bytes, numBytes - 12, nullptr, 0, auth, bytesOut);
 }
 

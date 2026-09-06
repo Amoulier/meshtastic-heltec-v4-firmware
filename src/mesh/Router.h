@@ -9,6 +9,7 @@
 #include "RadioInterface.h"
 #include "concurrency/LockGuard.h"
 #include "concurrency/OSThread.h"
+#include <atomic>
 #include <memory>
 
 inline bool isCoordinatePortnum(meshtastic_PortNum portnum)
@@ -45,6 +46,14 @@ class Router : protected concurrency::OSThread, protected PacketHistory
     /// Packets which have just arrived from the radio, ready to be processed by this service and possibly
     /// forwarded to the phone.
     PointerQueue<meshtastic_MeshPacket> fromRadioQueue;
+#if defined(HELTEC_V4_OLED)
+    // A single Router worker can cross NONE->QUIESCING after its initial gate
+    // but before dequeuing. Preserve that packet outside the bounded queue so
+    // it cannot be dropped or decoded against a replacement key generation.
+    std::atomic<meshtastic_MeshPacket *> configDeferredReceivedPacket{nullptr};
+    std::atomic<uint32_t> radioPacketRunDepth{0};
+    std::atomic<uintptr_t> radioPacketRunOwnerTask{0};
+#endif
 
   protected:
     std::unique_ptr<RadioInterface> iface = nullptr;
@@ -105,6 +114,11 @@ class Router : protected concurrency::OSThread, protected PacketHistory
      * FIXME, this is kinda a hack because we don't have a nice way yet to say 'wake us because we are 'blocked on this queue'
      */
     void setReceivedMessage();
+
+    /// Whether an already-captured LoRa frame is waiting for Router decoding.
+    /// A settings transaction must not replace channel keys while this queue
+    /// still contains ciphertext from the committed generation.
+    bool hasPendingRadioPacketsForConfig();
 
     /**
      * RadioInterface calls this to queue up packets that have been received from the radio.  The router is now responsible for

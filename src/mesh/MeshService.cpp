@@ -6,6 +6,7 @@
 
 #include "../concurrency/Periodic.h"
 #include "BluetoothCommon.h" // needed for updateBatteryLevel, FIXME, eventually when we pull mesh out into a lib we shouldn't be whacking bluetooth from here
+#include "FSCommon.h"
 #include "MeshService.h"
 #include "MessageStore.h"
 #include "NodeDB.h"
@@ -88,6 +89,11 @@ void MeshService::init()
 
 int MeshService::handleFromRadio(const meshtastic_MeshPacket *mp)
 {
+#if defined(HELTEC_V4_OLED)
+    NodeDB::ExternalStateAccessScope stateAccess(nodeDB);
+    if (!stateAccess)
+        return 0;
+#endif
     powerFSM.trigger(EVENT_PACKET_FOR_PHONE); // Possibly keep the node from sleeping
 
     nodeDB->updateFrom(*mp); // update our DB state based off sniffing every RX packet from the radio
@@ -145,28 +151,82 @@ void MeshService::loop()
 }
 
 /// The radioConfig object just changed, call this to force the hw to change to the new settings
-void MeshService::reloadConfig(int saveWhat)
+bool MeshService::reloadConfig(int saveWhat, bool commitOpenEdit)
 {
+    const bool changesRadio = saveWhat & (SEGMENT_CONFIG | SEGMENT_CHANNELS);
+    const bool persistentConfigUsable =
+        shouldUsePersistentConfiguration(shouldUseFilesystemPersistence(fsIsMounted()), nodeDB->requiresConfigRecovery());
+    if (changesRadio && !persistentConfigUsable) {
+        // An admin client may still be connected over BLE during degraded boot. Never let a transient,
+        // non-persistable region/channel update activate LoRa under the provisional in-memory identity.
+        LOG_ERROR("Reject radio config while persistent configuration is unavailable");
+        config.bluetooth.enabled = true;
+        config.position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_DISABLED;
+        config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+        config.lora.tx_enabled = false;
+#if !MESHTASTIC_EXCLUDE_GPS
+        if (gps)
+            gps->disable();
+#endif
+        nodeDB->resetRadioConfig();
+        configChanged.notifyObservers(nullptr);
+        return false;
+    }
+
     // Only LoRa config and channels (freq/PSK/slot) affect the radio. Saves that only touch
     // module config, device state, or the node database (e.g. favoriting a node) have no reason
     // to re-init the LoRa chip - skip it there to avoid an unnecessary and risky SPI reconfigure.
-    if (saveWhat & (SEGMENT_CONFIG | SEGMENT_CHANNELS)) {
+    if (changesRadio) {
         // If we can successfully set this radio to these settings, save them to disk
 
         // This will also update the region as needed
-        nodeDB->resetRadioConfig(); // Don't let the phone send us fatally bad settings
+        nodeDB->resetRadioConfig(false, false); // Normalize now; activate external consumers only after commit.
 
-        configChanged.notifyObservers(NULL); // This will cause radio hardware to change freqs etc
     }
-    nodeDB->saveToDisk(saveWhat);
+    if (!nodeDB->commitPreferenceEdit(saveWhat, commitOpenEdit)) {
+        LOG_ERROR("Configuration was not committed; hardware activation suppressed");
+#if defined(HELTEC_V4_OLED)
+        // If the durable marker could not even be created, RAM may still hold
+        // the caller's mutation while disk contains the previous generation.
+        // A clean reboot deterministically rolls RAM back; failures after the
+        // marker already schedule the same recovery reboot in NodeDB.
+        rebootAtMsec = millis() + 1000;
+#endif
+        return false;
+    }
+    // Heltec preference edits park LoRa before any shared configuration is
+    // mutated. Re-arm and verify RX even for a MODULECONFIG/NODEDATABASE-only
+    // commit; otherwise those successful edits would leave the radio asleep.
+#if defined(HELTEC_V4_OLED)
+    if (!nodeDB->activatePreferenceEditRadio(changesRadio)) {
+        LOG_ERROR("Configuration committed but LoRa activation failed");
+        rebootAtMsec = millis() + 1000;
+        return false;
+    }
+#else
+    if (changesRadio)
+        configChanged.notifyObservers(NULL); // This will cause radio hardware to change freqs etc
+#endif
+    if (!nodeDB->finishPreferenceEditActivation()) {
+        LOG_ERROR("Configuration committed but activation fence could not be released");
+#if defined(HELTEC_V4_OLED)
+        rebootAtMsec = millis() + 1000;
+#endif
+        return false;
+    }
+    // MQTT/channel consumers may connect or publish immediately. Expose only
+    // the generation whose durable commit and radio activation both passed.
+    if (saveWhat & (SEGMENT_CHANNELS | SEGMENT_MODULECONFIG))
+        channels.onConfigChanged(true);
+    return true;
 }
 
 /// The owner User record just got updated, update our node DB and broadcast the info into the mesh
-void MeshService::reloadOwner(bool shouldSave)
+void MeshService::reloadOwner(bool shouldSave, bool persistNodeDatabase)
 {
     // LOG_DEBUG("reloadOwner()");
     // update our local data directly
-    nodeDB->updateUser(nodeDB->getNodeNum(), owner);
+    nodeDB->updateUser(nodeDB->getNodeNum(), owner, 0, false, persistNodeDatabase);
     assert(nodeInfoModule);
     // update everyone else and save to disk
     if (nodeInfoModule && shouldSave) {
@@ -309,8 +369,9 @@ void MeshService::handleToRadio(meshtastic_MeshPacket &p)
                   p.to != NODENUM_BROADCAST && p.to != 0) // DM only
               {
                   perhapsDecode(&p);
-                  if (const StoredMessage *sm = messageStore.tryAddFromPacket(p))
-                      graphics::MessageRenderer::handleNewMessage(nullptr, *sm, p); // notify UI
+                  StoredMessage stored;
+                  if (messageStore.tryAddFromPacket(p, &stored))
+                      graphics::MessageRenderer::handleNewMessage(nullptr, stored, p); // notify UI
               })
 #if !MESHTASTIC_EXCLUDE_ADMIN
     // Note admin requests on their way out: AdminModule only accepts a response from a remote we
@@ -370,6 +431,13 @@ ErrorCode MeshService::sendQueueStatusToPhone(const meshtastic_QueueStatus &qs, 
 
 void MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPhone)
 {
+#if defined(HELTEC_V4_OLED)
+    NodeDB::ExternalStateAccessScope stateAccess(nodeDB);
+    if (!stateAccess) {
+        releaseToPool(p);
+        return;
+    }
+#endif
     uint32_t mesh_packet_id = p->id;
     nodeDB->updateFrom(*p); // update our local DB for this packet (because phone might have sent position packets etc...)
 
@@ -442,6 +510,21 @@ bool MeshService::trySendPosition(NodeNum dest, bool wantReplies)
             nodeInfoModule->sendOurNodeInfo(dest, wantReplies, node->channel);
         }
     }
+    return false;
+}
+
+// ASCII BEL, the in-band alert marker. Numeric so no control byte sits in the source, and
+// file-local because ASCII_BELL is already a macro in Screen.cpp and ExternalNotificationModule.cpp.
+static const uint8_t kAsciiBell = 7;
+
+bool MeshService::isAlertPayload(const meshtastic_MeshPacket &p)
+{
+    if (!moduleConfig.external_notification.alert_bell && !moduleConfig.external_notification.alert_bell_vibra &&
+        !moduleConfig.external_notification.alert_bell_buzzer)
+        return false;
+    for (pb_size_t i = 0; i < p.decoded.payload.size; i++)
+        if (p.decoded.payload.bytes[i] == kAsciiBell)
+            return true;
     return false;
 }
 

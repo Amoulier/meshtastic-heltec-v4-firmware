@@ -1,6 +1,7 @@
 #include "LR20x0Band.h"
 #include "MeshRadio.h"
 #include "MeshService.h"
+#include "NodeDB.h"
 #include "RadioInterface.h"
 #include "TestUtil.h"
 #include "memory/MemAudit.h"
@@ -9,6 +10,10 @@
 
 #include "meshtastic/config.pb.h"
 #include "support/MockMeshService.h"
+
+#ifdef ARCH_PORTDUINO
+#include "platform/portduino/PortduinoGlue.h"
+#endif
 
 static MockMeshService *mockMeshService;
 
@@ -61,6 +66,9 @@ class TestableRadioInterface : public RadioInterface
     uint8_t getCr() const { return cr; }
     uint8_t getSf() const { return sf; }
     float getBw() const { return bw; }
+    int8_t getRequestedPower() const { return requestedPower; }
+    int8_t getPower() const { return power; }
+    void limitPowerPublic(int8_t maxPower) { limitPower(maxPower); }
 
     size_t beginSendingPublic(meshtastic_MeshPacket *p) { return beginSending(p); }
     meshtastic_MeshPacket *getSendingPacket() const { return sendingPacket; }
@@ -107,20 +115,103 @@ static void test_bwCodeToKHz_roundTrip()
     }
 }
 
+static void test_sx126xBandwidthCodeWhitelist()
+{
+    const uint16_t supported[] = {8, 10, 16, 21, 31, 42, 62, 125, 250, 500};
+    for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++)
+        TEST_ASSERT_TRUE(isSx126xBandwidthCode(supported[i]));
+
+    const uint16_t unsupported[] = {0, 7, 9, 32, 123, 200, 400, 800, 1600};
+    for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++)
+        TEST_ASSERT_FALSE(isSx126xBandwidthCode(unsupported[i]));
+}
+
+static void test_frequencyOccupancyChecksEdgesAndOffset()
+{
+    TEST_ASSERT_TRUE(frequencyOccupancyFitsBounds(927.75f, 0.0f, 500.0f, 902.0f, 928.0f));
+    TEST_ASSERT_FALSE(frequencyOccupancyFitsBounds(928.0f, 0.0f, 500.0f, 902.0f, 928.0f));
+    TEST_ASSERT_FALSE(frequencyOccupancyFitsBounds(927.75f, 0.01f, 500.0f, 902.0f, 928.0f));
+    TEST_ASSERT_FALSE(frequencyOccupancyFitsBounds(927.75f, 0.0f, 0.0f, 902.0f, 928.0f));
+}
+
+static void test_usableFrequencySlotCountNeverRoundsOutsideBand()
+{
+    TEST_ASSERT_EQUAL_UINT32(104, usableFrequencySlotCount(902.0f, 928.0f, 250.0f, 0.0f, 0.0f));
+    TEST_ASSERT_EQUAL_UINT32(6, usableFrequencySlotCount(433.05f, 434.79f, 250.0f, 0.0f, 0.0f));
+    TEST_ASSERT_EQUAL_UINT32(4, usableFrequencySlotCount(865.6f, 867.6f, 125.0f, 0.4f, 0.0375f));
+    TEST_ASSERT_EQUAL_UINT32(3, usableFrequencySlotCount(869.4f, 869.65f, 62.5f, 0.0f, 0.0104f));
+    TEST_ASSERT_EQUAL_UINT32(102, usableFrequencySlotCount(2400.0f, 2483.5f, 812.5f, 0.0f, 0.0f));
+}
+
 static void test_validateConfigLora_noopWhenUsePresetFalse()
 {
     meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
     cfg.use_preset = false;
     cfg.region = meshtastic_Config_LoRaConfig_RegionCode_US;
     cfg.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_FAST;
+    cfg.bandwidth = 125;
+    cfg.spread_factor = 8;
+    cfg.coding_rate = 4;
+
+    TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(cfg));
+
+    TEST_ASSERT_EQUAL_UINT16(125, cfg.bandwidth);
+    TEST_ASSERT_EQUAL_UINT32(8, cfg.spread_factor);
+    TEST_ASSERT_EQUAL_UINT8(4, cfg.coding_rate);
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_FAST, cfg.modem_preset);
+}
+
+static void test_customTupleRejectsAndClampsUnsafeSfCr()
+{
+    meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
+    cfg.use_preset = false;
+    cfg.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    cfg.bandwidth = 125;
+    cfg.spread_factor = 32;
+    cfg.coding_rate = 9;
+
+    TEST_ASSERT_FALSE(RadioInterface::validateConfigLora(cfg));
+    TEST_ASSERT_TRUE(RadioInterface::clampConfigLora(cfg));
+    TEST_ASSERT_EQUAL_UINT32(LORA_SF_DEFAULT, cfg.spread_factor);
+    TEST_ASSERT_EQUAL_UINT8(LORA_CR_DEFAULT, cfg.coding_rate);
+    TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(cfg));
+}
+
+#if defined(HELTEC_V4_OLED)
+static void test_heltecCustomTupleRejectsAndClampsUnsupportedBandwidth()
+{
+    meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
+    cfg.use_preset = false;
+    cfg.region = meshtastic_Config_LoRaConfig_RegionCode_US;
     cfg.bandwidth = 123;
     cfg.spread_factor = 8;
+    cfg.coding_rate = 5;
 
-    RadioInterface::validateConfigLora(cfg);
+    TEST_ASSERT_FALSE(RadioInterface::validateConfigLora(cfg));
+    TEST_ASSERT_TRUE(RadioInterface::clampConfigLora(cfg));
+    TEST_ASSERT_EQUAL_UINT16(250, cfg.bandwidth);
+    TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(cfg));
+}
+#endif
 
-    TEST_ASSERT_EQUAL_UINT16(123, cfg.bandwidth);
-    TEST_ASSERT_EQUAL_UINT32(8, cfg.spread_factor);
-    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_FAST, cfg.modem_preset);
+static void test_validateConfigLora_rejectsOccupiedBandOutsideRegion()
+{
+    meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
+    cfg.use_preset = false;
+    cfg.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    cfg.bandwidth = 500;
+    cfg.spread_factor = 7;
+    cfg.coding_rate = 5;
+    cfg.override_frequency = 928.0f;
+
+    TEST_ASSERT_FALSE(RadioInterface::validateConfigLora(cfg));
+
+    cfg.override_frequency = 927.75f;
+    cfg.frequency_offset = 0.01f;
+    TEST_ASSERT_FALSE(RadioInterface::validateConfigLora(cfg));
+    TEST_ASSERT_TRUE(RadioInterface::clampConfigLora(cfg));
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.0f, cfg.frequency_offset);
+    TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(cfg));
 }
 
 static void test_validateConfigLora_validPreset_nonWideRegion()
@@ -140,7 +231,11 @@ static void test_validateConfigLora_validPreset_wideRegion()
     cfg.region = meshtastic_Config_LoRaConfig_RegionCode_LORA_24;
     cfg.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_FAST;
 
+#if defined(HELTEC_V4_OLED)
+    TEST_ASSERT_FALSE(RadioInterface::validateConfigLora(cfg));
+#else
     TEST_ASSERT_TRUE(RadioInterface::validateConfigLora(cfg));
+#endif
 }
 
 static void test_validateConfigLora_rejectsInvalidPresetForRegion()
@@ -177,11 +272,123 @@ static void test_clampConfigLora_validPresetUnchanged()
     TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_FAST, cfg.modem_preset);
 }
 
+static void test_everyStockRegionPresetDefaultSlotOccupancyIsValid()
+{
+    for (const RegionInfo *region = regions;; region++) {
+#if defined(HELTEC_V4_OLED)
+        // Heltec's SX1262 is sub-GHz and starts at 150 MHz. Unsupported stock
+        // regions are intentionally rejected by the separate hardware check.
+        const bool supportedByHeltec = !region->wideLora && region->freqStart >= 150.0f && region->freqEnd <= 960.0f;
+        if (!supportedByHeltec) {
+            if (region->code == meshtastic_Config_LoRaConfig_RegionCode_UNSET)
+                break;
+            continue;
+        }
+#endif
+        for (size_t presetIndex = 0; presetIndex < region->getNumPresets(); presetIndex++) {
+            const auto preset = region->getAvailablePresets()[presetIndex];
+            const float bw = modemPresetToBwKHz(preset, region->wideLora);
+            const float slotWidth = region->profile->spacing + 2.0f * region->profile->padding + bw / 1000.0f;
+            const uint32_t slots = usableFrequencySlotCount(region->freqStart, region->freqEnd, bw,
+                                                            region->profile->spacing, region->profile->padding);
+            TEST_ASSERT_GREATER_THAN_UINT32_MESSAGE(0, slots, region->name);
+            for (uint32_t slot = 0; slot < slots; slot++) {
+                const float center = region->freqStart + bw / 2000.0f + region->profile->padding + slot * slotWidth;
+                TEST_ASSERT_TRUE_MESSAGE(
+                    frequencyOccupancyFitsBounds(center, 0.0f, bw, region->freqStart, region->freqEnd), region->name);
+                TEST_ASSERT_TRUE_MESSAGE(center - bw / 2000.0f >= region->freqStart + region->profile->padding - 0.0001f,
+                                         region->name);
+                TEST_ASSERT_TRUE_MESSAGE(center + bw / 2000.0f <= region->freqEnd - region->profile->padding + 0.0001f,
+                                         region->name);
+            }
+
+            meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
+            cfg.use_preset = true;
+            cfg.region = region->code;
+            cfg.modem_preset = preset;
+            cfg.channel_num = 0;
+            cfg.frequency_offset = 0.0f;
+            TEST_ASSERT_TRUE_MESSAGE(RadioInterface::validateConfigLora(cfg), region->name);
+        }
+
+        if (region->code == meshtastic_Config_LoRaConfig_RegionCode_UNSET)
+            break;
+    }
+}
+
 // -----------------------------------------------------------------------
 // applyModemConfig() coding rate tests (via reconfigure)
 // -----------------------------------------------------------------------
 
 static TestableRadioInterface *testRadio;
+
+#ifdef ARCH_PORTDUINO
+static int savedNumPaPoints;
+static uint16_t savedTxGainLora[22];
+
+static constexpr uint16_t HELTEC_V4_KCT8103L_TX_GAIN[] = {13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+                                                          13, 13, 13, 12, 12, 11, 11, 10, 9,  8,  7};
+static constexpr uint16_t HELTEC_V4_GC1109_TX_GAIN[] = {11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
+                                                        11, 11, 11, 11, 11, 10, 10, 9,  9,  8,  7};
+
+static void setTxGainCurve(const uint16_t *curve, size_t count)
+{
+    TEST_ASSERT_LESS_OR_EQUAL_UINT(sizeof(portduino_config.tx_gain_lora) / sizeof(portduino_config.tx_gain_lora[0]), count);
+    portduino_config.num_pa_points = count;
+    memcpy(portduino_config.tx_gain_lora, curve, count * sizeof(curve[0]));
+}
+
+static void assertPowerStableAcrossRecoveryCycles(const uint16_t *curve, size_t count,
+                                                  meshtastic_Config_LoRaConfig_RegionCode region, int8_t configured,
+                                                  int8_t requested, int8_t converted)
+{
+    setTxGainCurve(curve, count);
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = region;
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    config.lora.tx_power = configured;
+
+    TEST_ASSERT_TRUE(testRadio->reconfigure());
+    TEST_ASSERT_EQUAL_INT8(requested, testRadio->getRequestedPower());
+    TEST_ASSERT_EQUAL_INT8(requested, config.lora.tx_power);
+
+    // Recovery limits once for re-init and again for parameter restore; later ceilings must also rederive.
+    static constexpr int8_t radioLimits[] = {22, 22, 13, 22};
+    for (size_t cycle = 0; cycle < sizeof(radioLimits) / sizeof(radioLimits[0]); cycle++) {
+        const int8_t expected = converted > radioLimits[cycle] ? radioLimits[cycle] : converted;
+        testRadio->limitPowerPublic(radioLimits[cycle]);
+        TEST_ASSERT_EQUAL_INT8(expected, testRadio->getPower());
+        TEST_ASSERT_EQUAL_INT8(requested, testRadio->getRequestedPower());
+    }
+
+    // A normal config reload must retain the requested/effective split too.
+    for (unsigned reconfiguration = 0; reconfiguration < 3; reconfiguration++) {
+        TEST_ASSERT_TRUE(testRadio->reconfigure());
+        testRadio->limitPowerPublic(22);
+        TEST_ASSERT_EQUAL_INT8(converted, testRadio->getPower());
+        testRadio->limitPowerPublic(22);
+        TEST_ASSERT_EQUAL_INT8(converted, testRadio->getPower());
+        TEST_ASSERT_EQUAL_INT8(requested, testRadio->getRequestedPower());
+    }
+}
+
+static void test_limitPower_kct8103lRecoveryIsIdempotent()
+{
+    assertPowerStableAcrossRecoveryCycles(HELTEC_V4_KCT8103L_TX_GAIN, sizeof(HELTEC_V4_KCT8103L_TX_GAIN) / sizeof(uint16_t),
+                                          meshtastic_Config_LoRaConfig_RegionCode_US, 30, 30, 22);
+    assertPowerStableAcrossRecoveryCycles(HELTEC_V4_KCT8103L_TX_GAIN, sizeof(HELTEC_V4_KCT8103L_TX_GAIN) / sizeof(uint16_t),
+                                          meshtastic_Config_LoRaConfig_RegionCode_EU_868, 30, 27, 16);
+}
+
+static void test_limitPower_gc1109RecoveryIsIdempotent()
+{
+    assertPowerStableAcrossRecoveryCycles(HELTEC_V4_GC1109_TX_GAIN, sizeof(HELTEC_V4_GC1109_TX_GAIN) / sizeof(uint16_t),
+                                          meshtastic_Config_LoRaConfig_RegionCode_US, 30, 30, 22);
+    assertPowerStableAcrossRecoveryCycles(HELTEC_V4_GC1109_TX_GAIN, sizeof(HELTEC_V4_GC1109_TX_GAIN) / sizeof(uint16_t),
+                                          meshtastic_Config_LoRaConfig_RegionCode_EU_868, 30, 27, 18);
+}
+#endif
 
 // After fresh flash: coding_rate=0, use_preset=true, modem_preset=LONG_FAST
 // CR should come from the preset (5 for LONG_FAST), not from the zero default.
@@ -256,6 +463,58 @@ static void test_applyModemConfig_mediumTurbo()
     TEST_ASSERT_EQUAL_UINT8(5, testRadio->getCr());
     TEST_ASSERT_EQUAL_UINT8(9, testRadio->getSf());
     TEST_ASSERT_FLOAT_WITHIN(0.01f, 500.0f, testRadio->getBw());
+}
+
+static void test_applyModemConfig_rejectsUnlicensedHamRegion()
+{
+    const bool savedLicensed = owner.is_licensed;
+    owner.is_licensed = false;
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_ITU1_70CM;
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_NARROW_SLOW;
+    config.lora.tx_enabled = true;
+
+    const bool applied = testRadio->reconfigure();
+    const auto resultingRegion = config.lora.region;
+    const bool resultingTxEnabled = config.lora.tx_enabled;
+    owner.is_licensed = savedLicensed;
+
+    TEST_ASSERT_FALSE(applied);
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RegionCode_UNSET, resultingRegion);
+    TEST_ASSERT_FALSE(resultingTxEnabled);
+}
+
+static void test_applyModemConfig_acceptsLicensedHamRegion()
+{
+    const bool savedLicensed = owner.is_licensed;
+    owner.is_licensed = true;
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_ITU1_70CM;
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_NARROW_SLOW;
+    config.lora.tx_enabled = true;
+
+    const bool applied = testRadio->reconfigure();
+    const auto resultingRegion = config.lora.region;
+    owner.is_licensed = savedLicensed;
+
+    TEST_ASSERT_TRUE(applied);
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RegionCode_ITU1_70CM, resultingRegion);
+}
+
+static void test_applyModemConfig_keepsUnsetRadioInitializedAndSilent()
+{
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    config.lora.tx_enabled = false;
+
+    TEST_ASSERT_TRUE(testRadio->reconfigure());
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RegionCode_UNSET, config.lora.region);
+    TEST_ASSERT_FALSE(config.lora.tx_enabled);
+    TEST_ASSERT_TRUE(testRadio->getBw() > 0.0f);
 }
 
 // MEDIUM_TURBO is a 500 kHz preset, so it is invalid for EU_868 and must clamp to the region default.
@@ -483,9 +742,19 @@ void setUp(void)
     initRegion();
 
     testRadio = new TestableRadioInterface();
+
+#ifdef ARCH_PORTDUINO
+    savedNumPaPoints = portduino_config.num_pa_points;
+    memcpy(savedTxGainLora, portduino_config.tx_gain_lora, sizeof(savedTxGainLora));
+#endif
 }
 void tearDown(void)
 {
+#ifdef ARCH_PORTDUINO
+    portduino_config.num_pa_points = savedNumPaPoints;
+    memcpy(portduino_config.tx_gain_lora, savedTxGainLora, sizeof(savedTxGainLora));
+#endif
+
     delete testRadio;
     testRadio = nullptr;
     service = nullptr;
@@ -507,17 +776,33 @@ void setup()
     RUN_TEST(test_bwCodeToKHz_specialMappings);
     RUN_TEST(test_bwCodeToKHz_passthrough);
     RUN_TEST(test_bwCodeToKHz_roundTrip);
+    RUN_TEST(test_sx126xBandwidthCodeWhitelist);
+    RUN_TEST(test_frequencyOccupancyChecksEdgesAndOffset);
+    RUN_TEST(test_usableFrequencySlotCountNeverRoundsOutsideBand);
     RUN_TEST(test_validateConfigLora_noopWhenUsePresetFalse);
+    RUN_TEST(test_customTupleRejectsAndClampsUnsafeSfCr);
+#if defined(HELTEC_V4_OLED)
+    RUN_TEST(test_heltecCustomTupleRejectsAndClampsUnsupportedBandwidth);
+#endif
+    RUN_TEST(test_validateConfigLora_rejectsOccupiedBandOutsideRegion);
     RUN_TEST(test_validateConfigLora_validPreset_nonWideRegion);
     RUN_TEST(test_validateConfigLora_validPreset_wideRegion);
     RUN_TEST(test_validateConfigLora_rejectsInvalidPresetForRegion);
     RUN_TEST(test_clampConfigLora_invalidPresetClampedToDefault);
     RUN_TEST(test_clampConfigLora_validPresetUnchanged);
+    RUN_TEST(test_everyStockRegionPresetDefaultSlotOccupancyIsValid);
     RUN_TEST(test_applyModemConfig_freshFlashCodingRateNotZero);
     RUN_TEST(test_applyModemConfig_codingRateMatchesPreset);
     RUN_TEST(test_applyModemConfig_customCodingRateHigherThanPreset);
     RUN_TEST(test_applyModemConfig_customCodingRateLowerThanPreset);
     RUN_TEST(test_applyModemConfig_mediumTurbo);
+    RUN_TEST(test_applyModemConfig_rejectsUnlicensedHamRegion);
+    RUN_TEST(test_applyModemConfig_acceptsLicensedHamRegion);
+    RUN_TEST(test_applyModemConfig_keepsUnsetRadioInitializedAndSilent);
+#ifdef ARCH_PORTDUINO
+    RUN_TEST(test_limitPower_kct8103lRecoveryIsIdempotent);
+    RUN_TEST(test_limitPower_gc1109RecoveryIsIdempotent);
+#endif
     RUN_TEST(test_clampConfigLora_mediumTurboInvalidForEU868);
     RUN_TEST(test_clampConfigLora_mediumTurboValidForUS);
     RUN_TEST(test_regionPresetMap_coversAllRegionsWithinBounds);

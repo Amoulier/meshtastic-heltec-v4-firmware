@@ -416,8 +416,9 @@ bool InkHUD::WaypointListApplet::canRenderWaypointIcon(const meshtastic_Waypoint
 uint8_t InkHUD::WaypointListApplet::fallbackBadgeNumber(const meshtastic_Waypoint &waypoint)
 {
     uint8_t badge = 0;
+    const auto waypoints = waypointStore.getWaypoints();
 
-    for (auto it = waypointStore.getWaypoints().rbegin(); it != waypointStore.getWaypoints().rend(); ++it) {
+    for (auto it = waypoints.rbegin(); it != waypoints.rend(); ++it) {
         const meshtastic_Waypoint &candidate = it->waypoint;
         if (canRenderWaypointIcon(candidate))
             continue;

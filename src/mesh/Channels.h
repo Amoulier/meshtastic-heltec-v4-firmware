@@ -69,7 +69,7 @@ class Channels
     void initDefaults();
 
     /// called when the user has just changed our radio config and we might need to change channel keys
-    void onConfigChanged();
+    void onConfigChanged(bool activateRuntime = true);
 
     /** Given a channel hash setup crypto for decoding that channel (or the primary channel if that channel is unsecured)
      *
@@ -159,6 +159,10 @@ extern Channels channels;
 /// 16 bytes of random PSK for our _public_ default channel that all devices power up on (AES128)
 static const uint8_t defaultpsk[] = {0xd4, 0xf1, 0xbb, 0x3a, 0x20, 0x29, 0x07, 0x59,
                                      0xf0, 0xbc, 0xff, 0xab, 0xcf, 0x4e, 0x69, 0x01};
+
+/// True if the user muted the source of this packet: the sender for a DM addressed to us,
+/// otherwise the channel it arrived on.
+bool isMutedForPacket(const meshtastic_MeshPacket &mp);
 
 /// True if a getKey()-resolved key offers no privacy: length 0 (off) or the public defaultpsk family. Pure; for tests.
 bool cryptoKeyIsPublic(const CryptoKey &key);

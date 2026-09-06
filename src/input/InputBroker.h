@@ -78,6 +78,7 @@ class InputBroker : public Observable<const InputEvent *>
 #if defined(HAS_FREE_RTOS) && !defined(ARCH_RP2040)
     void requestPollSoon(InputPollable *pollable);
     void queueInputEvent(const InputEvent *event);
+    bool tryQueueInputEvent(const InputEvent *event);
     void processInputEventQueue();
 #endif
     void Init();

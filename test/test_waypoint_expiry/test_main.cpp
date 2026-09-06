@@ -90,7 +90,31 @@ void test_packet_without_rx_time_still_expires()
 
     waypointStore.clearAllWaypoints();
     TEST_ASSERT_TRUE(waypointStore.addFromPacket(packet, false));
-    TEST_ASSERT_NULL(waypointStore.findWaypoint(wp.id));
+    StoredWaypoint stored;
+    TEST_ASSERT_FALSE(waypointStore.findWaypoint(wp.id, stored));
+    waypointStore.clearAllWaypoints();
+}
+
+void test_waypoint_reads_are_independent_snapshots()
+{
+    meshtastic_Waypoint wp = meshtastic_Waypoint_init_zero;
+    wp.id = 777;
+    wp.expire = 0;
+
+    meshtastic_MeshPacket packet = meshtastic_MeshPacket_init_zero;
+    packet.from = 0x11223344;
+    packet.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    packet.decoded.payload.size = (uint16_t)pb_encode_to_bytes(packet.decoded.payload.bytes, sizeof(packet.decoded.payload.bytes),
+                                                               &meshtastic_Waypoint_msg, &wp);
+
+    waypointStore.clearAllWaypoints();
+    TEST_ASSERT_TRUE(waypointStore.addFromPacket(packet, false));
+    const auto snapshot = waypointStore.getWaypoints();
+    TEST_ASSERT_EQUAL_UINT(1, snapshot.size());
+    TEST_ASSERT_TRUE(waypointStore.removeWaypoint(wp.id));
+    TEST_ASSERT_EQUAL_UINT(1, snapshot.size());
+    StoredWaypoint stored;
+    TEST_ASSERT_FALSE(waypointStore.findWaypoint(wp.id, stored));
     waypointStore.clearAllWaypoints();
 }
 
@@ -108,6 +132,7 @@ void setup()
     RUN_TEST(test_untrusted_clock_still_honours_delete);
     RUN_TEST(test_store_expiry_matches_the_predicate);
     RUN_TEST(test_packet_without_rx_time_still_expires);
+    RUN_TEST(test_waypoint_reads_are_independent_snapshots);
     exit(UNITY_END());
 }
 

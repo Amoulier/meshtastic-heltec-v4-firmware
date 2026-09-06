@@ -1,9 +1,13 @@
+#include "variant.h"
 #include "Arduino.h"
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "esp_sleep.h"
+#include "power/BatteryCriticalPolicy.h"
 #include "power/DeepSleepPolicy.h"
-#include "variant.h"
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+#include <HWCDC.h>
+#endif
 
 #if defined(HELTEC_V4_OLED) && defined(HELTEC_V4_SOLAR_ROUTER_PROFILE) && HELTEC_V4_SOLAR_ROUTER_PROFILE
 
@@ -12,8 +16,14 @@ RTC_DATA_ATTR static bool batteryCriticalLatched = false;
 static_assert(BATTERY_BOOT_GUARD_MIN_MILLIVOLTS < BATTERY_CRITICAL_MILLIVOLTS);
 static_assert(BATTERY_CRITICAL_MILLIVOLTS < BATTERY_CRITICAL_RECOVERY_MILLIVOLTS);
 static_assert(BATTERY_CRITICAL_SLEEP_MSEC > 0);
+static_assert(BATTERY_CRITICAL_MILLIVOLTS == HELTEC_V4_SOLAR_CRITICAL_BATTERY_POLICY.cutoffMillivolts);
+static_assert(BATTERY_CRITICAL_RECOVERY_MILLIVOLTS == HELTEC_V4_SOLAR_CRITICAL_BATTERY_POLICY.recoveryMillivolts);
+static_assert(BATTERY_CRITICAL_READINGS == HELTEC_V4_SOLAR_CRITICAL_BATTERY_POLICY.consecutiveReadings);
 
-void prepareLowBatterySleep() { batteryCriticalLatched = true; }
+void prepareLowBatterySleep()
+{
+    batteryCriticalLatched = true;
+}
 
 static void releaseEarlyPinHold(int pin)
 {
@@ -96,6 +106,29 @@ static uint16_t readBatteryMillivolts()
     return static_cast<uint16_t>((millivolts / samples) * (ADC_MULTIPLIER));
 }
 
+static bool hasActiveUsbDataHost()
+{
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+    // USB Serial/JTAG declares a host from recent SOF traffic. At this early
+    // boot point the first watchdog sample can race enumeration, so accept any
+    // positive sample across a short bounded window before entering another
+    // 60-second recovery sleep. Charge-only supplies still produce no SOF and
+    // remain on the conservative path.
+    constexpr uint8_t samples = 6;
+    for (uint8_t i = 0; i < samples; i++) {
+        if (HWCDC::isPlugged()) {
+            return true;
+        }
+        if (i + 1 < samples) {
+            delay(10);
+        }
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
 static void forceRadioResetForRecovery()
 {
     // earlyInitVariant() can run while an SX1262 retained from normal Router sleep is still receiving.
@@ -130,10 +163,11 @@ static void prepareBatteryRecoveryHardware(bool forceRadioReset)
     gpio_deep_sleep_hold_en();
 }
 
-__attribute__((noinline)) void variant_shutdown()
+__attribute__((noinline)) void variant_shutdown(bool radioSleepSucceeded)
 {
     if (batteryCriticalLatched) {
-        prepareBatteryRecoveryHardware(false);
+        prepareBatteryRecoveryHardware(
+            shouldForceRadioResetForCriticalSleep(batteryCriticalLatched, radioSleepSucceeded));
     }
 }
 
@@ -153,12 +187,12 @@ void earlyInitVariant()
     releaseEarlyPinHold(BATTERY_PIN);
 
     const uint16_t batteryMillivolts = readBatteryMillivolts();
-    if (shouldUseCriticalBatteryRecovery(batteryMillivolts, recoveryWasLatched,
-                                         BATTERY_BOOT_GUARD_MIN_MILLIVOLTS, BATTERY_CRITICAL_MILLIVOLTS,
-                                         BATTERY_CRITICAL_RECOVERY_MILLIVOLTS)) {
+    if (shouldUseCriticalBatteryRecovery(batteryMillivolts, recoveryWasLatched, BATTERY_BOOT_GUARD_MIN_MILLIVOLTS,
+                                         BATTERY_CRITICAL_MILLIVOLTS, BATTERY_CRITICAL_RECOVERY_MILLIVOLTS,
+                                         hasActiveUsbDataHost())) {
         batteryCriticalLatched = true;
-        const bool radioStateIsKnownSafe = isBatteryRecoveryRadioStateKnownSafe(
-            recoveryWasLatched, esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER);
+        const bool radioStateIsKnownSafe =
+            isBatteryRecoveryRadioStateKnownSafe(recoveryWasLatched, esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER);
         enterBatteryRecoverySleep(!radioStateIsKnownSafe);
     }
 

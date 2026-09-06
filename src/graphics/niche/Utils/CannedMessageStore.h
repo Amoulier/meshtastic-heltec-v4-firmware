@@ -39,7 +39,7 @@ class CannedMessageStore
 
     void load(); // Load from flash, and parse
 
-    void handleSet(const meshtastic_AdminMessage *request); // Client API changing the canned messages
+    bool handleSet(const meshtastic_AdminMessage *request); // Client API changing the canned messages
     void handleGet(meshtastic_AdminMessage *response);      // Client API wants to know current canned messages
 
     std::vector<std::string> messages;

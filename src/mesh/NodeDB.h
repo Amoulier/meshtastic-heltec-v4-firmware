@@ -3,7 +3,10 @@
 #include "Observer.h"
 #include <Arduino.h>
 #include <algorithm>
+#include <array>
 #include <assert.h>
+#include <atomic>
+#include <cstdint>
 #include <map>
 #include <pb_encode.h>
 #include <string>
@@ -80,6 +83,11 @@ static const uint8_t LOW_ENTROPY_HASHES[][32] = {
     {0xcc, 0x11, 0xfb, 0x1a, 0xab, 0xa1, 0x31, 0x87, 0x6a, 0xc6, 0xde, 0x88, 0x87, 0xa9, 0xb9, 0x59,
      0x37, 0x82, 0x8d, 0xb2, 0xcc, 0xd8, 0x97, 0x40, 0x9a, 0x5c, 0x8f, 0x40, 0x55, 0xcb, 0x4c, 0x3e}};
 static const char LOW_ENTROPY_WARNING[] = "Compromised keys were detected and regenerated.";
+// Shown when a user tries to restore/set a known pre-2.8 low-entropy key: explains why the saved
+// key did not persist and that the node's identity (NodeNum == crc32(public_key)) changed with it.
+static const char LOW_ENTROPY_RESTORE_WARNING[] =
+    "That key is a known pre-2.8 low-entropy key and can't be restored. A new secure key was "
+    "generated; your node number has changed.";
 #endif
 static const char LICENSED_IDENTITY_MIGRATION_WARNING[] =
     "Licensed signing generated a new identity key; this node identity changed.";
@@ -141,7 +149,7 @@ constexpr RadioProfileStoragePaths radioProfileStoragePaths(bool eventMode)
                      : RadioProfileStoragePaths{STANDARD_CONFIG_FILE_NAME, STANDARD_CHANNEL_FILE_NAME, STANDARD_BACKUP_FILE_NAME};
 }
 
-// Reserve event files and their atomic temporaries before seeding, preventing retry formatting on full storage.
+// Reserve event files and their atomic temporaries before seeding so full-atomic saves have room.
 static constexpr size_t EVENT_PROFILE_STORAGE_RESERVATION_BYTES = 2 * (meshtastic_LocalConfig_size + meshtastic_ChannelFile_size);
 
 constexpr bool hasEventProfileStorageSpace(size_t totalBytes, size_t usedBytes)
@@ -149,9 +157,46 @@ constexpr bool hasEventProfileStorageSpace(size_t totalBytes, size_t usedBytes)
     return usedBytes <= totalBytes && totalBytes - usedBytes >= EVENT_PROFILE_STORAGE_RESERVATION_BYTES;
 }
 
-constexpr bool shouldDeferBootPersistence(bool bootInitializationInProgress, bool configLoadComplete, bool configDecodeFailed)
+constexpr bool canSeedEventProfile(bool eventProfileFirstUse, bool storageSpaceAvailable)
 {
-    return bootInitializationInProgress && (!configLoadComplete || configDecodeFailed);
+    // Never activate a transient event radio profile that cannot publish its
+    // config+channels generation durably before the next reboot.
+    return eventProfileFirstUse && storageSpaceAvailable;
+}
+
+constexpr bool isCleanEventProfileFirstUse(bool eventConfigPresent, bool eventChannelsPresent, bool eventBackupPresent,
+                                           bool eventConfigTemporaryPresent, bool eventChannelsTemporaryPresent,
+                                           bool eventBackupTemporaryPresent, bool standardConfigPresent)
+{
+    // A clean first switch to event firmware owns neither member of the event
+    // radio generation and has no interrupted write. Any partial member or
+    // temporary is recovery evidence, not a seed request.
+    return standardConfigPresent && !eventConfigPresent && !eventChannelsPresent && !eventBackupPresent &&
+           !eventConfigTemporaryPresent && !eventChannelsTemporaryPresent && !eventBackupTemporaryPresent;
+}
+
+constexpr bool canInitializeMissingEventChannels(bool eventProfileFirstUse, bool initializedEventConfig,
+                                                 bool eventChannelsNotFound)
+{
+    // A missing channel file is expected only while seeding both members of a
+    // clean event profile. If config seeding failed, treating channels as a
+    // harmless first-use omission would hide a partial generation.
+    return eventProfileFirstUse && initializedEventConfig && eventChannelsNotFound;
+}
+
+constexpr int eventProfileFirstUseSaveSegments(bool initializedEventConfig, bool recoveryRequired)
+{
+    // Config and channels form one radio-profile generation. Never publish
+    // only one member, or either member while recovery evidence is present.
+    return initializedEventConfig && !recoveryRequired ? SEGMENT_CONFIG | SEGMENT_CHANNELS : 0;
+}
+
+constexpr bool shouldDeferBootPersistence(bool bootInitializationInProgress, bool, bool)
+{
+    // No core segment may be written until the complete generation has been
+    // scanned. A later file can exist yet fail decoding, so config alone is
+    // not a sufficient commit boundary.
+    return bootInitializationInProgress;
 }
 
 #if USERPREFS_EVENT_MODE
@@ -164,6 +209,21 @@ static constexpr const char *channelFileName = RADIO_PROFILE_STORAGE.channels;
 static constexpr const char *backupFileName = RADIO_PROFILE_STORAGE.backup;
 static constexpr const char *uiconfigFileName = "/prefs/uiconfig.proto";
 static constexpr const char *moduleConfigFileName = "/prefs/module.proto";
+
+inline int preferenceSegmentForFile(const char *filename)
+{
+    if (strcmp(filename, configFileName) == 0)
+        return SEGMENT_CONFIG;
+    if (strcmp(filename, moduleConfigFileName) == 0)
+        return SEGMENT_MODULECONFIG;
+    if (strcmp(filename, deviceStateFileName) == 0)
+        return SEGMENT_DEVICESTATE;
+    if (strcmp(filename, channelFileName) == 0)
+        return SEGMENT_CHANNELS;
+    if (strcmp(filename, nodeDatabaseFileName) == 0)
+        return SEGMENT_NODEDATABASE;
+    return 0;
+}
 
 // An unverified config load only endangers the radio profile, so only these files take part in
 // boot-write deferral. Lives next to the path table above so the two cannot drift apart.
@@ -311,6 +371,11 @@ class NodeDB
     /// @return true if the save was successful
     bool saveToDisk(int saveWhat = SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS |
                                    SEGMENT_NODEDATABASE);
+#if defined(HELTEC_V4_OLED)
+    /// Retry core segments whose ordinary write was refused by the fresh
+    /// low-voltage gate. Transactional/reset writes are never replayed here.
+    void retryPowerDeferredPreferenceWrites();
+#endif
 
     /** Reinit radio config if needed, because either:
      * a) sometimes a buggy android app might send us bogus settings or
@@ -320,13 +385,13 @@ class NodeDB
      * @param is_fresh_install set to true after a fresh install, to trigger NodeInfo/Position requests
      * @return true if the config was completely reset, in that case, we should send it back to the client
      */
-    void resetRadioConfig(bool is_fresh_install = false);
+    void resetRadioConfig(bool is_fresh_install = false, bool activateRuntime = true);
 
     /// given a subpacket sniffed from the network, update our DB state
     /// we updateGUI and updateGUIforNode if we think our this change is big enough for a redraw
     void updateFrom(const meshtastic_MeshPacket &p);
 
-    void addFromContact(const meshtastic_SharedContact);
+    bool addFromContact(const meshtastic_SharedContact, bool persist = true);
 
     /// On the clock-becoming-trusted transition (see RTC.cpp): convert every RAM arrival stamp into
     /// a real last_heard epoch, never backwards, then empty the table. updateFrom() takes over.
@@ -342,14 +407,15 @@ class NodeDB
 
     /** Update user info and channel for this node based on received user data.
      * A known signer's identity is only learned when xeddsaSigned; defaults false so callers fail closed. */
-    bool updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelIndex = 0, bool xeddsaSigned = false);
+    bool updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelIndex = 0, bool xeddsaSigned = false,
+                    bool persist = true);
 
     /*
      * Sets a node either favorite or unfavorite. Returns true if the node ends
      * up in the requested state; false if the node is unknown or favouriting
      * was refused by the protected-node cap (MAX_NUM_NODES - 2).
      */
-    bool set_favorite(bool is_favorite, uint32_t nodeId);
+    bool set_favorite(bool is_favorite, uint32_t nodeId, bool persist = true);
 
     /// Count of eviction-protected (favourite/ignored/manually-verified) nodes.
     int numProtectedNodes() const;
@@ -408,8 +474,10 @@ class NodeDB
      */
     size_t getNumOnlineMeshNodes(bool localOnly = false);
 
-    void initConfigIntervals(), initModuleConfigIntervals(), resetNodes(bool keepFavorites = false),
-        removeNodeByNum(NodeNum nodeNum);
+    void initConfigIntervals(), initModuleConfigIntervals();
+    bool removeNodeByNum(NodeNum nodeNum, bool persist = true);
+    bool resetNodes(bool keepFavorites = false);
+    bool canResetNodesForRecovery() const;
 
     bool factoryReset(bool eraseBleBonds = false);
 
@@ -418,7 +486,7 @@ class NodeDB
     bool saveProto(const char *filename, size_t protoSize, const pb_msgdesc_t *fields, const void *dest_struct,
                    bool fullAtomic = true);
 
-    void installRoleDefaults(meshtastic_Config_DeviceConfig_Role role);
+    void installRoleDefaults(meshtastic_Config_DeviceConfig_Role role, meshtastic_Config_DeviceConfig_Role previousRole);
 
     const meshtastic_NodeInfoLite *readNextMeshNode(uint32_t &readIndex);
 
@@ -587,12 +655,94 @@ class NodeDB
 #if !defined(MESHTASTIC_EXCLUDE_PKI)
     bool checkLowEntropyPublicKey(const meshtastic_Config_SecurityConfig_public_key_t &keyToTest);
 #endif
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+    bool generateBlacklistCheckedKeyPair();
+    bool derivePublicKeyFromPrivate();
+#endif
 
     /// Consolidate crypto key generation logic used across multiple modules
     /// @param privateKey Optional 32-byte private key to use. If nullptr, generates new random keys.
     bool generateCryptoKeyPair(const uint8_t *privateKey = nullptr);
+    /// Derive and validate the public half of a candidate private key without
+    /// changing the live identity or crypto engine.
+    bool derivePublicKeyForValidation(const uint8_t privateKey[32], uint8_t publicKey[32]) const;
 
     bool notifyPendingLicensedIdentityMigration();
+    /// True when an existing radio-profile file could not be read or its
+    /// identity was invalid. Until clean reload or full reset, radio-profile
+    /// writes and radio traffic must fail closed.
+    bool requiresConfigRecovery() const
+    {
+        // A corrupt optional node cache is independently write-protected but
+        // does not invalidate the loaded identity, channels, or radio profile.
+        // A *missing* node file in an established generation sets
+        // configDecodeFailed during inventory and remains fail-closed.
+        constexpr int criticalSegments = SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS;
+        return configDecodeFailed || (unreadablePreferenceSegments & criticalSegments) != 0 ||
+               incompleteLegacyMigrationDetected || incompleteNodeDatabaseResetDetected;
+    }
+
+    /// Start a user/admin multi-segment settings generation. On Heltec V4 an
+    /// in-process fence blocks every preference writer and parks LoRa while
+    /// callers mutate RAM; the durable marker is installed immediately before
+    /// commitPreferenceEdit() writes the first file. Other targets retain the
+    /// normal in-memory transaction behavior.
+    bool beginPreferenceEdit(bool requireDestructivePower = true);
+
+    /// Abandon an OPEN generation before any preference file was written.
+    /// The caller must prove the rejected/no-op request did not mutate RAM;
+    /// this method then rearms that unchanged durable radio generation.
+    bool cancelPreferenceEdit();
+
+    /// Persist a user/admin multi-segment settings generation. Heltec V4
+    /// brackets it with a durable transaction marker; other targets retain
+    /// the normal saveToDisk behavior.
+    bool commitPreferenceEdit(int saveWhat, bool commitOpenEdit = false);
+    /// Re-apply the committed radio generation and verify RX can be armed
+    /// before the final traffic fence is released.
+    bool activatePreferenceEditRadio(bool radioConfigChanged);
+    /// Release the final traffic fence after config observers have activated
+    /// the durable generation in hardware.
+    bool finishPreferenceEditActivation();
+    bool isPreferenceEditTransactionActive() const;
+    /// True only while BEGIN is waiting for radio work admitted under the
+    /// committed generation to finish. A terminal RX may still be captured in
+    /// this state, but RX is not rearmed and no new mesh egress is admitted.
+    bool isPreferenceEditQuiescing() const;
+    bool isPreferenceEditOwnerCurrentTask() const;
+    bool adoptAbandonedPreferenceEdit();
+    bool isPreferenceEditRadioActivationAllowed() const;
+    bool isDestructiveStorageMutationActive() const { return destructiveStorageMutationActive.load(std::memory_order_acquire); }
+    /// True only for the task that raised the destructive fence. Store-clear
+    /// operations use this to let factory reset write its verified empty
+    /// records while rejecting UI/autosave work that raced the reset.
+    bool isDestructiveStorageMutationOwnerCurrentTask() const;
+    /// Fence PhoneAPI/HTTP readers against reset/restore replacing shared
+    /// configuration and node storage. Callers must pair a successful begin.
+    bool beginExternalStateAccess(uintptr_t clientToken = 0);
+    void endExternalStateAccess(uintptr_t clientToken = 0);
+    bool hasCurrentExternalStateAccess() const;
+    bool isCurrentExternalStateStatelessClient() const;
+
+    class ExternalStateAccessScope
+    {
+      public:
+        explicit ExternalStateAccessScope(NodeDB *db, uintptr_t clientToken = 0)
+            : owner(db), token(clientToken), acquired(!owner || owner->beginExternalStateAccess(token))
+        {
+        }
+        ~ExternalStateAccessScope()
+        {
+            if (acquired && owner)
+                owner->endExternalStateAccess(token);
+        }
+        explicit operator bool() const { return acquired; }
+
+      private:
+        NodeDB *owner;
+        uintptr_t token;
+        bool acquired;
+    };
 
     bool createNewIdentity();
 
@@ -601,6 +751,7 @@ class NodeDB
     bool ensurePkiIdentity();
 
     bool backupPreferences(meshtastic_AdminMessage_BackupLocation location);
+    bool removeBackupPreferences(meshtastic_AdminMessage_BackupLocation location);
     bool restorePreferences(meshtastic_AdminMessage_BackupLocation location,
                             int restoreWhat = SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS);
 
@@ -642,6 +793,10 @@ class NodeDB
     /// surface the condition without callers re-walking each loadProto
     /// result. Cleared at the top of every loadFromDisk run.
     bool storageCorruptThisLoad = false;
+    // True only between a locked loadFromDisk() return and the later runtime
+    // unlock. Prevents the constructor from installing an ephemeral identity
+    // which could otherwise survive in CryptoEngine after the real files load.
+    bool encryptedStorageLockedPlaceholder = false;
 #endif
 
   private:
@@ -649,12 +804,65 @@ class NodeDB
     bool duplicateWarned = false;
     bool localPositionUpdatedSinceBoot = false;
     bool migrationSavePending = false;
+    bool legacyPreferencesPendingCleanup = false;
+    bool incompleteLegacyMigrationDetected = false;
+    std::atomic<bool> destructiveStorageMutationActive{false};
+    std::atomic<uintptr_t> destructiveStorageOwnerTask{0};
+    std::atomic<uint32_t> externalStateReaders{0};
+    std::atomic<uint32_t> preferenceStorageWriters{0};
+    bool waitForExternalStateReaders();
+    bool beginPreferenceStorageWrite();
+    void endPreferenceStorageWrite();
+    class PreferenceStorageWriteGuard
+    {
+      public:
+        explicit PreferenceStorageWriteGuard(NodeDB &db) : owner(db), acquired(db.beginPreferenceStorageWrite()) {}
+        ~PreferenceStorageWriteGuard()
+        {
+            if (acquired)
+                owner.endPreferenceStorageWrite();
+        }
+        explicit operator bool() const { return acquired; }
+
+      private:
+        NodeDB &owner;
+        bool acquired;
+    };
+#if defined(HELTEC_V4_OLED)
+    struct ExternalStateReaderSlot {
+        uintptr_t task = 0;
+        uintptr_t clientToken = 0;
+        uint16_t depth = 0;
+    };
+    static constexpr size_t EXTERNAL_STATE_READER_SLOTS = 8;
+    mutable concurrency::Lock externalStateReaderLock;
+    std::array<ExternalStateReaderSlot, EXTERNAL_STATE_READER_SLOTS> externalStateReaderSlots{};
+    enum class PreferenceEditState : uint8_t { NONE, QUIESCING, OPEN, COMMITTING, ACTIVATING };
+    std::atomic<PreferenceEditState> preferenceEditState{PreferenceEditState::NONE};
+    std::atomic<uintptr_t> preferenceEditOwnerTask{0};
+    std::atomic<uintptr_t> preferenceEditOwnerClient{0};
+    std::atomic<bool> preferenceEditRequiresDestructivePower{false};
+    std::atomic<bool> preferenceEditRadioParked{false};
+    uintptr_t currentExternalStateClientToken() const;
+    bool preferenceWriteAllowedDuringEdit() const;
+#endif
     /// Set when loadFromDisk() hit a present-but-undecodable config (DECODE_FAILED). The ctor uses it to
     /// skip boot keygen and skip persisting defaults, so a transient read failure can't change our NodeNum
     /// or overwrite the on-disk config. Cleared at the top of every loadFromDisk() run.
     bool configDecodeFailed = false;
+    // Bitmask of existing core files that could not be opened or decoded this
+    // boot. Their independent writes remain blocked until a clean reload or an
+    // explicit factory reset, so defaults cannot overwrite recoverable data.
+    int unreadablePreferenceSegments = 0;
+    bool incompleteConfigResetDetected = false;
+    bool incompletePreferenceRestoreDetected = false;
+    bool incompleteNodeDatabaseResetDetected = false;
     // Defer automatic writes until config load is healthy to protect device and node data from damaged configs.
     bool bootInitializationInProgress = true;
+    int bootDeferredPreferenceSegments = 0;
+#if defined(HELTEC_V4_OLED)
+    std::atomic<int> powerDeferredPreferenceSegments{0};
+#endif
     bool configLoadComplete = false;
 #if USERPREFS_EVENT_MODE
     // The active event profile is intentionally non-durable when there was not
@@ -720,7 +928,7 @@ class NodeDB
     /// Node-DB self-care; call only once identity is established (getNodeNum()
     /// valid). Confirms self is present, trims/demotes only NON-self overflow, and
     /// rewrites the store once when something changed (never while storage locked).
-    void nodeDBSelfCare();
+    void nodeDBSelfCare(bool persistRepair = true);
 
 #if WARM_NODE_COUNT > 0
     /// A database from a larger-cap build (e.g. the pre-fork 150-node nRF52 store)
@@ -732,7 +940,7 @@ class NodeDB
 
     /// Reinit device state from scratch (not loading from disk)
     void installDefaultDeviceState(), installDefaultNodeDatabase(), installDefaultChannels(),
-        installDefaultConfig(bool preserveKey), installDefaultModuleConfig();
+        installDefaultConfig(bool preserveKey = false, bool recoverOtaNetwork = true), installDefaultModuleConfig();
 
     /// write to flash
     /// @return true if the save was successful
@@ -755,6 +963,11 @@ class NodeDB
 };
 
 extern NodeDB *nodeDB;
+#if defined(HELTEC_V4_OLED)
+// Serializes the board's display-preference NVS handle with full-reset NVS
+// erase/rebuild. NodeDB holds it for the complete destructive transaction.
+extern concurrency::Lock heltecV4NvsMutationLock;
+#endif
 
 /*
   If is_router is set, we use a number of different default values

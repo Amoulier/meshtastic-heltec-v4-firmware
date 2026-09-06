@@ -12,11 +12,14 @@
 #include "MessageStore.h"
 #include "NodeDB.h"
 #include "PacketHistory.h"
+#include "Power.h"
 #include "PowerFSM.h"
+#include "PowerStatus.h"
 #include "RadioInterface.h"
 #include "Router.h"
 #include "SPILock.h"
 #include "SafeFile.h"
+#include "Throttle.h"
 #include "TransmitHistory.h"
 #include "TypeConversions.h"
 #include "UptimeClock.h"
@@ -41,14 +44,59 @@
 #include "xmodem.h"
 #include <ErriezCRC32.h>
 #include <algorithm>
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+#include <Curve25519.h>
+#endif
 #include <pb_decode.h>
 #include <pb_encode.h>
 #include <power/PowerHAL.h>
 #include <vector>
 
+void disableBluetooth();
+
+#if defined(HELTEC_V4_OLED)
+concurrency::Lock heltecV4NvsMutationLock;
+#endif
+
 #ifdef MESHTASTIC_ENCRYPTED_STORAGE
 #include "security/EncryptedStorage.h"
 #include "security/SecureZero.h"
+#endif
+
+namespace
+{
+bool isCompleteChannelFile(const meshtastic_ChannelFile &candidate)
+{
+    if (candidate.channels_count != MAX_NUM_CHANNELS)
+        return false;
+    size_t primaryCount = 0;
+    for (pb_size_t i = 0; i < candidate.channels_count; ++i) {
+        const meshtastic_Channel &channel = candidate.channels[i];
+        if (channel.role != meshtastic_Channel_Role_DISABLED && channel.role != meshtastic_Channel_Role_PRIMARY &&
+            channel.role != meshtastic_Channel_Role_SECONDARY)
+            return false;
+        if ((channel.role == meshtastic_Channel_Role_PRIMARY || channel.role == meshtastic_Channel_Role_SECONDARY) &&
+            !channel.has_settings)
+            return false;
+        if (channel.role == meshtastic_Channel_Role_PRIMARY)
+            ++primaryCount;
+    }
+    return primaryCount == 1;
+}
+} // namespace
+
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+namespace
+{
+enum class HeltecResetPendingKind : uint8_t { NONE, EDIT, NODEDB_RESET, CONFIG_ONLY, RESTORE, FULL, FULL_OR_UNKNOWN };
+bool removeHeltecPreferenceResidualsChecked(bool retainNodeDatabase, bool retainLegacyMarker);
+bool removeHeltecPreferenceTreeChecked(const char *directory);
+bool removeHeltecPersistedUserContentChecked();
+bool writeHeltecResetPendingMarker(HeltecResetPendingKind kind, bool requireDestructivePower);
+bool clearHeltecResetPendingMarker(HeltecResetPendingKind expectedKind, bool requireDestructivePower);
+HeltecResetPendingKind readHeltecResetPendingMarker();
+bool eraseHeltecNvsExceptRecoveryMarker();
+} // namespace
 #endif
 
 #ifdef ARCH_ESP32
@@ -58,6 +106,7 @@
 #include "SPILock.h"
 #include "modules/StoreForwardModule.h"
 #include <Preferences.h>
+#include <nvs.h>
 #include <nvs_flash.h>
 #endif
 
@@ -89,6 +138,33 @@ meshtastic_LocalConfig config;
 meshtastic_DeviceUIConfig uiconfig{.screen_brightness = 153, .screen_timeout = 30};
 meshtastic_LocalModuleConfig moduleConfig;
 meshtastic_ChannelFile channelFile;
+
+static void forceHeltecLocalRecoveryConfiguration()
+{
+#if defined(HELTEC_V4_OLED)
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+    config.lora.tx_enabled = false;
+    config.position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_DISABLED;
+    config.network.wifi_enabled = false;
+    config.network.eth_enabled = false;
+    config.network.enabled_protocols = meshtastic_Config_NetworkConfig_ProtocolFlags_NO_BROADCAST;
+    config.bluetooth.enabled = true;
+#endif
+}
+
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+static bool derivePublicKeyWithoutInstalling(const uint8_t *privateKey, uint8_t *publicKey)
+{
+    if (memfll(privateKey, 0, 32))
+        return false;
+    Curve25519::eval(publicKey, privateKey, 0);
+    if (Curve25519::isWeakPoint(publicKey)) {
+        memset(publicKey, 0, 32);
+        return false;
+    }
+    return true;
+}
+#endif
 
 #ifdef USERPREFS_USE_ADMIN_KEY_0
 static unsigned char userprefs_admin_key_0[] = USERPREFS_USE_ADMIN_KEY_0;
@@ -519,8 +595,47 @@ NodeDB::NodeDB()
     // Set my node num uint32 value to bytes from the public key (if we have one)
     // Generate identity and crypto keys if needed; this will create a new identity if one does not exist.
     // Skip on a degraded boot: the keypair isn't in RAM, so minting one would change our NodeNum.
-    if (!configDecodeFailed)
-        generateCryptoKeyPair(nullptr);
+    if (!configDecodeFailed
+#ifdef MESHTASTIC_ENCRYPTED_STORAGE
+        && !encryptedStorageLockedPlaceholder
+#endif
+    ) {
+#if defined(HELTEC_V4_OLED)
+        const size_t privateKeySize = config.security.private_key.size;
+        const size_t configPublicKeySize = config.security.public_key.size;
+        const size_t ownerPublicKeySize = owner.public_key.size;
+        bool persistedIdentityInvalid = (privateKeySize != 0 && privateKeySize != 32) ||
+                                        (configPublicKeySize != 0 && configPublicKeySize != 32) ||
+                                        (ownerPublicKeySize != 0 && ownerPublicKeySize != 32) ||
+                                        (privateKeySize == 0 && (configPublicKeySize != 0 || ownerPublicKeySize != 0));
+        if (!persistedIdentityInvalid && privateKeySize == 32) {
+            uint8_t derivedPublicKey[32];
+            persistedIdentityInvalid =
+                !derivePublicKeyWithoutInstalling(config.security.private_key.bytes, derivedPublicKey) ||
+                (configPublicKeySize == 32 &&
+                 memcmp(config.security.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey)) != 0) ||
+                (ownerPublicKeySize == 32 && memcmp(owner.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey)) != 0);
+        }
+        if (persistedIdentityInvalid) {
+            configDecodeFailed = true;
+            unreadablePreferenceSegments |= SEGMENT_CONFIG;
+            forceHeltecLocalRecoveryConfiguration();
+            LOG_ERROR("Persisted PKI identity is invalid; preserving config for local recovery");
+        }
+        const bool identityReady = !persistedIdentityInvalid && generateCryptoKeyPair(nullptr);
+        if (!persistedIdentityInvalid && privateKeySize == 32 && !identityReady) {
+            unreadablePreferenceSegments |= SEGMENT_CONFIG;
+            configDecodeFailed = true;
+            forceHeltecLocalRecoveryConfiguration();
+            LOG_ERROR("Persisted PKI identity could not be restored; preserving config for local recovery");
+        }
+#else
+        const bool restoringLegacyIdentity = legacyPreferencesPendingCleanup && config.security.private_key.size == 32;
+        const bool identityReady = generateCryptoKeyPair(nullptr);
+        (void)restoringLegacyIdentity;
+        (void)identityReady;
+#endif
+    }
 #elif !(MESHTASTIC_EXCLUDE_PKI)
     // Calculate Curve25519 public and private keys
     if (config.security.private_key.size == 32 && config.security.public_key.size == 32) {
@@ -539,13 +654,12 @@ NodeDB::NodeDB()
     // If we migrated from legacy during loadFromDisk(), persist the migrated DB
     // only after identity and self-care are established.
     if (migrationSavePending) {
-        saveNodeDatabaseToDisk();
-        migrationSavePending = false;
+        migrationSavePending = !saveNodeDatabaseToDisk();
     }
 
     // If node database has not been saved for the first time, save it now
 #ifdef FSCom
-    if (!FSCom.exists(nodeDatabaseFileName)) {
+    if (shouldUseFilesystemPersistence(fsIsMounted()) && !FSCom.exists(nodeDatabaseFileName)) {
         saveNodeDatabaseToDisk();
     }
 #endif
@@ -670,12 +784,20 @@ NodeDB::NodeDB()
         saveWhat |= SEGMENT_DEVICESTATE;
     if (nodeDatabaseCRC != crc32Buffer(&nodeDatabase, sizeof(nodeDatabase)))
         saveWhat |= SEGMENT_NODEDATABASE;
-    // Don't persist on a degraded boot: it would overwrite the unreadable-but-maybe-transient config file
-    // with no-key UNSET defaults. Runtime reconfiguration (admin set) still persists normally.
+    // Don't persist on a degraded boot: it would overwrite an unreadable-but-maybe-transient radio profile
+    // with no-key/default values. Ordinary runtime mutation remains blocked until explicit recovery.
     if (!configDecodeFailed && configCRC != crc32Buffer(&config, sizeof(config)))
         saveWhat |= SEGMENT_CONFIG;
     if (channelFileCRC != crc32Buffer(&channelFile, sizeof(channelFile)))
         saveWhat |= SEGMENT_CHANNELS;
+
+    // loadFromDisk() may discover and normalize migrations before it has
+    // inspected a later core file. Those writes are accumulated, never
+    // executed during the scan, and are eligible only after the complete
+    // generation proved healthy.
+    if (!requiresConfigRecovery())
+        saveWhat |= bootDeferredPreferenceSegments;
+    bootDeferredPreferenceSegments = 0;
 
     if (config.position.gps_enabled) {
         config.position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_ENABLED;
@@ -711,7 +833,67 @@ NodeDB::NodeDB()
     }
 #endif
     sortMeshDB();
-    saveToDisk(saveWhat);
+
+    const bool legacyMigrationWasPending = legacyPreferencesPendingCleanup;
+    const bool legacyXModemExclusive = !legacyMigrationWasPending || xModem.beginExclusiveStorageMutation();
+    bool canCommitLegacyMigration = legacyPreferencesPendingCleanup && !configDecodeFailed && legacyXModemExclusive;
+#ifdef MESHTASTIC_ENCRYPTED_STORAGE
+    canCommitLegacyMigration &= !(EncryptedStorage::isLockdownActive() && !EncryptedStorage::isUnlocked());
+#endif
+    const bool legacyNodeDatabaseRequired = canCommitLegacyMigration && (owner.public_key.size == 32 || owner.is_licensed);
+    const bool abortLegacyMigration = legacyPreferencesPendingCleanup && configDecodeFailed;
+    const int finalSaveWhat = abortLegacyMigration ? 0
+                              : canCommitLegacyMigration
+                                  ? SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS |
+                                        (legacyNodeDatabaseRequired ? SEGMENT_NODEDATABASE : 0)
+                                  : saveWhat;
+    const bool finalSaveSucceeded = finalSaveWhat == 0 || saveToDisk(finalSaveWhat);
+
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (canCommitLegacyMigration && finalSaveSucceeded) {
+        bool requiredFilesPresent = false;
+        {
+            concurrency::LockGuard guard(spiLock);
+            requiredFilesPresent = FSCom.exists(configFileName) && FSCom.exists(moduleConfigFileName) &&
+                                   FSCom.exists(deviceStateFileName) && FSCom.exists(channelFileName) &&
+                                   (!legacyNodeDatabaseRequired || FSCom.exists(nodeDatabaseFileName));
+        }
+
+        // Historical legacy migration cleared every auxiliary preference, not
+        // just the node cache. Remove and verify all of them only after the
+        // identity/config-bearing replacements exist, retaining db.proto as
+        // the final commit marker so a power loss always retries safely.
+        const bool residualsRemoved =
+            requiredFilesPresent && removeHeltecPreferenceResidualsChecked(legacyNodeDatabaseRequired, true);
+        bool markerRemoved = false;
+        if (residualsRemoved) {
+            concurrency::LockGuard guard(spiLock);
+            if (FSCom.exists(legacyPrefFileName))
+                FSCom.remove(legacyPrefFileName);
+            markerRemoved = !FSCom.exists(legacyPrefFileName);
+        }
+        if (markerRemoved) {
+            legacyPreferencesPendingCleanup = false;
+            incompleteLegacyMigrationDetected = false;
+            LOG_INFO("Legacy preferences migrated without erasing /prefs");
+        } else {
+            LOG_ERROR("Legacy preference migration incomplete; preserving marker for retry");
+        }
+    }
+#else
+    (void)finalSaveSucceeded;
+#endif
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (legacyPreferencesPendingCleanup) {
+        incompleteLegacyMigrationDetected = true;
+        forceHeltecLocalRecoveryConfiguration();
+        LOG_ERROR("Legacy preference migration did not commit - local recovery only");
+    }
+#endif
+#ifdef FSCom
+    if (legacyMigrationWasPending && legacyXModemExclusive)
+        xModem.endExclusiveStorageMutation();
+#endif
     bootInitializationInProgress = false;
 }
 
@@ -797,7 +979,7 @@ template <typename Map> void evictSatelliteOverCap(NodeDB &db, Map &map, NodeNum
 }
 } // namespace
 
-void NodeDB::resetRadioConfig(bool is_fresh_install)
+void NodeDB::resetRadioConfig(bool is_fresh_install, bool activateRuntime)
 {
     if (is_fresh_install) {
         radioGeneration++;
@@ -813,44 +995,918 @@ void NodeDB::resetRadioConfig(bool is_fresh_install)
             channels.ensureLicensedOperation();
     }
 
-    channels.onConfigChanged();
+    channels.onConfigChanged(activateRuntime);
 
     // Update the global myRegion
     initRegion();
 }
 
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+namespace
+{
+constexpr const char *HELTEC_RESET_PENDING_NAMESPACE = "heltec-reset";
+constexpr const char *HELTEC_RESET_PENDING_KEY = "pending";
+constexpr char HELTEC_EDIT_PENDING_PAYLOAD[] = "heltec-v4-settings-edit-v1\n";
+constexpr char HELTEC_NODEDB_RESET_PENDING_PAYLOAD[] = "heltec-v4-nodedb-reset-v1\n";
+constexpr char HELTEC_CONFIG_RESET_PENDING_PAYLOAD[] = "heltec-v4-config-reset-v1\n";
+constexpr char HELTEC_RESTORE_PENDING_PAYLOAD[] = "heltec-v4-restore-v1\n";
+constexpr char HELTEC_FULL_RESET_PENDING_PAYLOAD[] = "heltec-v4-full-reset-v1\n";
+constexpr const char *HELTEC_NVS_REBUILD_PENDING_FILE = "/heltec-nvs-reset.pending";
+concurrency::Lock heltecPreferencesTransactionLock;
+
+void scheduleHeltecRecoveryReboot()
+{
+    rebootAtMsec = millis() + 1000;
+}
+
+bool parkHeltecRadioForStorageMutation()
+{
+    RadioInterface *const radio = router ? router->getRadioIface() : nullptr;
+    if (!radio)
+        return true;
+
+    constexpr uint32_t radioQuiesceWaitMs = 5000;
+    const auto waitForIdle = [&]() {
+        const uint32_t started = millis();
+        while (!radio->canParkForConfig()) {
+            if (!Throttle::isWithinTimespanMs(started, radioQuiesceWaitMs))
+                return false;
+            delay(1);
+        }
+        return true;
+    };
+
+    // A destructive operation may discard queued work at reboot, but it must
+    // never truncate an on-air TX and report that packet as successful. Let
+    // the admitted hardware operation finish before cutting the rail.
+    return waitForIdle() && radio->sleep() && waitForIdle();
+}
+
+class HeltecXModemStorageGuard
+{
+  public:
+    explicit HeltecXModemStorageGuard(bool cancelActiveTransfer = false)
+        : acquired(xModem.beginExclusiveStorageMutation(cancelActiveTransfer))
+    {
+    }
+    ~HeltecXModemStorageGuard()
+    {
+        if (acquired)
+            xModem.endExclusiveStorageMutation();
+    }
+    explicit operator bool() const { return acquired; }
+
+  private:
+    bool acquired;
+};
+
+bool heltecNvsRebuildPendingFileExists()
+{
+    concurrency::LockGuard guard(spiLock);
+    return FSCom.exists(HELTEC_NVS_REBUILD_PENDING_FILE);
+}
+
+bool heltecNvsRebuildPendingFileIsValid()
+{
+    concurrency::LockGuard guard(spiLock);
+    File verify = FSCom.open(HELTEC_NVS_REBUILD_PENDING_FILE, FILE_O_READ);
+    constexpr size_t payloadSize = sizeof(HELTEC_FULL_RESET_PENDING_PAYLOAD) - 1;
+    char payload[sizeof(HELTEC_FULL_RESET_PENDING_PAYLOAD)] = {};
+    const size_t bytesRead = verify ? verify.readBytes(payload, payloadSize) : 0;
+    const bool valid = verify && verify.size() == payloadSize && bytesRead == payloadSize &&
+                       memcmp(payload, HELTEC_FULL_RESET_PENDING_PAYLOAD, payloadSize) == 0;
+    if (verify)
+        verify.close();
+    return valid;
+}
+
+void clearHeltecNvsRebuildTemporaryFile()
+{
+    concurrency::LockGuard guard(spiLock);
+    String temporaryPath = HELTEC_NVS_REBUILD_PENDING_FILE;
+    temporaryPath += ".tmp";
+    if (FSCom.exists(temporaryPath.c_str()))
+        FSCom.remove(temporaryPath.c_str());
+}
+
+bool writeHeltecNvsRebuildPendingFile()
+{
+    SafeFile file(HELTEC_NVS_REBUILD_PENDING_FILE, true, true);
+    const size_t payloadSize = sizeof(HELTEC_FULL_RESET_PENDING_PAYLOAD) - 1;
+    size_t bytesWritten = 0;
+    {
+        concurrency::LockGuard guard(spiLock);
+        bytesWritten = file.write(reinterpret_cast<const uint8_t *>(HELTEC_FULL_RESET_PENDING_PAYLOAD), payloadSize);
+    }
+    if (bytesWritten != payloadSize || !file.close())
+        return false;
+
+    concurrency::LockGuard guard(spiLock);
+    File verify = FSCom.open(HELTEC_NVS_REBUILD_PENDING_FILE, FILE_O_READ);
+    char payload[sizeof(HELTEC_FULL_RESET_PENDING_PAYLOAD)] = {};
+    const size_t bytesRead = verify ? verify.readBytes(payload, payloadSize) : 0;
+    const bool valid = verify && verify.size() == payloadSize && bytesRead == payloadSize &&
+                       memcmp(payload, HELTEC_FULL_RESET_PENDING_PAYLOAD, payloadSize) == 0;
+    if (verify)
+        verify.close();
+    return valid;
+}
+
+bool clearHeltecNvsRebuildPendingFile()
+{
+    concurrency::LockGuard guard(spiLock);
+    String temporaryPath = HELTEC_NVS_REBUILD_PENDING_FILE;
+    temporaryPath += ".tmp";
+    const bool fileRemoved = !FSCom.exists(HELTEC_NVS_REBUILD_PENDING_FILE) || FSCom.remove(HELTEC_NVS_REBUILD_PENDING_FILE);
+    const bool temporaryRemoved = !FSCom.exists(temporaryPath.c_str()) || FSCom.remove(temporaryPath.c_str());
+    return fileRemoved && temporaryRemoved && !FSCom.exists(HELTEC_NVS_REBUILD_PENDING_FILE) &&
+           !FSCom.exists(temporaryPath.c_str());
+}
+
+const char *heltecResetPendingPayload(HeltecResetPendingKind kind)
+{
+    switch (kind) {
+    case HeltecResetPendingKind::EDIT:
+        return HELTEC_EDIT_PENDING_PAYLOAD;
+    case HeltecResetPendingKind::NODEDB_RESET:
+        return HELTEC_NODEDB_RESET_PENDING_PAYLOAD;
+    case HeltecResetPendingKind::CONFIG_ONLY:
+        return HELTEC_CONFIG_RESET_PENDING_PAYLOAD;
+    case HeltecResetPendingKind::RESTORE:
+        return HELTEC_RESTORE_PENDING_PAYLOAD;
+    case HeltecResetPendingKind::FULL:
+        return HELTEC_FULL_RESET_PENDING_PAYLOAD;
+    default:
+        return nullptr;
+    }
+}
+
+bool writeHeltecResetPendingMarker(HeltecResetPendingKind kind, bool requireDestructivePower)
+{
+    const auto markerPowerIsSafe = [requireDestructivePower]() {
+        return requireDestructivePower ? heltecDestructiveStoragePowerIsSafe() : heltecPreferenceStoragePowerIsSafe();
+    };
+    if (!markerPowerIsSafe()) {
+        LOG_ERROR("Refusing Heltec recovery marker write while fresh power is unsafe");
+        return false;
+    }
+    const char *payload = heltecResetPendingPayload(kind);
+    if (!payload) {
+        LOG_ERROR("Invalid Heltec recovery marker kind");
+        return false;
+    }
+    const HeltecResetPendingKind currentKind = readHeltecResetPendingMarker();
+    const bool transitionAllowed =
+        currentKind == HeltecResetPendingKind::NONE || currentKind == kind || kind == HeltecResetPendingKind::FULL ||
+        (currentKind == HeltecResetPendingKind::EDIT &&
+         (kind == HeltecResetPendingKind::CONFIG_ONLY || kind == HeltecResetPendingKind::RESTORE)) ||
+        (currentKind == HeltecResetPendingKind::CONFIG_ONLY && kind == HeltecResetPendingKind::RESTORE);
+    const bool fullResetRecoveryActive = currentKind == HeltecResetPendingKind::FULL ||
+                                         currentKind == HeltecResetPendingKind::FULL_OR_UNKNOWN ||
+                                         heltecNvsRebuildPendingFileExists();
+    if (!transitionAllowed || (kind != HeltecResetPendingKind::FULL && fullResetRecoveryActive)) {
+        LOG_ERROR("Refusing unsafe Heltec recovery transaction transition");
+        return false;
+    }
+    if (currentKind == kind)
+        return true;
+    const size_t payloadSize = strlen(payload);
+
+    // This transaction intent deliberately lives in NVS, not LittleFS. A full
+    // reset can explicitly format LittleFS, and a power cut between that format
+    // and a filesystem marker rewrite would otherwise boot without knowing a
+    // destructive operation was interrupted.
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(HELTEC_RESET_PENDING_NAMESPACE, NVS_READWRITE, &handle);
+    if (result != ESP_OK) {
+        LOG_ERROR("Heltec recovery marker could not open NVS: %d", result);
+        return false;
+    }
+    // Replacing this one key preserves the old committed marker until the new
+    // value commits; clearing the namespace first creates a power-loss gap.
+    result = nvs_set_blob(handle, HELTEC_RESET_PENDING_KEY, payload, payloadSize);
+    if (result == ESP_OK) {
+        if (markerPowerIsSafe())
+            result = nvs_commit(handle);
+        else
+            result = ESP_ERR_INVALID_STATE;
+    }
+    nvs_close(handle);
+    if (result != ESP_OK) {
+        LOG_ERROR("Heltec recovery marker could not persist to NVS: %d", result);
+        return false;
+    }
+
+    const bool valid = readHeltecResetPendingMarker() == kind;
+    if (!valid)
+        LOG_ERROR("Heltec recovery marker failed NVS readback");
+    return valid;
+}
+
+bool prepareHeltecNvsRebuildIntent(HeltecResetPendingKind initialKind)
+{
+    const bool hasStrongFullResetIntent =
+        initialKind == HeltecResetPendingKind::FULL || initialKind == HeltecResetPendingKind::FULL_OR_UNKNOWN;
+    if (!fsIsMounted()) {
+        if (!hasStrongFullResetIntent || !heltecDestructiveStoragePowerIsSafe() || !fsFormat())
+            return false;
+    }
+    // A prior interrupted rebuild may have left this as the only durable FULL
+    // intent. Accept it without attempting a replace that could consume the
+    // final free block or weaken the marker on failure.
+    if (heltecNvsRebuildPendingFileIsValid() || writeHeltecNvsRebuildPendingFile())
+        return true;
+
+    // SafeFile may leave only a staging file after a failed refresh. Never
+    // delete the committed target here: even malformed content is interpreted
+    // fail-closed at boot and may be the sole surviving reset intent.
+    clearHeltecNvsRebuildTemporaryFile();
+    if (hasStrongFullResetIntent) {
+        return heltecDestructiveStoragePowerIsSafe() && fsFormat() && writeHeltecNvsRebuildPendingFile();
+    }
+
+    // Without an existing FULL NVS intent, deleting user data or formatting
+    // merely to make room for the secondary marker would itself be an
+    // insufficiently guarded destructive transaction. Fail closed; a clean USB
+    // install remains the recovery path for the rare combination of full
+    // LittleFS and unusable NVS.
+    return false;
+}
+
+bool rebuildHeltecNvsForFullReset(HeltecResetPendingKind initialKind, bool &rebootRequired)
+{
+    // Quiesce first: SafeFile and the guarded fsFormat fallback must not race
+    // network/XMODEM/radio tasks that may still hold filesystem or NVS state.
+#if HAS_WIFI
+    deinitWifi();
+#endif
+    disableBluetooth();
+    forceHeltecLocalRecoveryConfiguration();
+#if !MESHTASTIC_EXCLUDE_GPS
+    if (gps)
+        gps->disable();
+#endif
+    if (!parkHeltecRadioForStorageMutation()) {
+        LOG_ERROR("NVS rebuild could not safely drain/park LoRa");
+        return false;
+    }
+    rebootRequired = true;
+    if (!prepareHeltecNvsRebuildIntent(initialKind)) {
+        LOG_ERROR("Could not persist secondary full-reset intent before rebuilding NVS");
+        return false;
+    }
+    const esp_err_t deinitResult = nvs_flash_deinit();
+    if (deinitResult != ESP_OK && deinitResult != ESP_ERR_NVS_NOT_INITIALIZED) {
+        LOG_ERROR("Could not deinitialize corrupt NVS: %d", deinitResult);
+        return false;
+    }
+    esp_err_t result = nvs_flash_erase();
+    if (result == ESP_OK)
+        result = nvs_flash_init();
+    if (result != ESP_OK) {
+        LOG_ERROR("Could not rebuild NVS for explicit full reset: %d", result);
+        return false;
+    }
+    return writeHeltecResetPendingMarker(HeltecResetPendingKind::FULL, true);
+}
+
+bool clearHeltecResetPendingMarker(HeltecResetPendingKind expectedKind, bool requireDestructivePower)
+{
+    const auto markerPowerIsSafe = [requireDestructivePower]() {
+        return requireDestructivePower ? heltecDestructiveStoragePowerIsSafe() : heltecPreferenceStoragePowerIsSafe();
+    };
+    if (!markerPowerIsSafe()) {
+        LOG_ERROR("Refusing Heltec recovery marker clear while fresh power is unsafe");
+        return false;
+    }
+    if (readHeltecResetPendingMarker() != expectedKind) {
+        LOG_ERROR("Refusing to clear a different Heltec recovery transaction");
+        return false;
+    }
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(HELTEC_RESET_PENDING_NAMESPACE, NVS_READWRITE, &handle);
+    if (result != ESP_OK)
+        return false;
+    result = nvs_erase_key(handle, HELTEC_RESET_PENDING_KEY);
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+        result = ESP_OK;
+    if (result == ESP_OK) {
+        if (markerPowerIsSafe())
+            result = nvs_commit(handle);
+        else
+            result = ESP_ERR_INVALID_STATE;
+    }
+    nvs_close(handle);
+    return result == ESP_OK && readHeltecResetPendingMarker() == HeltecResetPendingKind::NONE;
+}
+
+HeltecResetPendingKind readHeltecResetPendingMarker()
+{
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(HELTEC_RESET_PENDING_NAMESPACE, NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND)
+        return HeltecResetPendingKind::NONE;
+    if (result != ESP_OK) {
+        LOG_ERROR("Heltec recovery marker NVS is unreadable: %d", result);
+        return HeltecResetPendingKind::FULL_OR_UNKNOWN;
+    }
+    char payload[64] = {};
+    size_t size = 0;
+    result = nvs_get_blob(handle, HELTEC_RESET_PENDING_KEY, nullptr, &size);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return HeltecResetPendingKind::NONE;
+    }
+    if (result != ESP_OK || size > sizeof(payload)) {
+        nvs_close(handle);
+        return HeltecResetPendingKind::FULL_OR_UNKNOWN;
+    }
+    size_t bytesRead = size;
+    result = nvs_get_blob(handle, HELTEC_RESET_PENDING_KEY, payload, &bytesRead);
+    nvs_close(handle);
+    if (result != ESP_OK)
+        return HeltecResetPendingKind::FULL_OR_UNKNOWN;
+
+    constexpr size_t editPayloadSize = sizeof(HELTEC_EDIT_PENDING_PAYLOAD) - 1;
+    if (size == editPayloadSize && bytesRead == size && memcmp(payload, HELTEC_EDIT_PENDING_PAYLOAD, editPayloadSize) == 0) {
+        return HeltecResetPendingKind::EDIT;
+    }
+    constexpr size_t nodeDbResetPayloadSize = sizeof(HELTEC_NODEDB_RESET_PENDING_PAYLOAD) - 1;
+    if (size == nodeDbResetPayloadSize && bytesRead == size &&
+        memcmp(payload, HELTEC_NODEDB_RESET_PENDING_PAYLOAD, nodeDbResetPayloadSize) == 0) {
+        return HeltecResetPendingKind::NODEDB_RESET;
+    }
+    constexpr size_t configPayloadSize = sizeof(HELTEC_CONFIG_RESET_PENDING_PAYLOAD) - 1;
+    if (size == configPayloadSize && bytesRead == size &&
+        memcmp(payload, HELTEC_CONFIG_RESET_PENDING_PAYLOAD, configPayloadSize) == 0) {
+        return HeltecResetPendingKind::CONFIG_ONLY;
+    }
+    constexpr size_t restorePayloadSize = sizeof(HELTEC_RESTORE_PENDING_PAYLOAD) - 1;
+    if (size == restorePayloadSize && bytesRead == size &&
+        memcmp(payload, HELTEC_RESTORE_PENDING_PAYLOAD, restorePayloadSize) == 0) {
+        return HeltecResetPendingKind::RESTORE;
+    }
+    constexpr size_t fullPayloadSize = sizeof(HELTEC_FULL_RESET_PENDING_PAYLOAD) - 1;
+    if (size == fullPayloadSize && bytesRead == size &&
+        memcmp(payload, HELTEC_FULL_RESET_PENDING_PAYLOAD, fullPayloadSize) == 0) {
+        return HeltecResetPendingKind::FULL;
+    }
+    // A corrupt or unrecognized marker is treated as the more conservative
+    // full-reset state; only another explicit full reset may clear it.
+    return HeltecResetPendingKind::FULL_OR_UNKNOWN;
+}
+
+bool eraseHeltecNvsExceptRecoveryMarker()
+{
+    if (readHeltecResetPendingMarker() != HeltecResetPendingKind::FULL) {
+        LOG_ERROR("Refusing NVS cleanup without a verified full-reset marker");
+        return false;
+    }
+
+    std::vector<std::string> namespaces;
+    std::vector<std::string> recoveryCompanionKeys;
+    nvs_iterator_t iterator = nullptr;
+    esp_err_t result = nvs_entry_find("nvs", nullptr, NVS_TYPE_ANY, &iterator);
+    while (result == ESP_OK) {
+        nvs_entry_info_t info;
+        nvs_entry_info(iterator, &info);
+        if (strcmp(info.namespace_name, HELTEC_RESET_PENDING_NAMESPACE) == 0) {
+            if (strcmp(info.key, HELTEC_RESET_PENDING_KEY) != 0)
+                recoveryCompanionKeys.emplace_back(info.key);
+        } else if (std::find(namespaces.begin(), namespaces.end(), info.namespace_name) == namespaces.end()) {
+            namespaces.emplace_back(info.namespace_name);
+        }
+        result = nvs_entry_next(&iterator);
+    }
+    if (iterator)
+        nvs_release_iterator(iterator);
+    if (result != ESP_ERR_NVS_NOT_FOUND) {
+        LOG_ERROR("Could not enumerate NVS namespaces: %d", result);
+        return false;
+    }
+
+    for (const auto &namespaceName : namespaces) {
+        nvs_handle_t handle;
+        result = nvs_open(namespaceName.c_str(), NVS_READWRITE, &handle);
+        if (result != ESP_OK) {
+            LOG_ERROR("Could not open NVS namespace %s: %d", namespaceName.c_str(), result);
+            return false;
+        }
+        result = nvs_erase_all(handle);
+        if (result == ESP_OK)
+            result = nvs_commit(handle);
+        nvs_close(handle);
+        if (result != ESP_OK) {
+            LOG_ERROR("Could not erase NVS namespace %s: %d", namespaceName.c_str(), result);
+            return false;
+        }
+    }
+
+    if (!recoveryCompanionKeys.empty()) {
+        nvs_handle_t handle;
+        result = nvs_open(HELTEC_RESET_PENDING_NAMESPACE, NVS_READWRITE, &handle);
+        if (result != ESP_OK)
+            return false;
+        for (const auto &key : recoveryCompanionKeys) {
+            result = nvs_erase_key(handle, key.c_str());
+            if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND)
+                break;
+        }
+        if (result == ESP_OK || result == ESP_ERR_NVS_NOT_FOUND)
+            result = nvs_commit(handle);
+        nvs_close(handle);
+        if (result != ESP_OK)
+            return false;
+    }
+
+    bool onlyRecoveryMarkerRemains = true;
+    iterator = nullptr;
+    result = nvs_entry_find("nvs", nullptr, NVS_TYPE_ANY, &iterator);
+    while (result == ESP_OK) {
+        nvs_entry_info_t info;
+        nvs_entry_info(iterator, &info);
+        if (strcmp(info.namespace_name, HELTEC_RESET_PENDING_NAMESPACE) != 0 || strcmp(info.key, HELTEC_RESET_PENDING_KEY) != 0) {
+            LOG_ERROR("Unexpected NVS entry remained after full reset: %s/%s", info.namespace_name, info.key);
+            onlyRecoveryMarkerRemains = false;
+        }
+        result = nvs_entry_next(&iterator);
+    }
+    if (iterator)
+        nvs_release_iterator(iterator);
+    if (result != ESP_ERR_NVS_NOT_FOUND)
+        onlyRecoveryMarkerRemains = false;
+
+    return onlyRecoveryMarkerRemains && readHeltecResetPendingMarker() == HeltecResetPendingKind::FULL;
+}
+
+bool isHeltecRetainedPreferenceFile(const char *path, bool retainNodeDatabase, bool retainLegacyMarker)
+{
+    if (!path) {
+        return false;
+    }
+    const bool activeFile = strcmp(path, configFileName) == 0 || strcmp(path, moduleConfigFileName) == 0 ||
+                            strcmp(path, channelFileName) == 0 || strcmp(path, deviceStateFileName) == 0 ||
+                            (retainNodeDatabase && strcmp(path, nodeDatabaseFileName) == 0) ||
+                            (retainLegacyMarker && strcmp(path, legacyPrefFileName) == 0);
+#if USERPREFS_EVENT_MODE
+    // An event build writes its active profile under separate names. Legacy
+    // migration must not erase the inactive standard profile or its backup.
+    return activeFile || strcmp(path, STANDARD_CONFIG_FILE_NAME) == 0 || strcmp(path, STANDARD_CHANNEL_FILE_NAME) == 0 ||
+           strcmp(path, STANDARD_BACKUP_FILE_NAME) == 0;
+#else
+    return activeFile;
+#endif
+}
+
+bool removeHeltecPreferenceTreeChecked(const char *directory)
+{
+    File root = FSCom.open(directory, FILE_O_READ);
+    if (!root || !root.isDirectory()) {
+        LOG_ERROR("Config reset cleanup could not open %s", directory);
+        return false;
+    }
+
+    bool success = true;
+    File file = root.openNextFile();
+    while (file && file.name()[0]) {
+        const char *sourcePath = file.path();
+        char path[255];
+        const bool pathValid = sourcePath && strlcpy(path, sourcePath, sizeof(path)) < sizeof(path);
+        const bool isDirectory = file.isDirectory();
+        file.close();
+
+        if (!pathValid) {
+            LOG_ERROR("Config reset cleanup skipped an invalid preference path");
+            success = false;
+        } else if (isDirectory) {
+            success &= removeHeltecPreferenceTreeChecked(path);
+        } else if (!FSCom.remove(path) && FSCom.exists(path)) {
+            LOG_ERROR("Config reset cleanup could not remove %s", path);
+            success = false;
+        }
+
+        file = root.openNextFile();
+    }
+    root.close();
+
+    if (!FSCom.rmdir(directory) && FSCom.exists(directory)) {
+        LOG_ERROR("Config reset cleanup could not remove directory %s", directory);
+        success = false;
+    }
+    return success && !FSCom.exists(directory);
+}
+
+bool removeHeltecFileChecked(const char *path)
+{
+    if (FSCom.exists(path) && !FSCom.remove(path)) {
+        LOG_ERROR("Factory reset could not remove %s", path);
+        return false;
+    }
+    return !FSCom.exists(path);
+}
+
+bool removeHeltecPersistedUserContentChecked()
+{
+    constexpr const char *paths[] = {"/Messages_default.msgs", "/Messages_default.msgs.tmp", "/Waypoints_default.wpts",
+                                     "/Waypoints_default.wpts.tmp"};
+    bool success = true;
+    for (const char *path : paths)
+        success &= removeHeltecFileChecked(path);
+    return success;
+}
+
+// Called only after every required default file has been committed
+// successfully. This restores the traditional reset cleanup without deleting
+// the previous identity/config generation before its atomic replacement is
+// known good.
+bool removeHeltecPreferenceResidualsChecked(bool retainNodeDatabase, bool retainLegacyMarker)
+{
+    concurrency::LockGuard guard(spiLock);
+    File root = FSCom.open("/prefs", FILE_O_READ);
+    if (!root || !root.isDirectory()) {
+        LOG_ERROR("Config reset cleanup could not open /prefs");
+        return false;
+    }
+
+    bool success = true;
+    File file = root.openNextFile();
+    while (file && file.name()[0]) {
+        const char *sourcePath = file.path();
+        char path[255];
+        const bool pathValid = sourcePath && strlcpy(path, sourcePath, sizeof(path)) < sizeof(path);
+        const bool isDirectory = file.isDirectory();
+        file.close();
+
+        if (!pathValid) {
+            LOG_ERROR("Config reset cleanup skipped an invalid preference path");
+            success = false;
+        } else if (isDirectory) {
+            success &= removeHeltecPreferenceTreeChecked(path);
+        } else if (!isHeltecRetainedPreferenceFile(path, retainNodeDatabase, retainLegacyMarker) && !FSCom.remove(path) &&
+                   FSCom.exists(path)) {
+            LOG_ERROR("Config reset cleanup could not remove %s", path);
+            success = false;
+        }
+
+        file = root.openNextFile();
+    }
+    root.close();
+
+    // Re-open and verify: deleting entries while iterating can expose
+    // backend-specific cursor behavior, so success requires an explicit final
+    // inventory containing only the files explicitly retained by this reset or
+    // migration transaction.
+    root = FSCom.open("/prefs", FILE_O_READ);
+    if (!root || !root.isDirectory()) {
+        LOG_ERROR("Config reset cleanup could not verify /prefs");
+        return false;
+    }
+    file = root.openNextFile();
+    while (file && file.name()[0]) {
+        const char *path = file.path();
+        if (file.isDirectory() || !isHeltecRetainedPreferenceFile(path, retainNodeDatabase, retainLegacyMarker)) {
+            LOG_ERROR("Config reset cleanup left residual %s", path ? path : "<invalid>");
+            success = false;
+        }
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+    return success;
+}
+} // namespace
+#endif
+
 bool NodeDB::factoryReset(bool eraseBleBonds)
 {
     LOG_INFO("Factory reset");
-    // first, remove the "/prefs" (this removes most prefs)
-    spiLock->lock();
-    rmDir("/prefs"); // this uses spilock internally...
+#if defined(HELTEC_V4_OLED)
+    if (rebootAtMsec != 0 || shutdownAtMsec != 0) {
+        LOG_ERROR("Factory reset refused while reboot/shutdown is pending");
+        return false;
+    }
+    bool expectedInactive = false;
+    if (!destructiveStorageMutationActive.compare_exchange_strong(expectedInactive, true, std::memory_order_acq_rel)) {
+        LOG_ERROR("Factory reset refused while another destructive storage operation is active");
+        return false;
+    }
+    destructiveStorageOwnerTask.store(reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle()), std::memory_order_release);
+    bool keepDestructiveFenceUntilReboot = false;
+    struct ActivityReset {
+        std::atomic<bool> &flag;
+        std::atomic<uintptr_t> &owner;
+        bool &keepUntilReboot;
+        ~ActivityReset()
+        {
+            owner.store(0, std::memory_order_release);
+            if (!keepUntilReboot)
+                flag.store(false, std::memory_order_release);
+        }
+    } activityReset{destructiveStorageMutationActive, destructiveStorageOwnerTask, keepDestructiveFenceUntilReboot};
+    // A store autosave can pass its first gate immediately before the CAS
+    // above. Drain all persistence locks before any format/remove operation;
+    // the raised destructive fence prevents a new save from passing its
+    // second gate. Keep one fixed order for the two independent stores.
+    if (transmitHistory)
+        transmitHistory->drainPersistenceWrites();
+#if HAS_SCREEN
+    messageStore.drainPersistenceWrites();
+#endif
+#if HAS_SCREEN && !MESHTASTIC_EXCLUDE_WAYPOINT
+    waypointStore.drainPersistenceWrites();
+#endif
+    if (!waitForExternalStateReaders()) {
+        LOG_ERROR("Factory reset refused while a PhoneAPI/HTTP state reader is active");
+        return false;
+    }
+    concurrency::LockGuard transactionGuard(&heltecPreferencesTransactionLock);
+    if (!eraseBleBonds && isPreferenceEditTransactionActive()) {
+        LOG_ERROR("Config reset refused while a settings edit is open");
+        return false;
+    }
+    // Keep Screen::saveDisplayDisabled() and any in-flight PRG event away
+    // from Preferences while FULL may deinit/erase/reinitialize NVS.
+    concurrency::LockGuard nvsMutationGuard(&heltecV4NvsMutationLock);
+    HeltecXModemStorageGuard xmodemGuard(eraseBleBonds);
+    // saveNodeDatabaseToDisk() deliberately skips writes while XMODEM owns the
+    // filesystem. A reset in that window could otherwise report success while
+    // retaining the previous nodes.proto. Reject before mutating RAM instead.
+    if (!xmodemGuard) {
+        LOG_ERROR("Factory reset refused while XMODEM transfer is active");
+        return false;
+    }
 
-#ifdef FSCom
-    if (FSCom.exists("/static/rangetest.csv") && !FSCom.remove("/static/rangetest.csv")) {
-        LOG_ERROR("Can't remove rangetest.csv");
+    if (!eraseBleBonds && incompletePreferenceRestoreDetected) {
+        LOG_ERROR("Config reset refused: interrupted backup restore must be retried or fully reset");
+        return false;
+    }
+
+    const HeltecResetPendingKind initialMarkerKind = readHeltecResetPendingMarker();
+    const bool recoveringInterruptedEdit = initialMarkerKind == HeltecResetPendingKind::EDIT;
+
+    if (!eraseBleBonds && (unreadablePreferenceSegments & SEGMENT_CONFIG) != 0) {
+        // A config-only reset promises to retain the keypair. When the mounted
+        // file exists but could not be decoded, the in-memory defaults contain
+        // no authoritative key to preserve. Leave the file untouched for a
+        // clean reboot/recovery or require an explicitly destructive full reset.
+        LOG_ERROR("Config reset refused: persisted identity is unavailable");
+        return false;
+    }
+
+    const bool hasValidPrivateKey = config.has_security && config.security.private_key.size == 32;
+    const bool hasPriorPublicIdentity =
+        owner.public_key.size != 0 || (config.has_security && config.security.public_key.size != 0);
+    if (!eraseBleBonds &&
+        ((config.has_security && config.security.private_key.size != 0 && config.security.private_key.size != 32) ||
+         (config.has_security && config.security.public_key.size != 0 && config.security.public_key.size != 32) ||
+         (owner.public_key.size != 0 && owner.public_key.size != 32) || (!hasValidPrivateKey && hasPriorPublicIdentity))) {
+        LOG_ERROR("Config reset refused: persisted identity length is invalid");
+        return false;
+    }
+
+    uint32_t preservedNodeNum = myNodeInfo.my_node_num;
+    meshtastic_User_public_key_t preservedPublicKey = owner.public_key;
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+    if (!eraseBleBonds && hasValidPrivateKey) {
+        uint8_t derivedPublicKey[32];
+        meshtastic_Config_SecurityConfig_public_key_t derivedKey = {};
+        derivedKey.size = sizeof(derivedPublicKey);
+        if (!derivePublicKeyWithoutInstalling(config.security.private_key.bytes, derivedPublicKey)) {
+            LOG_ERROR("Config reset refused: private key cannot produce a valid identity");
+            return false;
+        }
+        memcpy(derivedKey.bytes, derivedPublicKey, sizeof(derivedPublicKey));
+        if (checkLowEntropyPublicKey(derivedKey) ||
+            (config.security.public_key.size == 32 &&
+             memcmp(config.security.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey)) != 0) ||
+            (!recoveringInterruptedEdit && owner.public_key.size == 32 &&
+             memcmp(owner.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey)) != 0)) {
+            LOG_ERROR("Config reset refused: persisted identity is inconsistent");
+            return false;
+        }
+        const uint32_t derivedNodeNum = crc32Buffer(derivedPublicKey, sizeof(derivedPublicKey));
+        if (preservedNodeNum != derivedNodeNum) {
+            if (!incompleteConfigResetDetected && (unreadablePreferenceSegments & SEGMENT_DEVICESTATE) == 0) {
+                LOG_ERROR("Config reset refused: persisted NodeNum does not match its key");
+                return false;
+            }
+            LOG_WARN("Recovering config-reset NodeNum from its preserved private key");
+            preservedNodeNum = derivedNodeNum;
+        }
+        preservedPublicKey.size = sizeof(derivedPublicKey);
+        memcpy(preservedPublicKey.bytes, derivedPublicKey, sizeof(derivedPublicKey));
     }
 #endif
 
+    // Never remove the last persistent generation unless flash writes are
+    // currently safe. Refresh the physical battery sample at each destructive
+    // boundary instead of relying on a stale periodic status value.
+    if (!heltecDestructiveStoragePowerIsSafe()) {
+        LOG_ERROR("Factory reset refused: connect stable power or charge battery "
+                  "to at least %umV",
+                  HELTEC_V4_DESTRUCTIVE_STORAGE_MIN_MILLIVOLTS);
+        return false;
+    }
+
+    // Mount failures never auto-format on this board. A factory reset is the
+    // explicit destructive recovery path. Only the full device reset may erase
+    // the identity; the config-only reset promises to preserve it and therefore
+    // must fail while the persisted key is unavailable.
+    if (!fsIsMounted()) {
+        if (!eraseBleBonds) {
+            LOG_ERROR("Config reset refused: filesystem unavailable and identity cannot be preserved");
+            return false;
+        }
+    }
+
+    const HeltecResetPendingKind resetKind = eraseBleBonds ? HeltecResetPendingKind::FULL : HeltecResetPendingKind::CONFIG_ONLY;
+    bool markerReady = writeHeltecResetPendingMarker(resetKind, true);
+    bool nvsRebuildRequiresReboot = false;
+    if (!markerReady && eraseBleBonds && heltecDestructiveStoragePowerIsSafe()) {
+        LOG_WARN("Rebuilding unreadable NVS for explicit full reset");
+        markerReady = rebuildHeltecNvsForFullReset(initialMarkerKind, nvsRebuildRequiresReboot);
+    }
+    if (!markerReady) {
+        LOG_ERROR("Factory reset refused: pending marker could not be verified");
+        if (nvsRebuildRequiresReboot) {
+            // Rebuild preparation already quiesced transports and may have
+            // changed NVS or installed the secondary FULL intent. Do not
+            // reopen PhoneAPI/input against that transitional state.
+            keepDestructiveFenceUntilReboot = true;
+            scheduleHeltecRecoveryReboot();
+        }
+        return false;
+    }
+    // A verified reset marker supersedes any in-process settings edit. This is
+    // needed for the physical factory-reset recovery path, which deliberately
+    // remains available even if a client abandoned a bulk import.
+    preferenceEditOwnerTask.store(0, std::memory_order_release);
+    preferenceEditOwnerClient.store(0, std::memory_order_release);
+    preferenceEditRequiresDestructivePower.store(false, std::memory_order_release);
+    preferenceEditRadioParked.store(false, std::memory_order_release);
+    preferenceEditState.store(PreferenceEditState::NONE, std::memory_order_release);
+    keepDestructiveFenceUntilReboot = true;
+    if (nvsRebuildRequiresReboot) {
+        // nvs_flash_deinit()/erase()/init() invalidates handles owned by other
+        // components. Reboot with both recovery markers committed instead of
+        // continuing a multi-store reset in the same process.
+        LOG_WARN("NVS rebuilt; rebooting into guarded factory-reset recovery");
+        scheduleHeltecRecoveryReboot();
+        return false;
+    }
+    {
+        // Quiesce every transport and radio reader while the original config is
+        // still intact, before defaults can make availability predicates return
+        // false or replace NodeDB/config storage observed by another task.
+#if HAS_WIFI
+        deinitWifi();
+#endif
+        disableBluetooth();
+        config.lora.tx_enabled = false;
+#if !MESHTASTIC_EXCLUDE_GPS
+        if (gps)
+            gps->disable();
+#endif
+        if (!parkHeltecRadioForStorageMutation()) {
+            LOG_ERROR("Factory reset could not safely drain/park LoRa");
+            configDecodeFailed = true;
+            incompleteConfigResetDetected = !eraseBleBonds;
+            unreadablePreferenceSegments =
+                SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS | SEGMENT_NODEDATABASE;
+            forceHeltecLocalRecoveryConfiguration();
+            scheduleHeltecRecoveryReboot();
+            return false;
+        }
+    }
+    const auto abortHeltecReset = [&]() {
+        configDecodeFailed = true;
+        incompleteConfigResetDetected = !eraseBleBonds;
+        incompletePreferenceRestoreDetected = false;
+        incompleteNodeDatabaseResetDetected = false;
+        unreadablePreferenceSegments =
+            SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS | SEGMENT_NODEDATABASE;
+        forceHeltecLocalRecoveryConfiguration();
+#if !MESHTASTIC_EXCLUDE_GPS
+        if (gps)
+            gps->disable();
+#endif
+        if (router && router->getRadioIface())
+            router->getRadioIface()->sleep();
+        // A typed reset marker has already committed and transports are
+        // quiesced. Schedule a reboot independently of the caller while still
+        // reporting failure so it cannot acknowledge an incomplete reset.
+        scheduleHeltecRecoveryReboot();
+        return false;
+    };
+    if (eraseBleBonds || !fsIsMounted()) {
+        // A full factory reset is also a privacy boundary: XMODEM and modules
+        // can create data outside /prefs, so enumerating only today's known
+        // paths could leave identity exports or PSKs for the next owner. The
+        // durable NVS FULL marker survives this LittleFS format.
+        LOG_WARN(eraseBleBonds ? "Full factory reset formatting filesystem"
+                               : "Factory reset explicitly formatting unavailable filesystem");
+        if (!heltecDestructiveStoragePowerIsSafe() || !fsFormat()) {
+            LOG_ERROR("Factory reset aborted: filesystem format/remount failed");
+            return abortHeltecReset();
+        }
+    }
+#endif
+    // A full device reset remains explicitly destructive. On Heltec, a
+    // config-only reset leaves the old core files in place until SafeFile has
+    // atomically replaced every one, preserving identity if a write fails. Other
+    // targets retain their established reset sequence.
+    bool resetCleanupSucceeded = true;
+#if defined(HELTEC_V4_OLED)
+    if (!heltecDestructiveStoragePowerIsSafe()) {
+        LOG_ERROR("Factory reset refused: power changed before preference cleanup");
+        return abortHeltecReset();
+    }
+#endif
+    spiLock->lock();
+#ifdef FSCom
+    // Clear unrelated files before touching the sole preference generation.
+    // A failure here can still abort with identity/config fully intact.
+    if (FSCom.exists("/static/rangetest.csv") && !FSCom.remove("/static/rangetest.csv")) {
+        LOG_ERROR("Can't remove rangetest.csv");
+#if defined(HELTEC_V4_OLED)
+        resetCleanupSucceeded = false;
+#endif
+    }
+#if defined(HELTEC_V4_OLED)
+    // Full reset removes every recoverable copy before deleting the active
+    // preference generation.
+    if (resetCleanupSucceeded && eraseBleBonds && FSCom.exists("/backups")) {
+        resetCleanupSucceeded = removeHeltecPreferenceTreeChecked("/backups") && !FSCom.exists("/backups");
+        if (!resetCleanupSucceeded)
+            LOG_ERROR("Factory reset could not remove and verify preference backups");
+    }
+    if (resetCleanupSucceeded && eraseBleBonds)
+        resetCleanupSucceeded = removeHeltecPersistedUserContentChecked();
+#endif
+#endif
+
+    if (resetCleanupSucceeded && shouldRemovePreferencesBeforeFactoryDefaults(
+#if defined(HELTEC_V4_OLED)
+                                     true,
+#else
+                                     false,
+#endif
+                                     eraseBleBonds)) {
+        rmDir("/prefs"); // caller holds spiLock; rmDir/listDir deliberately do not
+                         // lock internally
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+        resetCleanupSucceeded = !FSCom.exists("/prefs");
+#endif
+    }
     spiLock->unlock();
+#if defined(HELTEC_V4_OLED)
+    if (!resetCleanupSucceeded && eraseBleBonds) {
+        // The typed FULL marker is already durable, so a malformed managed
+        // path (for example /backups created as a file) must not make recovery
+        // permanently unrepeatable. Finish the explicitly destructive reset
+        // with a verified format whether cleanup failed before or during the
+        // /prefs removal.
+        LOG_WARN("Factory reset preference cleanup incomplete; formatting filesystem");
+        resetCleanupSucceeded = heltecDestructiveStoragePowerIsSafe() && fsFormat();
+        if (resetCleanupSucceeded) {
+            // The NVS marker deliberately survives a LittleFS format.
+            resetCleanupSucceeded = readHeltecResetPendingMarker() == HeltecResetPendingKind::FULL;
+        }
+    }
+    if (!resetCleanupSucceeded) {
+        LOG_ERROR("Factory reset aborted: preference cleanup incomplete");
+        return abortHeltecReset();
+    }
+#endif
 
     // rmDir above nuked the .dat file, but TransmitHistory's in-memory
     // cache auto-flushes every 5 min and would resurrect it.
-    if (transmitHistory) {
-        transmitHistory->clear();
-    }
+    const bool transmitHistoryCleared = !transmitHistory || transmitHistory->clear(true);
+#if !defined(HELTEC_V4_OLED)
+    (void)transmitHistoryCleared;
+#endif
 #if HAS_SCREEN
-    messageStore.clearAllMessages();
+    const bool messagesCleared = messageStore.clearAllMessages(true);
+#else
+    const bool messagesCleared = true;
 #endif
 #if HAS_SCREEN && !MESHTASTIC_EXCLUDE_WAYPOINT
-    waypointStore.clearAllWaypoints();
+    const bool waypointsCleared = waypointStore.clearAllWaypoints(true);
+#else
+    const bool waypointsCleared = true;
+#endif
+#if defined(HELTEC_V4_OLED)
+    if (!transmitHistoryCleared || !messagesCleared || !waypointsCleared) {
+        LOG_ERROR("Factory reset failed to verify empty runtime stores");
+        return abortHeltecReset();
+    }
 #endif
 
 #if WARM_NODE_COUNT > 0
     // On nRF52840 the warm tier lives in raw flash outside /prefs, so rmDir
     // didn't touch it; clear it and persist the empty store.
     warmStore.clear();
-    warmStore.saveIfDirty();
+    warmStore.saveIfDirty(true);
 #endif
 #if HAS_TRAFFIC_MANAGEMENT
     // Factory reset forgets everything; TMM's RAM caches must not survive to resurrect
@@ -859,19 +1915,103 @@ bool NodeDB::factoryReset(bool eraseBleBonds)
         trafficManagementModule->purgeAll();
 #endif
 
+    // The old preference tree has now been removed or is about to be replaced
+    // atomically. Full reset may replace an unreadable identity; config-only
+    // reached here only with a valid identity and can repair channels/modules.
+    configDecodeFailed = false;
+
+    unreadablePreferenceSegments = 0; // this explicit reset is the recovery authorization
+    incompleteConfigResetDetected = false;
+    incompletePreferenceRestoreDetected = false;
+    incompleteNodeDatabaseResetDetected = false;
+    incompleteLegacyMigrationDetected = false;
+    localPosition = meshtastic_Position_init_default;
+    localPositionUpdatedSinceBoot = false;
+#if defined(HELTEC_V4_OLED)
+    // Reset every non-identity DeviceState field. Full reset starts with no
+    // identity at all; config-only restores only the NodeNum/public key pair it
+    // explicitly promises to retain, not old messages, remote pins or flags.
+    devicestate = meshtastic_DeviceState_init_default;
+    myNodeInfo.device_id.size = 0;
+    memset(myNodeInfo.device_id.bytes, 0, sizeof(myNodeInfo.device_id.bytes));
+    if (getDeviceId(myNodeInfo.device_id.bytes))
+        myNodeInfo.device_id.size = sizeof(myNodeInfo.device_id.bytes);
+    if (!eraseBleBonds) {
+        myNodeInfo.my_node_num = preservedNodeNum;
+        owner.public_key = preservedPublicKey;
+    }
+#endif
+
     // second, install default state (this will deal with the duplicate mac address issue)
     installDefaultNodeDatabase();
     installDefaultDeviceState();
-    installDefaultConfig(!eraseBleBonds); // Also preserve the private key if we're not erasing BLE bonds
+#if defined(HELTEC_V4_OLED)
+    // installDefaultDeviceState() normally retains a nonzero NodeNum, but make
+    // the config-reset identity invariant explicit at the final pre-save
+    // boundary so later default-state changes cannot silently undo it.
+    if (!eraseBleBonds) {
+        myNodeInfo.my_node_num = preservedNodeNum;
+        owner.public_key = preservedPublicKey;
+        snprintf(owner.id, sizeof(owner.id), "!%08x", preservedNodeNum);
+    }
+#endif
+    // A reset requested in the running application must not re-import network
+    // credentials merely because this boot followed an OTA update.
+    installDefaultConfig(!eraseBleBonds, false); // Also preserve the private key if we're not erasing BLE bonds
     installDefaultModuleConfig();
     installDefaultChannels();
     // third, write everything to disk
+#if defined(HELTEC_V4_OLED)
+    if (!saveToDisk()) {
+        LOG_ERROR("Factory reset failed to persist defaults");
+        return abortHeltecReset();
+    }
+    if (!eraseBleBonds) {
+        const bool nodeDatabaseRequired = owner.public_key.size == 32 || owner.is_licensed;
+        bool requiredFilesPresent = false;
+        {
+            concurrency::LockGuard guard(spiLock);
+            requiredFilesPresent = FSCom.exists(configFileName) && FSCom.exists(moduleConfigFileName) &&
+                                   FSCom.exists(deviceStateFileName) && FSCom.exists(channelFileName) &&
+                                   (!nodeDatabaseRequired || FSCom.exists(nodeDatabaseFileName));
+        }
+        if (!requiredFilesPresent || !removeHeltecPreferenceResidualsChecked(nodeDatabaseRequired, false)) {
+            LOG_ERROR("Config reset incomplete: auxiliary preferences remain");
+            return abortHeltecReset();
+        }
+    }
+#else
     saveToDisk();
+#endif
     if (eraseBleBonds) {
+#if defined(HELTEC_V4_OLED)
+        if (!heltecDestructiveStoragePowerIsSafe()) {
+            LOG_ERROR("Factory reset stopped: power changed before NVS erase");
+            return abortHeltecReset();
+        }
+#endif
         LOG_INFO("Erase BLE bonds");
 #ifdef ARCH_ESP32
-        // This will erase what's in NVS including ssl keys, persistent variables and ble pairing
-        nvs_flash_erase();
+#if defined(HELTEC_V4_OLED)
+        // Keep the committed full-reset marker intact while every other NVS
+        // namespace (BLE bonds, credentials and persistent variables) is
+        // erased and verified. A brownout therefore cannot erase the intent
+        // before the rest of the transaction has completed.
+#if HAS_WIFI
+        deinitWifi();
+#endif
+        disableBluetooth();
+        if (!eraseHeltecNvsExceptRecoveryMarker()) {
+            LOG_ERROR("Factory reset failed to erase and verify NVS");
+            return abortHeltecReset();
+        }
+#else
+        const esp_err_t nvsEraseResult = nvs_flash_erase();
+        if (nvsEraseResult != ESP_OK) {
+            LOG_ERROR("Factory reset failed to erase NVS: %d", nvsEraseResult);
+            return false;
+        }
+#endif
 #endif
 
 #ifdef ARCH_NRF52
@@ -882,6 +2022,23 @@ bool NodeDB::factoryReset(bool eraseBleBonds)
         Bluefruit.Central.clearBonds();
 #endif
     }
+#if defined(HELTEC_V4_OLED)
+    if (!heltecDestructiveStoragePowerIsSafe()) {
+        LOG_ERROR("Factory reset stopped: power changed before final commit");
+        return abortHeltecReset();
+    }
+    if (eraseBleBonds && !clearHeltecNvsRebuildPendingFile()) {
+        LOG_ERROR("Factory reset completed but secondary pending marker could not be cleared");
+        return abortHeltecReset();
+    }
+    if (!clearHeltecResetPendingMarker(resetKind, true)) {
+        LOG_ERROR("Factory reset completed but pending marker could not be cleared");
+        // The replacement preferences and (for a full reset) NVS cleanup are
+        // already committed. Reboot into marker-controlled recovery instead
+        // of continuing to run with a half-finalized transaction.
+        return abortHeltecReset();
+    }
+#endif
     return true;
 }
 
@@ -889,7 +2046,14 @@ void NodeDB::installDefaultNodeDatabase()
 {
     LOG_DEBUG("Install default NodeDatabase");
     nodeDatabase.version = DEVICESTATE_CUR_VER;
+#if defined(HELTEC_V4_OLED)
+    if (nodeDatabase.nodes.size() == MAX_NUM_NODES)
+        std::fill(nodeDatabase.nodes.begin(), nodeDatabase.nodes.end(), meshtastic_NodeInfoLite());
+    else
+        nodeDatabase.nodes.assign(MAX_NUM_NODES, meshtastic_NodeInfoLite());
+#else
     nodeDatabase.nodes = std::vector<meshtastic_NodeInfoLite>(MAX_NUM_NODES);
+#endif
     numMeshNodes = 0;
     meshNodes = &nodeDatabase.nodes;
     concurrency::LockGuard satelliteGuard(&satelliteMutex);
@@ -910,7 +2074,7 @@ void NodeDB::installDefaultNodeDatabase()
 #endif
 }
 
-void NodeDB::installDefaultConfig(bool preserveKey = false)
+void NodeDB::installDefaultConfig(bool preserveKey, bool recoverOtaNetwork)
 {
     uint8_t private_key_temp[32];
     bool shouldPreserveKey = preserveKey && config.has_security && config.security.private_key.size == 32;
@@ -1209,14 +2373,17 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
 #endif
 
 #if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_WIFI
-    if (MeshtasticOTA::isUpdated()) {
+    if (recoverOtaNetwork && MeshtasticOTA::isUpdated()) {
         MeshtasticOTA::recoverConfig(&config.network);
     }
 #endif
 
 #ifdef USERPREFS_CONFIG_DEVICE_ROLE
     // Apply role-specific defaults when role is set via user preferences
-    installRoleDefaults(config.device.role);
+    // Boot-time defaults must not reinterpret an explicitly configured owner
+    // flag as residue from a role transition. Passing the same role preserves
+    // the persisted owner semantics; real role changes pass the old role.
+    installRoleDefaults(config.device.role, config.device.role);
 #endif
 
 #ifdef USERPREFS_CONFIG_DEVICE_REBROADCAST_MODE
@@ -1595,8 +2762,168 @@ void NodeDB::installDefaultModuleConfig()
     initModuleConfigIntervals();
 }
 
-void NodeDB::installRoleDefaults(meshtastic_Config_DeviceConfig_Role role)
+void NodeDB::installRoleDefaults(meshtastic_Config_DeviceConfig_Role role, meshtastic_Config_DeviceConfig_Role previousRole)
 {
+    // Role presets are not user preferences: when leaving a role, undo only
+    // values that still equal that role's forced value. A field customized
+    // after the role was selected is preserved byte-for-byte.
+    if (role != previousRole) {
+        const auto resetIfStillForced = [](auto &field, const auto forcedValue, const auto replacement) {
+            if (field == forcedValue)
+                field = replacement;
+        };
+
+#ifdef USERPREFS_CONFIG_GPS_UPDATE_INTERVAL
+        constexpr uint32_t routerGpsUpdateInterval = USERPREFS_CONFIG_GPS_UPDATE_INTERVAL;
+        constexpr uint32_t normalGpsUpdateInterval = USERPREFS_CONFIG_GPS_UPDATE_INTERVAL;
+#else
+        constexpr uint32_t routerGpsUpdateInterval = ONE_DAY;
+        constexpr uint32_t normalGpsUpdateInterval = 2 * 60;
+#endif
+#ifdef USERPREFS_CONFIG_POSITION_BROADCAST_INTERVAL
+        constexpr uint32_t routerPositionBroadcastInterval = USERPREFS_CONFIG_POSITION_BROADCAST_INTERVAL;
+        constexpr uint32_t normalPositionBroadcastInterval = USERPREFS_CONFIG_POSITION_BROADCAST_INTERVAL;
+#else
+        constexpr uint32_t routerPositionBroadcastInterval = ONE_DAY / 2;
+        constexpr uint32_t normalPositionBroadcastInterval = 60 * 60;
+#endif
+#ifdef USERPREFS_CONFIG_SMART_POSITION_ENABLED
+        constexpr bool normalSmartPositionEnabled = USERPREFS_CONFIG_SMART_POSITION_ENABLED;
+#else
+        constexpr bool normalSmartPositionEnabled = true;
+#endif
+#ifdef USERPREFS_CONFIG_DEVICE_TELEM_UPDATE_INTERVAL
+        constexpr uint32_t normalDeviceTelemetryInterval = USERPREFS_CONFIG_DEVICE_TELEM_UPDATE_INTERVAL;
+#else
+        constexpr uint32_t normalDeviceTelemetryInterval = MAX_INTERVAL;
+#endif
+#ifdef USERPREFS_CONFIG_ENVIRONMENT_MEASUREMENT_ENABLED
+        constexpr bool normalEnvironmentMeasurementEnabled = USERPREFS_CONFIG_ENVIRONMENT_MEASUREMENT_ENABLED;
+#else
+        constexpr bool normalEnvironmentMeasurementEnabled = false;
+#endif
+#ifdef USERPREFS_CONFIG_ENV_TELEM_UPDATE_INTERVAL
+        constexpr uint32_t normalEnvironmentTelemetryInterval = USERPREFS_CONFIG_ENV_TELEM_UPDATE_INTERVAL;
+#else
+        constexpr uint32_t normalEnvironmentTelemetryInterval = 0;
+#endif
+#ifdef USERPREFS_CONFIG_AQ_TELEM_UPDATE_INTERVAL
+        constexpr uint32_t normalAirQualityTelemetryInterval = USERPREFS_CONFIG_AQ_TELEM_UPDATE_INTERVAL;
+#else
+        constexpr uint32_t normalAirQualityTelemetryInterval = 0;
+#endif
+#ifdef USE_POWERSAVE
+        constexpr uint32_t routerWaitBluetoothInterval = 30;
+        constexpr uint32_t routerScreenOnInterval = 30;
+        constexpr uint32_t normalWaitBluetoothInterval = 30;
+        constexpr uint32_t normalScreenOnInterval = 30;
+#else
+        constexpr uint32_t routerWaitBluetoothInterval = 1;
+        constexpr uint32_t routerScreenOnInterval = 1;
+        constexpr uint32_t normalWaitBluetoothInterval = 60;
+        constexpr uint32_t normalScreenOnInterval = 60 * 10;
+#endif
+        constexpr uint32_t normalPositionFlags =
+            meshtastic_Config_PositionConfig_PositionFlags_ALTITUDE |
+            meshtastic_Config_PositionConfig_PositionFlags_ALTITUDE_MSL | meshtastic_Config_PositionConfig_PositionFlags_SPEED |
+            meshtastic_Config_PositionConfig_PositionFlags_HEADING | meshtastic_Config_PositionConfig_PositionFlags_DOP |
+            meshtastic_Config_PositionConfig_PositionFlags_SATINVIEW;
+        constexpr uint32_t takPositionFlags =
+            meshtastic_Config_PositionConfig_PositionFlags_ALTITUDE | meshtastic_Config_PositionConfig_PositionFlags_SPEED |
+            meshtastic_Config_PositionConfig_PositionFlags_HEADING | meshtastic_Config_PositionConfig_PositionFlags_DOP;
+
+        switch (previousRole) {
+        case meshtastic_Config_DeviceConfig_Role_ROUTER:
+            resetIfStillForced(config.device.rebroadcast_mode, meshtastic_Config_DeviceConfig_RebroadcastMode_CORE_PORTNUMS_ONLY,
+                               meshtastic_Config_DeviceConfig_RebroadcastMode_ALL);
+            resetIfStillForced(config.position.gps_update_interval, routerGpsUpdateInterval, normalGpsUpdateInterval);
+            resetIfStillForced(config.position.position_broadcast_secs, routerPositionBroadcastInterval,
+                               normalPositionBroadcastInterval);
+            resetIfStillForced(config.power.ls_secs, static_cast<uint32_t>(ONE_DAY), uint32_t{5 * 60});
+            resetIfStillForced(config.power.sds_secs, static_cast<uint32_t>(ONE_DAY), UINT32_MAX);
+            resetIfStillForced(config.power.wait_bluetooth_secs, routerWaitBluetoothInterval, normalWaitBluetoothInterval);
+            resetIfStillForced(config.display.screen_on_secs, routerScreenOnInterval, normalScreenOnInterval);
+            resetIfStillForced(moduleConfig.telemetry.device_update_interval, static_cast<uint32_t>(ONE_DAY / 2),
+                               normalDeviceTelemetryInterval);
+            break;
+        case meshtastic_Config_DeviceConfig_Role_ROUTER_LATE:
+            resetIfStillForced(moduleConfig.telemetry.device_update_interval, static_cast<uint32_t>(ONE_DAY),
+                               normalDeviceTelemetryInterval);
+            break;
+        case meshtastic_Config_DeviceConfig_Role_SENSOR:
+            resetIfStillForced(moduleConfig.telemetry.device_update_interval, uint32_t{60 * 60}, normalDeviceTelemetryInterval);
+            resetIfStillForced(moduleConfig.telemetry.environment_measurement_enabled, true, normalEnvironmentMeasurementEnabled);
+            resetIfStillForced(moduleConfig.telemetry.environment_update_interval, uint32_t{300},
+                               normalEnvironmentTelemetryInterval);
+            break;
+        case meshtastic_Config_DeviceConfig_Role_TRACKER:
+            resetIfStillForced(moduleConfig.telemetry.device_update_interval, uint32_t{60 * 60}, normalDeviceTelemetryInterval);
+            break;
+        case meshtastic_Config_DeviceConfig_Role_TAK_TRACKER:
+            resetIfStillForced(config.device.node_info_broadcast_secs, static_cast<uint32_t>(ONE_DAY), uint32_t{3 * 60 * 60});
+            resetIfStillForced(config.position.position_broadcast_smart_enabled, true, normalSmartPositionEnabled);
+            resetIfStillForced(config.position.position_broadcast_secs, uint32_t{3 * 60}, normalPositionBroadcastInterval);
+            resetIfStillForced(config.position.broadcast_smart_minimum_distance, uint32_t{20}, uint32_t{100});
+            resetIfStillForced(config.position.broadcast_smart_minimum_interval_secs, uint32_t{15}, uint32_t{5 * 60});
+            resetIfStillForced(config.position.position_flags, takPositionFlags, normalPositionFlags);
+            resetIfStillForced(moduleConfig.telemetry.device_update_interval, static_cast<uint32_t>(ONE_DAY),
+                               normalDeviceTelemetryInterval);
+            break;
+        case meshtastic_Config_DeviceConfig_Role_TAK:
+            resetIfStillForced(config.device.node_info_broadcast_secs, static_cast<uint32_t>(ONE_DAY), uint32_t{3 * 60 * 60});
+            resetIfStillForced(config.position.position_broadcast_smart_enabled, false, normalSmartPositionEnabled);
+            resetIfStillForced(config.position.position_broadcast_secs, static_cast<uint32_t>(ONE_DAY),
+                               normalPositionBroadcastInterval);
+            resetIfStillForced(config.position.position_flags, takPositionFlags, normalPositionFlags);
+            resetIfStillForced(moduleConfig.telemetry.device_update_interval, static_cast<uint32_t>(ONE_DAY),
+                               normalDeviceTelemetryInterval);
+            break;
+        case meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND:
+            resetIfStillForced(config.position.position_broadcast_smart_enabled, false, normalSmartPositionEnabled);
+            resetIfStillForced(config.position.position_broadcast_secs, uint32_t{300}, normalPositionBroadcastInterval);
+            break;
+        case meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN:
+            resetIfStillForced(config.device.rebroadcast_mode, meshtastic_Config_DeviceConfig_RebroadcastMode_LOCAL_ONLY,
+                               meshtastic_Config_DeviceConfig_RebroadcastMode_ALL);
+            resetIfStillForced(config.device.node_info_broadcast_secs, static_cast<uint32_t>(MAX_INTERVAL),
+                               uint32_t{3 * 60 * 60});
+            resetIfStillForced(config.position.position_broadcast_smart_enabled, false, normalSmartPositionEnabled);
+            resetIfStillForced(config.position.position_broadcast_secs, static_cast<uint32_t>(MAX_INTERVAL),
+                               normalPositionBroadcastInterval);
+            resetIfStillForced(moduleConfig.neighbor_info.update_interval, static_cast<uint32_t>(MAX_INTERVAL), uint32_t{0});
+            resetIfStillForced(moduleConfig.telemetry.device_update_interval, static_cast<uint32_t>(MAX_INTERVAL),
+                               normalDeviceTelemetryInterval);
+            resetIfStillForced(moduleConfig.telemetry.environment_update_interval, static_cast<uint32_t>(MAX_INTERVAL),
+                               normalEnvironmentTelemetryInterval);
+            resetIfStillForced(moduleConfig.telemetry.air_quality_interval, static_cast<uint32_t>(MAX_INTERVAL),
+                               normalAirQualityTelemetryInterval);
+            resetIfStillForced(moduleConfig.telemetry.health_update_interval, static_cast<uint32_t>(MAX_INTERVAL), uint32_t{0});
+            break;
+        default:
+            break;
+        }
+    }
+
+    const bool previousRoleForcedUnmessagable =
+        IS_ONE_OF(previousRole, meshtastic_Config_DeviceConfig_Role_ROUTER, meshtastic_Config_DeviceConfig_Role_ROUTER_LATE,
+                  meshtastic_Config_DeviceConfig_Role_SENSOR, meshtastic_Config_DeviceConfig_Role_TRACKER,
+                  meshtastic_Config_DeviceConfig_Role_TAK_TRACKER);
+    const bool newRoleSupportsMessaging =
+        IS_ONE_OF(role, meshtastic_Config_DeviceConfig_Role_CLIENT, meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE,
+                  meshtastic_Config_DeviceConfig_Role_CLIENT_BASE, meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN,
+                  meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND, meshtastic_Config_DeviceConfig_Role_TAK);
+
+    // Infrastructure/tracker defaults mark the owner as unavailable for
+    // messaging. Clear that derived value when the same device returns to a
+    // messaging role; otherwise the old role silently remains sticky. Do this
+    // only on an actual transition, never on boot, so an explicit user choice
+    // in a messaging role remains intact.
+    if (role != previousRole && previousRoleForcedUnmessagable && newRoleSupportsMessaging && owner.has_is_unmessagable &&
+        owner.is_unmessagable) {
+        owner.has_is_unmessagable = true;
+        owner.is_unmessagable = false;
+    }
+
     if (role == meshtastic_Config_DeviceConfig_Role_ROUTER) {
         initConfigIntervals();
         initModuleConfigIntervals();
@@ -1654,6 +2981,15 @@ void NodeDB::installRoleDefaults(meshtastic_Config_DeviceConfig_Role role)
         moduleConfig.telemetry.air_quality_interval = MAX_INTERVAL;
         moduleConfig.telemetry.health_update_interval = MAX_INTERVAL;
     }
+
+    if (role != previousRole) {
+        // owner.role and the local slim-node cache are what NodeInfo sends.
+        // Updating only config.device.role leaves the old role visible until a
+        // reboot (and can persist it when a bulk transaction writes NodeDB).
+        owner.role = role;
+        if (configLoadComplete)
+            updateUser(getNodeNum(), owner, 0, false, false);
+    }
 }
 
 void NodeDB::initModuleConfigIntervals()
@@ -1706,8 +3042,95 @@ void NodeDB::installDefaultChannels()
     channelFile.version = DEVICESTATE_CUR_VER;
 }
 
-void NodeDB::resetNodes(bool keepFavorites)
+bool NodeDB::resetNodes(bool keepFavorites)
 {
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (rebootAtMsec != 0 || shutdownAtMsec != 0) {
+        LOG_ERROR("Node database reset refused while reboot/shutdown is pending");
+        return false;
+    }
+    bool expectedInactive = false;
+    if (!destructiveStorageMutationActive.compare_exchange_strong(expectedInactive, true, std::memory_order_acq_rel)) {
+        LOG_ERROR("Node database reset refused while another destructive operation is active");
+        return false;
+    }
+    destructiveStorageOwnerTask.store(reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle()), std::memory_order_release);
+    bool keepDestructiveFenceUntilReboot = false;
+    struct NodeResetActivityGuard {
+        std::atomic<bool> &flag;
+        std::atomic<uintptr_t> &owner;
+        bool &keepUntilReboot;
+        ~NodeResetActivityGuard()
+        {
+            owner.store(0, std::memory_order_release);
+            if (!keepUntilReboot)
+                flag.store(false, std::memory_order_release);
+        }
+    } activityGuard{destructiveStorageMutationActive, destructiveStorageOwnerTask, keepDestructiveFenceUntilReboot};
+    if (!waitForExternalStateReaders()) {
+        LOG_ERROR("Node database reset refused while a PhoneAPI/HTTP state reader is active");
+        return false;
+    }
+    concurrency::LockGuard transactionGuard(&heltecPreferencesTransactionLock);
+    if (isPreferenceEditTransactionActive()) {
+        LOG_ERROR("Node database reset refused while a settings edit is open");
+        return false;
+    }
+    HeltecXModemStorageGuard xmodemGuard;
+    if (!xmodemGuard) {
+        LOG_ERROR("Node database reset refused while XMODEM transfer is active");
+        return false;
+    }
+    if (requiresConfigRecovery() && !canResetNodesForRecovery()) {
+        LOG_ERROR("Node database reset refused during unrelated recovery");
+        return false;
+    }
+    const HeltecResetPendingKind pendingKind = readHeltecResetPendingMarker();
+    if (pendingKind != HeltecResetPendingKind::NONE && pendingKind != HeltecResetPendingKind::NODEDB_RESET) {
+        LOG_ERROR("Node database reset refused while another recovery transaction is active");
+        return false;
+    }
+    if (!heltecDestructiveStoragePowerIsSafe()) {
+        LOG_ERROR("Node database reset refused: connect stable power or charge the battery");
+        return false;
+    }
+    if (!writeHeltecResetPendingMarker(HeltecResetPendingKind::NODEDB_RESET, true)) {
+        LOG_ERROR("Node database reset refused: durable intent could not be verified");
+        return false;
+    }
+    keepDestructiveFenceUntilReboot = true;
+    incompleteNodeDatabaseResetDetected = true;
+#if HAS_WIFI
+    deinitWifi();
+#endif
+    disableBluetooth();
+#if !MESHTASTIC_EXCLUDE_GPS
+    if (gps)
+        gps->disable();
+#endif
+    if (!parkHeltecRadioForStorageMutation()) {
+        LOG_ERROR("Node database reset could not safely drain/park LoRa");
+        incompleteNodeDatabaseResetDetected = true;
+        unreadablePreferenceSegments |= SEGMENT_NODEDATABASE;
+        forceHeltecLocalRecoveryConfiguration();
+        scheduleHeltecRecoveryReboot();
+        return false;
+    }
+#endif
+    const auto abortNodeDatabaseReset = [&]() {
+#if defined(HELTEC_V4_OLED)
+        incompleteNodeDatabaseResetDetected = true;
+        unreadablePreferenceSegments |= SEGMENT_NODEDATABASE;
+        forceHeltecLocalRecoveryConfiguration();
+        (void)parkHeltecRadioForStorageMutation();
+        scheduleHeltecRecoveryReboot();
+#endif
+        return false;
+    };
+    const int previousUnreadableSegments = unreadablePreferenceSegments;
+    // This command is explicit authorization to replace only nodes.proto. Any
+    // independently unreadable DeviceState remains protected below.
+    unreadablePreferenceSegments &= ~SEGMENT_NODEDATABASE;
     if (!config.position.fixed_position)
         clearLocalPosition();
     NodeNum ourNum = getNodeNum();
@@ -1747,13 +3170,66 @@ void NodeDB::resetNodes(bool keepFavorites)
 #endif
 
     devicestate.has_rx_waypoint = false;
-    saveNodeDatabaseToDisk();
-    saveDeviceStateToDisk();
+    bool nodeDatabaseSaved = false;
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (owner.public_key.size == 32 || owner.is_licensed) {
+        nodeDatabaseSaved = saveNodeDatabaseToDisk();
+    } else {
+        concurrency::LockGuard guard(spiLock);
+        String temporaryPath = nodeDatabaseFileName;
+        temporaryPath += ".tmp";
+        nodeDatabaseSaved = removeHeltecFileChecked(nodeDatabaseFileName) && removeHeltecFileChecked(temporaryPath.c_str()) &&
+                            !FSCom.exists(nodeDatabaseFileName) && !FSCom.exists(temporaryPath.c_str());
+    }
+#else
+    nodeDatabaseSaved = saveNodeDatabaseToDisk();
+#endif
+    const bool deviceStateSaved = saveDeviceStateToDisk();
+#if WARM_NODE_COUNT > 0
+    // Covers the no-key path above, where nodes.proto is removed rather than
+    // saveNodeDatabaseToDisk() being called.
+    const bool warmStoreSaved = warmStore.saveIfDirty(true);
+#else
+    const bool warmStoreSaved = true;
+#endif
+    if (!nodeDatabaseSaved) {
+        unreadablePreferenceSegments = previousUnreadableSegments;
+    }
     if (neighborInfoModule && moduleConfig.neighbor_info.enabled)
         neighborInfoModule->resetNeighbors();
+    const bool resetSaved = nodeDatabaseSaved && deviceStateSaved && warmStoreSaved;
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (!resetSaved || !heltecDestructiveStoragePowerIsSafe() ||
+        !clearHeltecResetPendingMarker(HeltecResetPendingKind::NODEDB_RESET, true)) {
+        LOG_ERROR("Node database reset did not reach its final commit point");
+        return abortNodeDatabaseReset();
+    }
+    incompleteNodeDatabaseResetDetected = false;
+    // The reset is now durably committed and its marker is gone. Arm the
+    // ordinary reboot only at this final point; failure paths independently
+    // schedule the marker-controlled recovery reboot.
+    rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 1000;
+#endif
+    return resetSaved;
 }
 
-void NodeDB::removeNodeByNum(NodeNum nodeNum)
+bool NodeDB::canResetNodesForRecovery() const
+{
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    const HeltecResetPendingKind pendingKind = readHeltecResetPendingMarker();
+    const bool noUnrelatedUnreadableSegments = (unreadablePreferenceSegments & ~SEGMENT_NODEDATABASE) == 0;
+    const bool retryingInterruptedReset =
+        incompleteNodeDatabaseResetDetected && pendingKind == HeltecResetPendingKind::NODEDB_RESET;
+    const bool repairingIsolatedNodeDatabase =
+        unreadablePreferenceSegments == SEGMENT_NODEDATABASE && pendingKind == HeltecResetPendingKind::NONE;
+    return noUnrelatedUnreadableSegments && !incompleteConfigResetDetected && !incompletePreferenceRestoreDetected &&
+           (retryingInterruptedReset || repairingIsolatedNodeDatabase);
+#else
+    return true;
+#endif
+}
+
+bool NodeDB::removeNodeByNum(NodeNum nodeNum, bool persist)
 {
     int newPos = 0, removed = 0;
     for (int i = 0; i < numMeshNodes; i++) {
@@ -1784,8 +3260,8 @@ void NodeDB::removeNodeByNum(NodeNum nodeNum)
         trafficManagementModule->purgeNode(nodeNum);
 #endif
 
-    LOG_DEBUG("NodeDB::removeNodeByNum purged %d entries, saving", removed);
-    saveNodeDatabaseToDisk();
+    LOG_DEBUG("NodeDB::removeNodeByNum purged %d entries%s", removed, persist ? ", saving" : "");
+    return !persist || saveNodeDatabaseToDisk();
 }
 
 void NodeDB::clearLocalPosition()
@@ -2138,6 +3614,11 @@ void NodeDB::pickNewNodeNum()
 LoadFileResult NodeDB::loadProto(const char *filename, size_t protoSize, size_t objSize, const pb_msgdesc_t *fields,
                                  void *dest_struct)
 {
+    if (!shouldUseFilesystemPersistence(fsIsMounted())) {
+        LOG_ERROR("Filesystem unavailable while loading %s", filename);
+        return LoadFileResult::NO_FILESYSTEM;
+    }
+
     LoadFileResult state = LoadFileResult::OTHER_FAILURE;
 
 #ifdef MESHTASTIC_ENCRYPTED_STORAGE
@@ -2149,6 +3630,7 @@ LoadFileResult NodeDB::loadProto(const char *filename, size_t protoSize, size_t 
         auto decBuf = meshtastic_security::make_zeroizing_array(protoSize);
         if (!decBuf) {
             LOG_ERROR("OOM decrypting %s", filename);
+            storageCorruptThisLoad = true;
             return LoadFileResult::OTHER_FAILURE;
         }
         size_t decLen = 0;
@@ -2176,6 +3658,11 @@ LoadFileResult NodeDB::loadProto(const char *filename, size_t protoSize, size_t 
 
 #ifdef FSCom
     concurrency::LockGuard g(spiLock);
+
+    if (!FSCom.exists(filename)) {
+        LOG_INFO("File not found: %s", filename);
+        return LoadFileResult::NOT_FOUND;
+    }
 
     auto f = FSCom.open(filename, FILE_O_READ);
 
@@ -2242,13 +3729,14 @@ void NodeDB::demoteOldestHotNodesToWarm()
 }
 #endif
 
-void NodeDB::nodeDBSelfCare()
+void NodeDB::nodeDBSelfCare(bool persistRepair)
 {
     if (!meshNodes)
         return;
 
     const NodeNum self = getNodeNum();
-    const bool nodesOverCap = numMeshNodes > MAX_NUM_NODES;
+    bool nodesOverCap = numMeshNodes > MAX_NUM_NODES;
+    bool selfHealed = false;
 
     // Confirm self is present and its key matches what we just (re)derived. A
     // non-empty DB that doesn't contain us means a foreign/over-cap or corrupt
@@ -2261,11 +3749,27 @@ void NodeDB::nodeDBSelfCare()
         LOG_WARN("NodeDB self-care: self 0x%08x key mismatch, refreshing", (unsigned)self);
     }
 
+    // Self has absolute priority over every remote, including a malformed
+    // legacy database filled entirely with protected remotes. Append one
+    // temporary overflow slot directly (getOrCreateMeshNode correctly refuses
+    // to evict protected nodes), pin it at index zero, then let the normal warm
+    // demotion logic choose the remote that leaves the hot tier.
+    if (!selfNode) {
+        if (static_cast<size_t>(numMeshNodes) >= meshNodes->size())
+            meshNodes->resize(static_cast<size_t>(numMeshNodes) + 1);
+        selfNode = &meshNodes->at(numMeshNodes++);
+        *selfNode = meshtastic_NodeInfoLite_init_default;
+        selfNode->num = self;
+        selfHealed = true;
+        nodesOverCap = numMeshNodes > MAX_NUM_NODES;
+    }
+
     // Maintenance that must never touch self. Pin self to index 0 first so
     // the positional demote/eviction scans (which skip index 0) provably exclude
     // us, wherever the loaded file happened to place our row.
     if (selfNode && numMeshNodes > 0 && selfNode != &meshNodes->at(0)) {
         std::swap(meshNodes->at(0), *selfNode);
+        selfHealed = true;
     }
 
 #if WARM_NODE_COUNT > 0
@@ -2287,8 +3791,11 @@ void NodeDB::nodeDBSelfCare()
     // Ensure self exists, sits at index 0, and carries current owner info - after
     // any demotion has freed a slot. Covers the foreign/fixture case where the
     // loaded file did not contain us at all.
-    meshtastic_NodeInfoLite *info = getOrCreateMeshNode(self);
+    meshtastic_NodeInfoLite *info = getMeshNode(self);
     if (info) {
+        if (owner.public_key.size == 32 &&
+            (info->public_key.size != 32 || memcmp(info->public_key.bytes, owner.public_key.bytes, 32) != 0))
+            selfHealed = true;
         TypeConversions::CopyUserToNodeInfoLite(info, owner);
         if (info != &meshNodes->at(0))
             std::swap(meshNodes->at(0), *info);
@@ -2303,18 +3810,31 @@ void NodeDB::nodeDBSelfCare()
     const bool storageLocked = false;
 #endif
 
-    if ((nodesOverCap || satsTrimmed) && !storageLocked) {
-        LOG_MIGRATION("NodeDB self-care: healed store (nodes-over-cap:%s sats-trimmed:%s); rewriting nodes.proto once",
-                      nodesOverCap ? "yes" : "no", satsTrimmed ? "yes" : "no");
-        saveNodeDatabaseToDisk();
-#if WARM_NODE_COUNT > 0
-        warmStore.saveIfDirty();
+    if (persistRepair && (nodesOverCap || satsTrimmed || selfHealed) && !storageLocked) {
+        LOG_MIGRATION("NodeDB self-care: healed store (nodes-over-cap:%s sats-trimmed:%s self:%s); rewriting nodes.proto once",
+                      nodesOverCap ? "yes" : "no", satsTrimmed ? "yes" : "no", selfHealed ? "yes" : "no");
+        const bool nodeDatabaseSaved = saveNodeDatabaseToDisk();
+#if WARM_NODE_COUNT > 0 && !defined(HELTEC_V4_OLED)
+        // Heltec commits the hot and warm tiers together inside
+        // saveNodeDatabaseToDisk(); do not flush warm.dat a second time after
+        // a rejected/failed hot-generation save.
+        if (nodeDatabaseSaved)
+            warmStore.saveIfDirty();
+#else
+        (void)nodeDatabaseSaved;
 #endif
     }
 }
 
 void NodeDB::loadFromDisk()
 {
+    bootInitializationInProgress = true;
+    bootDeferredPreferenceSegments = 0;
+    struct BootPreferenceScanGuard {
+        bool &active;
+        ~BootPreferenceScanGuard() { active = false; }
+    } bootPreferenceScanGuard{bootInitializationInProgress};
+
     // Mark the current device state as completely unusable, so that if we fail reading the entire file from
     // disk we will still factoryReset to restore things.
     devicestate.version = 0;
@@ -2324,23 +3844,182 @@ void NodeDB::loadFromDisk()
     // reloadFromDisk to surface storage corruption to the operator instead
     // of silently falling back to defaults.
     storageCorruptThisLoad = false;
+    encryptedStorageLockedPlaceholder = false;
 #endif
 
     migrationSavePending = false;
+    legacyPreferencesPendingCleanup = false;
+    incompleteLegacyMigrationDetected = false;
     configDecodeFailed = false;
+    unreadablePreferenceSegments = 0;
+    incompleteConfigResetDetected = false;
+    incompletePreferenceRestoreDetected = false;
+    incompleteNodeDatabaseResetDetected = false;
     configLoadComplete = false;
 
-#if !USERPREFS_EVENT_MODE
-#ifdef FSCom
-    const char *eventProfileFiles[] = {EVENT_CONFIG_FILE_NAME, EVENT_CHANNEL_FILE_NAME, EVENT_BACKUP_FILE_NAME};
-    spiLock->lock();
-    for (const char *filename : eventProfileFiles) {
-        if (FSCom.exists(filename) && !FSCom.remove(filename))
-            LOG_WARN("Can't remove stale event profile file %s", filename);
+    if (!shouldUseFilesystemPersistence(fsIsMounted())) {
+        // Keep the on-disk identity and preferences untouched after a transient mount failure. In-memory
+        // defaults leave BLE available for recovery, while UNSET prevents any radio traffic under a
+        // provisional identity. A later clean boot gets a fresh mount attempt and can load the real prefs.
+        LOG_ERROR("NodeDB: filesystem unavailable - boot degraded without persistence or radio");
+        configDecodeFailed = true;
+        unreadablePreferenceSegments =
+            SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS | SEGMENT_NODEDATABASE;
+        installDefaultNodeDatabase();
+        installDefaultDeviceState();
+        installDefaultConfig(false, false);
+        installDefaultModuleConfig();
+        installDefaultChannels();
+        forceHeltecLocalRecoveryConfiguration();
+        configLoadComplete = true;
+        return;
     }
-    spiLock->unlock();
+
+    // A missing file is a valid first-boot condition only when no core
+    // generation exists at all. If any peer file (or an interrupted SafeFile
+    // temporary) remains, defaulting a missing config/channel could silently
+    // replace identity or transmit on the public default PSK.
+    bool persistedCoreGenerationPresent = false;
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    bool nodeDatabaseMissingFromPersistedGeneration = false;
 #endif
+#if USERPREFS_EVENT_MODE
+    // Kept through the later config/channel reads. A clean first event boot
+    // legitimately has neither active event file; all other missing-member
+    // combinations are a torn generation and remain fail-closed.
+    bool eventProfileFirstUse = false;
 #endif
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    {
+        concurrency::LockGuard guard(spiLock);
+        const auto activeFileExists = [](const char *path) { return FSCom.exists(path); };
+        const auto generationEvidenceExists = [&activeFileExists](const char *path) {
+            String temporaryPath = path;
+            temporaryPath += ".tmp";
+            return activeFileExists(path) || FSCom.exists(temporaryPath.c_str());
+        };
+
+        bool configPresent = activeFileExists(configFileName);
+        bool channelsPresent = activeFileExists(channelFileName);
+#if USERPREFS_EVENT_MODE
+        String eventConfigTemporary = configFileName;
+        eventConfigTemporary += ".tmp";
+        String eventChannelsTemporary = channelFileName;
+        eventChannelsTemporary += ".tmp";
+        String eventBackupTemporary = backupFileName;
+        eventBackupTemporary += ".tmp";
+        eventProfileFirstUse = isCleanEventProfileFirstUse(
+            configPresent, channelsPresent, activeFileExists(backupFileName), activeFileExists(eventConfigTemporary.c_str()),
+            activeFileExists(eventChannelsTemporary.c_str()), activeFileExists(eventBackupTemporary.c_str()),
+            activeFileExists(STANDARD_CONFIG_FILE_NAME));
+
+        // First use of an event build deliberately seeds config from the
+        // standard profile and creates fresh event channels. Treat the pair as
+        // absent together only in that exact clean state. Either member (or a
+        // .tmp) on its own is evidence of a torn event generation and must
+        // remain fail-closed.
+        if (eventProfileFirstUse) {
+            configPresent = true;
+            channelsPresent = true;
+        }
+#endif
+        const bool moduleConfigPresent = activeFileExists(moduleConfigFileName);
+        const bool deviceStatePresent = activeFileExists(deviceStateFileName);
+        const bool nodeDatabasePresent = activeFileExists(nodeDatabaseFileName);
+
+        // An interrupted SafeFile temporary proves this is not a pristine
+        // first boot, but it is not an active segment and cannot satisfy the
+        // per-file completeness check below.
+        persistedCoreGenerationPresent =
+            generationEvidenceExists(configFileName) || generationEvidenceExists(moduleConfigFileName) ||
+            generationEvidenceExists(deviceStateFileName) || generationEvidenceExists(channelFileName) ||
+            generationEvidenceExists(nodeDatabaseFileName) || generationEvidenceExists(backupFileName);
+#if USERPREFS_EVENT_MODE
+        persistedCoreGenerationPresent = persistedCoreGenerationPresent || generationEvidenceExists(STANDARD_CONFIG_FILE_NAME);
+#endif
+
+        // nodes.proto is deliberately absent on a keyless, unlicensed device.
+        // Record its absence now, but decide whether it is required only after
+        // DeviceState and config have been decoded. The other four core files
+        // are unconditionally required and establish the early write fence.
+        nodeDatabaseMissingFromPersistedGeneration = persistedCoreGenerationPresent && !nodeDatabasePresent;
+
+        if (persistedCoreGenerationPresent) {
+            if (!configPresent)
+                unreadablePreferenceSegments |= SEGMENT_CONFIG;
+            if (!moduleConfigPresent)
+                unreadablePreferenceSegments |= SEGMENT_MODULECONFIG;
+            if (!deviceStatePresent)
+                unreadablePreferenceSegments |= SEGMENT_DEVICESTATE;
+            if (!channelsPresent)
+                unreadablePreferenceSegments |= SEGMENT_CHANNELS;
+        }
+    }
+    if (unreadablePreferenceSegments != 0) {
+        // Establish the write fence before loading any individual segment.
+        // Several migration paths save earlier segments while later files have
+        // not yet been read; without this early inventory a late missing file
+        // could still allow a partial generation to be overwritten at boot.
+        configDecodeFailed = true;
+        LOG_ERROR("Partial preference generation detected before load - automatic core writes disabled");
+    }
+#endif
+
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    const HeltecResetPendingKind pendingReset =
+        heltecNvsRebuildPendingFileExists() ? HeltecResetPendingKind::FULL_OR_UNKNOWN : readHeltecResetPendingMarker();
+    if (pendingReset == HeltecResetPendingKind::EDIT) {
+        // A settings import or local multi-segment edit was interrupted. Some
+        // files may belong to each generation, so keep radio/GPS silent and
+        // expose only local restore/reset/OTA recovery.
+        incompleteConfigResetDetected = true;
+        configDecodeFailed = true;
+        LOG_ERROR("Incomplete settings commit detected - local recovery only");
+    } else if (pendingReset == HeltecResetPendingKind::NODEDB_RESET) {
+        // Config/identity files remain authoritative, but the hot/warm node
+        // stores and DeviceState may span generations. Keep radio/GPS silent
+        // and permit only an explicit node-db reset retry (or full reset).
+        incompleteNodeDatabaseResetDetected = true;
+        LOG_ERROR("Incomplete node database reset detected - retry locally");
+    } else if (pendingReset == HeltecResetPendingKind::CONFIG_ONLY) {
+        // Load and validate the preserved identity so the operator can safely
+        // retry config-only reset. All automatic core writes remain blocked,
+        // and the radio is forced silent at the end of this load.
+        incompleteConfigResetDetected = true;
+        configDecodeFailed = true;
+        LOG_ERROR("Incomplete config reset detected - local recovery only");
+    } else if (pendingReset == HeltecResetPendingKind::RESTORE) {
+        // A verified backup remains available outside /prefs. Load the current
+        // files only to expose diagnostics, keep all automatic writes/radio
+        // activity blocked, and allow an explicit full restore to retry the
+        // same transaction through the local BLE/USB recovery channel.
+        incompleteConfigResetDetected = true;
+        incompletePreferenceRestoreDetected = true;
+        configDecodeFailed = true;
+        LOG_ERROR("Incomplete preferences restore detected - retry restore locally");
+    } else if (pendingReset == HeltecResetPendingKind::FULL || pendingReset == HeltecResetPendingKind::FULL_OR_UNKNOWN) {
+        // A prior multi-file reset did not reach its final commit point. Never
+        // accept an arbitrary mix of old and new generations as authoritative.
+        // Keep local BLE/USB recovery available while radio and GPS stay off.
+        LOG_ERROR("Incomplete factory reset detected - boot degraded for local recovery");
+        configDecodeFailed = true;
+        unreadablePreferenceSegments =
+            SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS | SEGMENT_NODEDATABASE;
+        installDefaultNodeDatabase();
+        installDefaultDeviceState();
+        installDefaultConfig(false, false);
+        installDefaultModuleConfig();
+        installDefaultChannels();
+        forceHeltecLocalRecoveryConfiguration();
+        configLoadComplete = true;
+        return;
+    }
+#endif
+
+    // Standard and event radio profiles are deliberately isolated. Keep the
+    // inactive event generation when booting standard firmware, just as event
+    // firmware keeps the standard generation; deleting it here could destroy
+    // the only valid event profile during a locked or degraded boot.
 
 #if USERPREFS_EVENT_MODE
     // Seed only a missing event config; never overwrite normal files after a corrupt event config.
@@ -2375,7 +4054,7 @@ void NodeDB::loadFromDisk()
 #endif
 
 #ifdef FSCom
-#if defined(FACTORY_INSTALL) && !defined(ARCH_PORTDUINO)
+#if defined(FACTORY_INSTALL) && !defined(ARCH_PORTDUINO) && !defined(HELTEC_V4_OLED)
     spiLock->lock();
     if (!FSCom.exists("/prefs/" xstr(BUILD_EPOCH))) {
         LOG_WARN("Factory Install Reset");
@@ -2388,20 +4067,57 @@ void NodeDB::loadFromDisk()
         }
     }
     spiLock->unlock();
-#endif // FACTORY_INSTALL, not PORTDUINO
+#endif // FACTORY_INSTALL, not PORTDUINO, and not HELTEC_V4_OLED
     spiLock->lock();
     if (FSCom.exists(legacyPrefFileName)) {
-        spiLock->unlock();
-        LOG_WARN("Legacy prefs version, factory reset");
-        if (loadProto(configFileName, meshtastic_LocalConfig_size, sizeof(meshtastic_LocalConfig), &meshtastic_LocalConfig_msg,
-                      &config) == LoadFileResult::LOAD_SUCCESS &&
-            config.has_security && config.security.private_key.size > 0) {
-            LOG_DEBUG("Backup security config and keys");
-            backupSecurity = config.security;
+        const char *legacyIdentityConfigFileName = configFileName;
+        bool legacyConfigPresent = FSCom.exists(legacyIdentityConfigFileName);
+#if USERPREFS_EVENT_MODE
+        if (!legacyConfigPresent && FSCom.exists(STANDARD_CONFIG_FILE_NAME)) {
+            legacyIdentityConfigFileName = STANDARD_CONFIG_FILE_NAME;
+            legacyConfigPresent = true;
         }
-        spiLock->lock();
-        rmDir("/prefs");
+#endif
         spiLock->unlock();
+        LOG_WARN("Legacy preferences detected");
+        if (legacyConfigPresent) {
+            const LoadFileResult legacyConfigState =
+                loadProto(legacyIdentityConfigFileName, meshtastic_LocalConfig_size, sizeof(meshtastic_LocalConfig),
+                          &meshtastic_LocalConfig_msg, &config);
+            if (legacyConfigState == LoadFileResult::LOAD_SUCCESS) {
+                if (config.has_security && config.security.private_key.size == 32) {
+                    LOG_DEBUG("Backup security config and keys");
+                    backupSecurity = config.security;
+                } else if (config.has_security &&
+                           (config.security.private_key.size != 0 || config.security.public_key.size != 0)) {
+#if defined(HELTEC_V4_OLED)
+                    configDecodeFailed = true;
+                    unreadablePreferenceSegments |= SEGMENT_CONFIG;
+                    LOG_ERROR("Legacy private key length is invalid; preserving files for recovery");
+#endif
+                }
+#if defined(HELTEC_V4_OLED)
+            } else {
+                // The legacy file still exists, so a read/decode failure may
+                // be transient. Never replace a potentially recoverable key
+                // with defaults or remove the migration marker this boot.
+                configDecodeFailed = true;
+                unreadablePreferenceSegments |= SEGMENT_CONFIG;
+                LOG_ERROR("Legacy config unavailable; preserving identity files for retry");
+#endif
+            }
+        }
+        if (shouldAutoEraseLegacyPreferences()) {
+            spiLock->lock();
+            rmDir("/prefs");
+            spiLock->unlock();
+        } else {
+            // Keep every old file until current core files have been written
+            // successfully later in the constructor. Only the obsolete marker
+            // is removed at that commit point.
+            legacyPreferencesPendingCleanup = true;
+            LOG_WARN("Legacy preferences found; staging non-destructive migration");
+        }
     } else {
         spiLock->unlock();
     }
@@ -2420,7 +4136,7 @@ void NodeDB::loadFromDisk()
         LOG_WARN("NodeDB: Encrypted storage locked, default config until unlocked");
         installDefaultNodeDatabase();
         installDefaultDeviceState();
-        installDefaultConfig();
+        installDefaultConfig(false, false);
         installDefaultModuleConfig();
         installDefaultChannels();
 
@@ -2437,6 +4153,42 @@ void NodeDB::loadFromDisk()
         // operator unlocks.
         config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
         config.lora.tx_enabled = false;
+        // Do not mint and expose a throw-away PKI identity in the remainder of
+        // the constructor. reloadFromDisk() restores the persisted key into
+        // CryptoEngine after the operator unlocks storage.
+        encryptedStorageLockedPlaceholder = true;
+        return;
+    }
+#endif
+
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (legacyPreferencesPendingCleanup) {
+        // Preserve the historical migration semantics (legacy marker means
+        // factory defaults) without deleting the only durable generation at
+        // boot. Build every replacement in RAM, retain the cryptographic
+        // identity, then let the constructor atomically save and verify all
+        // current core files before it removes only the legacy marker.
+        installDefaultNodeDatabase();
+        installDefaultDeviceState();
+        installDefaultConfig(false, false);
+        installDefaultModuleConfig();
+        installDefaultChannels();
+        const bool legacyIdentityUnavailable = (unreadablePreferenceSegments & SEGMENT_CONFIG) != 0;
+        if (legacyIdentityUnavailable) {
+            config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+            config.lora.tx_enabled = false;
+            configLoadComplete = true;
+            return;
+        }
+        if (backupSecurity.private_key.size == 32) {
+            config.has_security = true;
+            config.security = backupSecurity;
+        }
+        if (incompleteConfigResetDetected) {
+            configDecodeFailed = true;
+            forceHeltecLocalRecoveryConfiguration();
+        }
+        configLoadComplete = true;
         return;
     }
 #endif
@@ -2452,11 +4204,36 @@ void NodeDB::loadFromDisk()
     } disarm{*this};
 
     // Avoid push_back's power-of-2 capacity growth wasting RAM at small N.
+    // loadProto() deliberately does not memset this C++ object because it owns
+    // vectors; clear every repeated field explicitly instead. This is vital
+    // for runtime encrypted-storage reloads, where the locked placeholder has
+    // already sized nodes to MAX_NUM_NODES and the nanopb callback appends.
+    nodeDatabase.version = 0;
+    nodeDatabase.nodes.clear();
+    nodeDatabase.positions.clear();
+    nodeDatabase.telemetry.clear();
+    nodeDatabase.status.clear();
+    nodeDatabase.environment.clear();
     nodeDatabase.nodes.reserve(MAX_NUM_NODES);
 
     auto state = loadProto(nodeDatabaseFileName, getMaxNodesAllocatedSize(), sizeof(meshtastic_NodeDatabase),
                            &meshtastic_NodeDatabase_msg, &nodeDatabase);
-    if (nodeDatabase.version < DEVICESTATE_MIN_VER) {
+#if defined(HELTEC_V4_OLED)
+    const bool nodeDatabaseVersionTooNew = state == LoadFileResult::LOAD_SUCCESS && nodeDatabase.version > DEVICESTATE_CUR_VER;
+#else
+    const bool nodeDatabaseVersionTooNew = false;
+#endif
+    if (state == LoadFileResult::DECODE_FAILED || state == LoadFileResult::OTHER_FAILURE) {
+        unreadablePreferenceSegments |= SEGMENT_NODEDATABASE;
+    }
+#if defined(HELTEC_V4_OLED)
+    if (nodeDatabaseVersionTooNew) {
+        unreadablePreferenceSegments |= SEGMENT_NODEDATABASE;
+        LOG_ERROR("Node database version %u is newer than supported %u; preserve file without downgrade",
+                  static_cast<unsigned>(nodeDatabase.version), static_cast<unsigned>(DEVICESTATE_CUR_VER));
+    }
+#endif
+    if (state != LoadFileResult::LOAD_SUCCESS || nodeDatabase.version < DEVICESTATE_MIN_VER || nodeDatabaseVersionTooNew) {
         LOG_WARN("NodeDatabase %d is old, discard", nodeDatabase.version);
         installDefaultNodeDatabase();
     } else if (nodeDatabase.version < DEVICESTATE_CUR_VER) {
@@ -2513,6 +4290,31 @@ void NodeDB::loadFromDisk()
     state = loadProto(deviceStateFileName, meshtastic_DeviceState_size, sizeof(meshtastic_DeviceState),
                       &meshtastic_DeviceState_msg, &devicestate);
 
+#if defined(HELTEC_V4_OLED)
+    const bool deviceStateVersionTooNew = state == LoadFileResult::LOAD_SUCCESS && devicestate.version > DEVICESTATE_CUR_VER;
+#else
+    const bool deviceStateVersionTooNew = false;
+#endif
+
+    if (state == LoadFileResult::DECODE_FAILED || state == LoadFileResult::OTHER_FAILURE) {
+        unreadablePreferenceSegments |= SEGMENT_DEVICESTATE;
+    }
+#if defined(HELTEC_V4_OLED)
+    if (deviceStateVersionTooNew) {
+        unreadablePreferenceSegments |= SEGMENT_DEVICESTATE;
+        configDecodeFailed = true;
+        LOG_ERROR("Device state version %u is newer than supported %u; preserve identity for newer firmware",
+                  static_cast<unsigned>(devicestate.version), static_cast<unsigned>(DEVICESTATE_CUR_VER));
+    }
+#endif
+#if defined(HELTEC_V4_OLED)
+    if (state == LoadFileResult::NOT_FOUND && persistedCoreGenerationPresent) {
+        unreadablePreferenceSegments |= SEGMENT_DEVICESTATE;
+        configDecodeFailed = true;
+        LOG_ERROR("Partial preference generation: device state is missing; preserving remaining files for recovery");
+    }
+#endif
+
     // See https://github.com/meshtastic/firmware/issues/4184#issuecomment-2269390786
     // It is very important to try and use the saved prefs even if we fail to read meshtastic_DeviceState.  Because most of our
     // critical config may still be valid (in the other files - loaded next).
@@ -2521,7 +4323,7 @@ void NodeDB::loadFromDisk()
     // if (state != LoadFileResult::LOAD_SUCCESS) {
     //    installDefaultDeviceState(); // Our in RAM copy might now be corrupt
     //} else {
-    if ((state != LoadFileResult::LOAD_SUCCESS) || (devicestate.version < DEVICESTATE_MIN_VER)) {
+    if ((state != LoadFileResult::LOAD_SUCCESS) || (devicestate.version < DEVICESTATE_MIN_VER) || deviceStateVersionTooNew) {
         LOG_WARN("Devicestate %d is old or invalid, discard", devicestate.version);
         installDefaultDeviceState();
 
@@ -2553,7 +4355,11 @@ void NodeDB::loadFromDisk()
     state = loadProto(configFileName, meshtastic_LocalConfig_size, sizeof(meshtastic_LocalConfig), &meshtastic_LocalConfig_msg,
                       &config);
 #if USERPREFS_EVENT_MODE
+#if defined(HELTEC_V4_OLED)
+    if (canSeedEventProfile(eventProfileFirstUse, !eventProfileStorageUnavailable) && state != LoadFileResult::LOAD_SUCCESS) {
+#else
     if (eventConfigMissing && state != LoadFileResult::LOAD_SUCCESS) {
+#endif
         const LoadFileResult eventConfigState = state;
         const LoadFileResult standardConfigState =
             loadProto(STANDARD_CONFIG_FILE_NAME, meshtastic_LocalConfig_size, sizeof(meshtastic_LocalConfig),
@@ -2572,32 +4378,85 @@ void NodeDB::loadFromDisk()
             LOG_INFO("Init event config without modifying %s", STANDARD_CONFIG_FILE_NAME);
         } else {
             // Keep the event load outcome because loadProto() clears config before decoding.
-            // A normal decode failure must not create a replacement identity.
-            state = standardConfigState == LoadFileResult::DECODE_FAILED ? LoadFileResult::DECODE_FAILED : eventConfigState;
+            // Any present-but-unreadable standard config must not create a replacement identity.
+            state = (standardConfigState == LoadFileResult::DECODE_FAILED || standardConfigState == LoadFileResult::OTHER_FAILURE)
+                        ? standardConfigState
+                        : eventConfigState;
         }
     }
 #endif
-    if (state == LoadFileResult::DECODE_FAILED) {
-        // Config file present but undecodable this boot (corruption / torn write / transient decrypt fail).
-        // loadProto() already zeroed `config`, so the keypair is gone from RAM; minting a new one would change
-        // our NodeNum (== crc32(public_key)) and orphan us on the mesh. configDecodeFailed freezes identity and
-        // skips persisting (see ctor), so a transient failure self-heals on the next clean boot. A genuinely
-        // absent config returns OTHER_FAILURE, so this never fires on first boot. Boot degraded + radio-silent.
-        LOG_ERROR("Config decode failed - freeze identity, boot degraded (radio silent until restored)");
+    const bool loadedValidPrivateKey = config.has_security && config.security.private_key.size == 32;
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    const bool persistedIdentityNeedsNodeDatabase = persistedIdentityRequiresNodeDatabase(
+        config.has_security ? config.security.private_key.size : 0, config.has_security ? config.security.public_key.size : 0,
+        owner.public_key.size, owner.is_licensed);
+#endif
+    const bool invalidPrivateKeyLength = state == LoadFileResult::LOAD_SUCCESS && config.has_security &&
+                                         config.security.private_key.size != 0 && !loadedValidPrivateKey;
+    const bool missingPrivateKeyForKnownIdentity =
+        state == LoadFileResult::LOAD_SUCCESS && !loadedValidPrivateKey &&
+        (owner.public_key.size != 0 || (config.has_security && config.security.public_key.size != 0));
+    bool loadedPublicKeyMismatch = false;
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+    if (state == LoadFileResult::LOAD_SUCCESS && loadedValidPrivateKey) {
+        uint8_t derivedPublicKey[32];
+        loadedPublicKeyMismatch =
+            !derivePublicKeyWithoutInstalling(config.security.private_key.bytes, derivedPublicKey) ||
+            (config.security.public_key.size != 0 &&
+             (config.security.public_key.size != sizeof(derivedPublicKey) ||
+              memcmp(config.security.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey)) != 0)) ||
+            (owner.public_key.size != 0 && (owner.public_key.size != sizeof(derivedPublicKey) ||
+                                            memcmp(owner.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey)) != 0));
+    }
+#endif
+    const bool missingConfigForKnownIdentity =
+        state == LoadFileResult::NOT_FOUND && (owner.public_key.size != 0 || persistedCoreGenerationPresent);
+    const bool invalidLoadedRegionPolicy = state == LoadFileResult::LOAD_SUCCESS && config.has_lora &&
+                                           config.lora.region != meshtastic_Config_LoRaConfig_RegionCode_UA_868 &&
+                                           !RadioInterface::checkConfigRegion(config.lora);
+#if defined(HELTEC_V4_OLED)
+    const bool configVersionTooNew = state == LoadFileResult::LOAD_SUCCESS && config.version > DEVICESTATE_CUR_VER;
+#else
+    const bool configVersionTooNew = false;
+#endif
+    if (state == LoadFileResult::DECODE_FAILED || state == LoadFileResult::OTHER_FAILURE || invalidPrivateKeyLength ||
+        missingPrivateKeyForKnownIdentity || loadedPublicKeyMismatch || missingConfigForKnownIdentity ||
+        invalidLoadedRegionPolicy || configVersionTooNew) {
+        // Config file present but unreadable this boot (corruption / torn write
+        // / transient open, allocation, or decrypt fail). loadProto() already
+        // zeroed `config`, so the keypair is gone from RAM; minting a new one
+        // would change our NodeNum (== crc32(public_key)) and orphan us on the
+        // mesh. configDecodeFailed freezes identity and skips persisting (see
+        // ctor), so a transient failure self-heals on the next clean boot. A
+        // genuinely absent config returns NOT_FOUND, so this never fires on
+        // first boot. Boot degraded + radio-silent.
+        LOG_ERROR("Config read/identity/region validation failed - freeze "
+                  "identity, boot degraded (radio silent until restored)");
         configDecodeFailed = true;
-        installDefaultConfig(true);
+        unreadablePreferenceSegments |= SEGMENT_CONFIG;
+        installDefaultConfig(true, false);
         config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
         config.lora.tx_enabled = false;
     } else if (state != LoadFileResult::LOAD_SUCCESS) {
-        // No decodable config to work with: the file is absent (first boot) or could not be opened (OTHER_FAILURE
-        // / NO_FILESYSTEM). Unlike DECODE_FAILED there are no usable contents to protect, so install defaults.
+        // No config generation exists to protect (first boot), or this platform
+        // has no filesystem.
         installDefaultConfig();
     } else if (config.version < DEVICESTATE_MIN_VER) {
         LOG_WARN("config %d is old, discard", config.version);
-        installDefaultConfig(true);
+        installDefaultConfig(true, false);
     } else {
         LOG_INFO("Loaded saved config v%d", config.version);
     }
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (nodeDatabaseMissingFromPersistedGeneration &&
+        persistedIdentityNeedsNodeDatabase) {
+        unreadablePreferenceSegments |= SEGMENT_NODEDATABASE;
+        configDecodeFailed = true;
+        LOG_ERROR("Partial preference generation: identity exists but node "
+                  "database is missing; preserving remaining files for "
+                  "recovery");
+    }
+#endif
     configLoadComplete = true;
 
     // Coerce LoRa config fields derived from presets while bootstrapping.
@@ -2639,16 +4498,7 @@ void NodeDB::loadFromDisk()
     config.lora.override_frequency = USERPREFS_LORACONFIG_OVERRIDE_FREQUENCY;
 #endif
 
-#if USERPREFS_EVENT_MODE
-    if (initializedEventConfig) {
-        // This is the first durable event-profile write.  A failed write is
-        // safe: normal files remain untouched and the next event boot retries.
-        if (!saveToDisk(SEGMENT_CONFIG))
-            LOG_ERROR("Can't persist initial event config");
-    }
-#endif
-
-    if (backupSecurity.private_key.size > 0) {
+    if (backupSecurity.private_key.size == 32) {
         LOG_DEBUG("Restore security config backup");
         config.security = backupSecurity;
         saveToDisk(SEGMENT_CONFIG);
@@ -2708,7 +4558,29 @@ void NodeDB::loadFromDisk()
 
     state = loadProto(moduleConfigFileName, meshtastic_LocalModuleConfig_size, sizeof(meshtastic_LocalModuleConfig),
                       &meshtastic_LocalModuleConfig_msg, &moduleConfig);
-    if (state != LoadFileResult::LOAD_SUCCESS) {
+#if defined(HELTEC_V4_OLED)
+    const bool moduleConfigVersionTooNew =
+        state == LoadFileResult::LOAD_SUCCESS && moduleConfig.version > POSITION_TELEMETRY_OPTIN_VER;
+#else
+    const bool moduleConfigVersionTooNew = false;
+#endif
+    if (state == LoadFileResult::DECODE_FAILED || state == LoadFileResult::OTHER_FAILURE) {
+        unreadablePreferenceSegments |= SEGMENT_MODULECONFIG;
+    }
+#if defined(HELTEC_V4_OLED)
+    if (moduleConfigVersionTooNew) {
+        unreadablePreferenceSegments |= SEGMENT_MODULECONFIG;
+        configDecodeFailed = true;
+        LOG_ERROR("Module config version %u is newer than supported %u; preserve file without downgrade",
+                  static_cast<unsigned>(moduleConfig.version), static_cast<unsigned>(POSITION_TELEMETRY_OPTIN_VER));
+    }
+    if (state == LoadFileResult::NOT_FOUND && persistedCoreGenerationPresent) {
+        unreadablePreferenceSegments |= SEGMENT_MODULECONFIG;
+        configDecodeFailed = true;
+        LOG_ERROR("Partial preference generation: module config is missing; preserving remaining files for recovery");
+    }
+#endif
+    if (state != LoadFileResult::LOAD_SUCCESS || moduleConfigVersionTooNew) {
         installDefaultModuleConfig(); // Our in RAM copy might now be corrupt
     } else {
         if (moduleConfig.version < DEVICESTATE_MIN_VER) {
@@ -2731,16 +4603,78 @@ void NodeDB::loadFromDisk()
 
     state = loadProto(channelFileName, meshtastic_ChannelFile_size, sizeof(meshtastic_ChannelFile), &meshtastic_ChannelFile_msg,
                       &channelFile);
-    if (state != LoadFileResult::LOAD_SUCCESS) {
-        installDefaultChannels(); // Our in RAM copy might now be corrupt
+#if defined(HELTEC_V4_OLED)
+    const bool channelVersionTooNew = state == LoadFileResult::LOAD_SUCCESS && channelFile.version > POSITION_TELEMETRY_OPTIN_VER;
+#else
+    const bool channelVersionTooNew = false;
+#endif
+    if (state == LoadFileResult::DECODE_FAILED || state == LoadFileResult::OTHER_FAILURE) {
+        // Channel PSKs are part of the radio identity. A present-but-unreadable
+        // file may be recoverable on the next clean boot; do not replace it with
+        // defaults or permit the radio to use those defaults in the meantime.
+        installDefaultChannels();
+        configDecodeFailed = true;
+        unreadablePreferenceSegments |= SEGMENT_CHANNELS;
+        config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+        config.lora.tx_enabled = false;
+        LOG_ERROR("Channel profile read failed - boot degraded (radio silent until restored)");
+    } else if (channelVersionTooNew) {
+        installDefaultChannels();
+        configDecodeFailed = true;
+        unreadablePreferenceSegments |= SEGMENT_CHANNELS;
+        config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+        config.lora.tx_enabled = false;
+        LOG_ERROR("Channel version is newer than supported; preserve future profile and disable radio");
+    } else if (state != LoadFileResult::LOAD_SUCCESS) {
+        installDefaultChannels(); // Safe only on an actually empty first boot.
+#if defined(HELTEC_V4_OLED)
+        const bool expectedMissingEventChannels =
+#if USERPREFS_EVENT_MODE
+            canInitializeMissingEventChannels(eventProfileFirstUse, initializedEventConfig, state == LoadFileResult::NOT_FOUND);
+#else
+            false;
+#endif
+        if (persistedCoreGenerationPresent && !expectedMissingEventChannels) {
+            configDecodeFailed = true;
+            unreadablePreferenceSegments |= SEGMENT_CHANNELS;
+            config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+            config.lora.tx_enabled = false;
+            LOG_ERROR("Partial preference generation: channels are missing - radio disabled for local recovery");
+        }
+#endif
     } else {
-        if (channelFile.version < DEVICESTATE_MIN_VER) {
+#if defined(HELTEC_V4_OLED)
+        if (!isCompleteChannelFile(channelFile)) {
+            // A syntactically valid but truncated channel file is still an
+            // identity/radio-profile failure. Do not let resetRadioConfig()
+            // silently install LongFast and transmit with the retained region.
+            installDefaultChannels();
+            configDecodeFailed = true;
+            unreadablePreferenceSegments |= SEGMENT_CHANNELS;
+            config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+            config.lora.tx_enabled = false;
+            LOG_ERROR("Channel profile is incomplete - boot degraded (radio silent until restored)");
+        } else
+#endif
+            if (channelFile.version < DEVICESTATE_MIN_VER) {
             LOG_WARN("channelFile %d is old, discard", channelFile.version);
             installDefaultChannels();
         } else {
             LOG_INFO("Loaded saved channelFile v%d", channelFile.version);
         }
     }
+
+#if USERPREFS_EVENT_MODE
+    const int eventProfileInitialSave = eventProfileFirstUseSaveSegments(initializedEventConfig, configDecodeFailed);
+    if (eventProfileInitialSave != 0) {
+        // Publish the two active event-profile members as one deferred boot
+        // generation. Persisting config alone makes the next boot see a torn
+        // event profile, while relying on the channel version migration leaves
+        // a current-version default channel entirely unwritten.
+        if (!saveToDisk(eventProfileInitialSave))
+            LOG_ERROR("Can't persist initial event radio profile");
+    }
+#endif
 
     state = loadProto(uiconfigFileName, meshtastic_DeviceUIConfig_size, sizeof(meshtastic_DeviceUIConfig),
                       &meshtastic_DeviceUIConfig_msg, &uiconfig);
@@ -2774,9 +4708,19 @@ void NodeDB::loadFromDisk()
 
         // Migrate any remaining plaintext proto files (from standard firmware upgrade)
         for (const char *fn : filesToCheck) {
-            if (!EncryptedStorage::isEncrypted(fn)) {
+            bool exists = false;
+#ifdef FSCom
+            {
+                concurrency::LockGuard guard(spiLock);
+                exists = FSCom.exists(fn);
+            }
+#endif
+            if (exists && !EncryptedStorage::isEncrypted(fn)) {
                 LOG_INFO("Migrating %s to encrypted storage", fn);
-                EncryptedStorage::migrateFile(fn);
+                if (!EncryptedStorage::migrateFile(fn)) {
+                    LOG_ERROR("Can't migrate %s to encrypted storage", fn);
+                    storageCorruptThisLoad = true;
+                }
             }
         }
 
@@ -2861,6 +4805,12 @@ void NodeDB::loadFromDisk()
         LOG_WARN("Licensed operation removed persisted channel encryption/admin access");
         saveToDisk(SEGMENT_CHANNELS);
     }
+#if defined(HELTEC_V4_OLED)
+    if (incompleteConfigResetDetected)
+        configDecodeFailed = true;
+    if (requiresConfigRecovery())
+        forceHeltecLocalRecoveryConfiguration();
+#endif
 #if ARCH_PORTDUINO
     // set any config overrides
     if (portduino_config.has_configDisplayMode) {
@@ -2903,41 +4853,152 @@ bool NodeDB::reloadFromDisk()
     concurrency::LockGuard guard(&g_reloadFromDiskMutex);
     LOG_INFO("NodeDB: Reloading config from encrypted storage after unlock");
 
+    if (!shouldUseFilesystemPersistence(fsIsMounted())) {
+        LOG_ERROR("NodeDB: reload refused while filesystem is unavailable");
+        return false;
+    }
+
     RadioInterface *rIface = router ? router->getRadioIface() : nullptr;
 
     // Park the radio while config.lora / channelFile swap. Without this,
     // a concurrent send or receive can read half-old / half-new state
     // (channel keys, region, modem preset) and the SX12xx ends up in
     // an inconsistent register set that only a reboot recovers from.
-    if (rIface)
-        rIface->sleep();
+    if (rIface && !rIface->sleep()) {
+        LOG_ERROR("NodeDB: encrypted reload could not park the radio");
+        return false;
+    }
 
     loadFromDisk();
 
-    if (storageCorruptThisLoad) {
-        LOG_ERROR("NodeDB: reload decrypt/decode failed - treat as corrupt");
+    if (storageCorruptThisLoad || requiresConfigRecovery()) {
+        LOG_ERROR("NodeDB: reload failed validation - treat preference generation as corrupt");
         // Leave the radio sleeping. Caller will lock storage and emit
         // a LOCKED(storage_corrupt) status; we must not reconfigure
         // the chip with the locked-default placeholder values still
         // sitting in config.lora.
+        bootDeferredPreferenceSegments = 0;
         return false;
     }
+
+    int deferredBootSaves = bootDeferredPreferenceSegments;
+    bootDeferredPreferenceSegments = 0;
+
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+    // The locked boot deliberately never installs a placeholder key. Loading
+    // the protobufs restores the bytes but not CryptoEngine's Curve25519/XEdDSA
+    // state, so activate and re-verify the exact persisted key before radio RX
+    // is allowed to resume.
+    if (config.security.private_key.size == 32) {
+        const bool normalizeConfigPublicKey = config.security.public_key.size == 0;
+        const bool normalizeOwnerPublicKey = owner.public_key.size == 0;
+        uint8_t derivedPublicKey[32];
+        if (!derivePublicKeyWithoutInstalling(config.security.private_key.bytes, derivedPublicKey) ||
+            (config.security.public_key.size == 32 &&
+             memcmp(config.security.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey)) != 0) ||
+            (owner.public_key.size == 32 && memcmp(owner.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey)) != 0) ||
+            crc32Buffer(derivedPublicKey, sizeof(derivedPublicKey)) != myNodeInfo.my_node_num || !crypto ||
+            !crypto->regeneratePublicKey(derivedPublicKey, config.security.private_key.bytes)) {
+            LOG_ERROR("NodeDB: encrypted reload identity validation failed");
+            configDecodeFailed = true;
+            unreadablePreferenceSegments |= SEGMENT_CONFIG;
+            forceHeltecLocalRecoveryConfiguration();
+            return false;
+        }
+        config.security.public_key.size = sizeof(derivedPublicKey);
+        memcpy(config.security.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey));
+        owner.public_key.size = sizeof(derivedPublicKey);
+        memcpy(owner.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey));
+        if (normalizeConfigPublicKey || normalizeOwnerPublicKey)
+            deferredBootSaves |= SEGMENT_CONFIG | SEGMENT_DEVICESTATE | SEGMENT_NODEDATABASE;
+    } else if (config.security.public_key.size != 0 || owner.public_key.size != 0 ||
+               config.lora.region != meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
+        LOG_ERROR("NodeDB: encrypted reload lacks the private key required by the persisted identity");
+        configDecodeFailed = true;
+        unreadablePreferenceSegments |= SEGMENT_CONFIG;
+        forceHeltecLocalRecoveryConfiguration();
+        return false;
+    }
+#endif
+
+    // loadFromDisk() replaced DeviceState after the locked constructor had
+    // stamped fields owned by this running binary and silicon. Reapply those
+    // fields before self-care copies owner into the local NodeInfo row.
+    meshtastic_MyNodeInfo_device_id_t runtimeDeviceId{};
+    if (getDeviceId(runtimeDeviceId.bytes))
+        runtimeDeviceId.size = sizeof(runtimeDeviceId.bytes);
+    if (myNodeInfo.device_id.size != runtimeDeviceId.size ||
+        memcmp(myNodeInfo.device_id.bytes, runtimeDeviceId.bytes, sizeof(runtimeDeviceId.bytes)) != 0) {
+        myNodeInfo.device_id = runtimeDeviceId;
+        deferredBootSaves |= SEGMENT_DEVICESTATE;
+    }
+
+    if (myNodeInfo.min_app_version != 30200) {
+        myNodeInfo.min_app_version = 30200;
+        deferredBootSaves |= SEGMENT_DEVICESTATE;
+    }
+#ifdef USERPREFS_FIRMWARE_EDITION
+    constexpr meshtastic_FirmwareEdition runtimeFirmwareEdition = USERPREFS_FIRMWARE_EDITION;
+#else
+    constexpr meshtastic_FirmwareEdition runtimeFirmwareEdition = meshtastic_FirmwareEdition_VANILLA;
+#endif
+    if (myNodeInfo.firmware_edition != runtimeFirmwareEdition) {
+        myNodeInfo.firmware_edition = runtimeFirmwareEdition;
+        deferredBootSaves |= SEGMENT_DEVICESTATE;
+    }
+#ifdef ARCH_ESP32
+    Preferences preferences;
+    preferences.begin("meshtastic", true);
+    const uint32_t runtimeRebootCount = preferences.getUInt("rebootCounter", 0);
+    preferences.end();
+    if (myNodeInfo.reboot_count != runtimeRebootCount) {
+        myNodeInfo.reboot_count = runtimeRebootCount;
+        deferredBootSaves |= SEGMENT_DEVICESTATE;
+    }
+#endif
+
+    getMacAddr(ourMacAddr);
+    char runtimeOwnerId[sizeof(owner.id)]{};
+    snprintf(runtimeOwnerId, sizeof(runtimeOwnerId), "!%08x", getNodeNum());
+    const bool ownerRuntimeFieldsChanged = owner.hw_model != HW_VENDOR || owner.role != config.device.role ||
+                                           memcmp(owner.macaddr, ourMacAddr, sizeof(owner.macaddr)) != 0 ||
+                                           memcmp(owner.id, runtimeOwnerId, sizeof(owner.id)) != 0;
+    if (ownerRuntimeFieldsChanged) {
+        owner.hw_model = HW_VENDOR;
+        owner.role = config.device.role;
+        memcpy(owner.macaddr, ourMacAddr, sizeof(owner.macaddr));
+        memcpy(owner.id, runtimeOwnerId, sizeof(owner.id));
+        deferredBootSaves |= SEGMENT_DEVICESTATE | SEGMENT_NODEDATABASE;
+    }
+
+    cleanupMeshDB();
 
     // loadFromDisk() leaves the store untrimmed; run self-care now (getNodeNum()
     // is valid at runtime) to trim/demote non-self overflow, pin self to index 0
     // and normalise the backing store before the node DB is exercised again.
     nodeDBSelfCare();
 
-    // Preserve constructor ordering: persist any migration only after self-care.
-    if (migrationSavePending) {
-        saveNodeDatabaseToDisk();
-        migrationSavePending = false;
+    // Preserve constructor ordering: persist migrations and runtime-owned
+    // metadata only after identity and self-care are established.
+    const bool nodeDatabaseMigrationPending = migrationSavePending;
+    if (nodeDatabaseMigrationPending)
+        deferredBootSaves |= SEGMENT_NODEDATABASE;
+    if (deferredBootSaves != 0 && !saveToDisk(deferredBootSaves)) {
+        LOG_ERROR("NodeDB: deferred boot migrations failed after storage reload");
+        return false;
     }
+    if (nodeDatabaseMigrationPending)
+        migrationSavePending = false;
 
-    // Push the now-real config to the radio.
+    // Rebuild channel hashes and the region pointer before pushing the real
+    // persisted generation to hardware. The locked placeholder deliberately
+    // left myRegion at UNSET.
+    resetRadioConfig(false);
     if (rIface) {
-        channels.onConfigChanged();
-        rIface->reconfigure();
+        if (!rIface->reconfigure()) {
+            LOG_ERROR("NodeDB: encrypted reload could not activate the persisted radio configuration");
+            return false;
+        }
     }
     return true;
 }
@@ -2976,14 +5037,91 @@ bool NodeDB::disableLockdownToPlaintext()
 bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_t *fields, const void *dest_struct,
                        bool fullAtomic)
 {
+#if defined(HELTEC_V4_OLED)
+    PreferenceStorageWriteGuard storageWrite(*this);
+    if (!storageWrite) {
+        LOG_WARN("NodeDB: refusing protobuf write during destructive storage mutation");
+        return false;
+    }
+#endif
 
-    // Only the radio profile is at risk from an unverified config load, so only defer those writes.
-    // Devicestate/nodedb/module writes must still land, otherwise boot-time recovery (e.g. loadFromDisk()
-    // restoring owner fields) is dropped and never retried.
-    if (isRadioProfileFile(filename) &&
-        shouldDeferBootPersistence(bootInitializationInProgress, configLoadComplete, configDecodeFailed)) {
-        LOG_WARN("NodeDB: deferred boot write to %s until config recovery completes", filename);
-        return true;
+    if (!shouldUseFilesystemPersistence(fsIsMounted())) {
+        LOG_ERROR("NodeDB: refusing write to %s while filesystem is unavailable", filename);
+        return false;
+    }
+
+    const int preferenceSegment = preferenceSegmentForFile(filename);
+#if defined(HELTEC_V4_OLED)
+    const bool authorizedRecoveryWriter =
+        destructiveStorageMutationActive.load(std::memory_order_acquire) &&
+        destructiveStorageOwnerTask.load(std::memory_order_acquire) == reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+    if (preferenceSegment != 0 && requiresConfigRecovery() && !authorizedRecoveryWriter) {
+        LOG_ERROR("NodeDB: refusing core write while another segment requires recovery: %s", filename);
+        return false;
+    }
+    if (preferenceSegment != 0 && !preferenceWriteAllowedDuringEdit()) {
+        LOG_WARN("NodeDB: defer external preference write during settings edit: %s", filename);
+        return false;
+    }
+    if (preferenceSegment == 0 && isPreferenceEditTransactionActive() && !isPreferenceEditOwnerCurrentTask()) {
+        LOG_WARN("NodeDB: reject auxiliary preference write from non-owner during settings edit: %s", filename);
+        return false;
+    }
+#endif
+    if (incompleteConfigResetDetected && preferenceSegment != 0) {
+        LOG_ERROR("NodeDB: refusing write during incomplete config-reset recovery: %s", filename);
+        return false;
+    }
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (incompleteNodeDatabaseResetDetected && preferenceSegment != 0) {
+        const bool authorizedResetWriter = destructiveStorageMutationActive.load(std::memory_order_acquire) &&
+                                           destructiveStorageOwnerTask.load(std::memory_order_acquire) ==
+                                               reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle()) &&
+                                           readHeltecResetPendingMarker() == HeltecResetPendingKind::NODEDB_RESET;
+        if (!authorizedResetWriter) {
+            LOG_ERROR("NodeDB: refusing core write during incomplete node-db reset: %s", filename);
+            return false;
+        }
+    }
+#endif
+    if (incompleteLegacyMigrationDetected && preferenceSegment != 0) {
+        LOG_ERROR("NodeDB: refusing write during incomplete legacy migration: %s", filename);
+        return false;
+    }
+    if ((unreadablePreferenceSegments & preferenceSegment) != 0) {
+        LOG_ERROR("NodeDB: refusing write to unreadable existing file %s until recovery", filename);
+        return false;
+    }
+
+#if defined(HELTEC_V4_OLED)
+    // Every protobuf path, including UI/auxiliary files that bypass
+    // saveToDisk(), gets a fresh sample immediately before SafeFile opens.
+    // Reset and explicitly destructive settings transactions retain their
+    // stronger 3.65 V threshold.
+    const bool preferenceEditActive = isPreferenceEditTransactionActive();
+    const bool destructiveMutationActiveNow = destructiveStorageMutationActive.load(std::memory_order_acquire);
+    const bool destructivePowerRequired =
+        destructiveMutationActiveNow ||
+        (preferenceEditActive && preferenceEditRequiresDestructivePower.load(std::memory_order_acquire));
+    const bool heltecPowerSafe =
+        destructivePowerRequired ? heltecDestructiveStoragePowerIsSafe() : heltecPreferenceStoragePowerIsSafe();
+    if (!heltecPowerSafe) {
+        if (preferenceSegment != 0 &&
+            shouldQueueHeltecPreferenceWriteRetry(false, preferenceEditActive, destructiveMutationActiveNow)) {
+            powerDeferredPreferenceSegments.fetch_or(preferenceSegment, std::memory_order_acq_rel);
+        }
+        LOG_ERROR("NodeDB: refusing preference write to %s while fresh power is unsafe", filename);
+        return false;
+    }
+#endif
+
+    // Identity and channel files must never replace a present-but-undecodable
+    // generation, during boot or later. A reboot can retry a transient read;
+    // XMODEM/BLE OTA or an explicit full reset provide recovery paths. Other
+    // stores may still persist independent runtime repair state.
+    if (isRadioProfileFile(filename) && configDecodeFailed) {
+        LOG_ERROR("NodeDB: refusing write to %s until config recovery completes", filename);
+        return false;
     }
 
     // do not try to save anything if power level is not safe. In many cases flash will be lock-protected
@@ -3016,7 +5154,11 @@ bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_
         }
 
         size_t encodedSize = stream.bytes_written;
+#if defined(HELTEC_V4_OLED)
+        bool ok = EncryptedStorage::encryptAndWrite(filename, pbBuf.get(), encodedSize, fullAtomic, destructivePowerRequired);
+#else
         bool ok = EncryptedStorage::encryptAndWrite(filename, pbBuf.get(), encodedSize, fullAtomic);
+#endif
 
         if (!ok) {
             LOG_ERROR("EncryptedStorage: encrypt+write %s failed", filename);
@@ -3025,32 +5167,40 @@ bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_
     }
 #endif
 
-    bool okay = false;
 #ifdef FSCom
+#if defined(HELTEC_V4_OLED)
+    auto f = SafeFile(filename, fullAtomic, destructivePowerRequired);
+#else
     auto f = SafeFile(filename, fullAtomic);
+#endif
 
     LOG_INFO("Save %s", filename);
     pb_ostream_t stream = {&writecb, static_cast<Print *>(&f), protoSize};
 
     if (!pb_encode(&stream, fields, dest_struct)) {
         LOG_ERROR("Can't encode protobuf %s", PB_GET_ERROR(&stream));
-    } else {
-        okay = true;
+        return false;
     }
 
-    bool writeSucceeded = f.close();
-
-    if (!okay || !writeSucceeded) {
+    if (!f.close()) {
         LOG_ERROR("Can't write prefs");
+        return false;
     }
+
+    return true;
 #else
     LOG_ERROR("Filesystem not implemented");
+    return false;
 #endif
-    return okay;
 }
 
 bool NodeDB::saveChannelsToDisk()
 {
+#if defined(HELTEC_V4_OLED)
+    PreferenceStorageWriteGuard storageWrite(*this);
+    if (!storageWrite)
+        return false;
+#endif
 
     // do not try to save anything if power level is not safe. In many cases flash will be lock-protected
     // and all writes will fail anyway.
@@ -3065,11 +5215,16 @@ bool NodeDB::saveChannelsToDisk()
     spiLock->unlock();
 #endif
 
-    return saveProto(channelFileName, meshtastic_ChannelFile_size, &meshtastic_ChannelFile_msg, &channelFile);
+    return saveProto(channelFileName, meshtastic_ChannelFile_size, &meshtastic_ChannelFile_msg, &channelFile, true);
 }
 
 bool NodeDB::saveDeviceStateToDisk()
 {
+#if defined(HELTEC_V4_OLED)
+    PreferenceStorageWriteGuard storageWrite(*this);
+    if (!storageWrite)
+        return false;
+#endif
 
     // do not try to save anything if power level is not safe. In many cases flash will be lock-protected
     // and all writes will fail anyway. Device should be sleeping at this point anyway.
@@ -3083,13 +5238,47 @@ bool NodeDB::saveDeviceStateToDisk()
     FSCom.mkdir("/prefs");
     spiLock->unlock();
 #endif
-    // Note: if MAX_NUM_NODES=100 and meshtastic_NodeInfoLite_size=166, so will be approximately 17KB
-    // Because so huge we _must_ not use fullAtomic, because the filesystem is probably too small to hold two copies of this
+    // Device state is small enough to preserve the previous generation until the replacement verifies.
     return saveProto(deviceStateFileName, meshtastic_DeviceState_size, &meshtastic_DeviceState_msg, &devicestate, true);
 }
 
 bool NodeDB::saveNodeDatabaseToDisk()
 {
+#if defined(HELTEC_V4_OLED)
+    PreferenceStorageWriteGuard storageWrite(*this);
+    if (!storageWrite)
+        return false;
+    const bool authorizedRecoveryWriter =
+        destructiveStorageMutationActive.load(std::memory_order_acquire) &&
+        destructiveStorageOwnerTask.load(std::memory_order_acquire) == reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+    if ((requiresConfigRecovery() || (unreadablePreferenceSegments & SEGMENT_NODEDATABASE) != 0) && !authorizedRecoveryWriter) {
+        // Return before projecting satellite maps or flushing warm.dat. A
+        // corrupt/missing node generation must remain byte-for-byte available
+        // for recovery, and critical config recovery fences every node tier.
+        LOG_WARN("NodeDB: reject node/warm save while persisted generation requires recovery");
+        return false;
+    }
+#if defined(FSCom)
+    if (incompleteNodeDatabaseResetDetected && !(destructiveStorageMutationActive.load(std::memory_order_acquire) &&
+                                                 destructiveStorageOwnerTask.load(std::memory_order_acquire) ==
+                                                     reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle()) &&
+                                                 readHeltecResetPendingMarker() == HeltecResetPendingKind::NODEDB_RESET)) {
+        LOG_ERROR("NodeDB: refusing node/warm write during incomplete node-db reset");
+        return false;
+    }
+#endif
+    // Return before warm.dat or nodes.proto can be touched by an autosave
+    // racing an open Admin settings transaction.
+    if (!preferenceWriteAllowedDuringEdit()) {
+        LOG_WARN("NodeDB: reject node database save while a settings edit is open");
+        return false;
+    }
+#endif
+    if (!shouldUseFilesystemPersistence(fsIsMounted())) {
+        LOG_ERROR("NodeDB: refusing node database write while filesystem is unavailable");
+        return false;
+    }
+
     // Don't persist the node DB until this device has a PKI keypair
     // TODO: revisit when https://github.com/meshtastic/firmware/pull/10478 lands
 #if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
@@ -3106,8 +5295,8 @@ bool NodeDB::saveNodeDatabaseToDisk()
         return false;
     }
 
-    // Defer (don't fail) while xmodem holds the prefs file handle. Returning false
-    // would propagate through saveToDisk() and trigger fsFormat() mid-transfer.
+    // Defer (don't fail) while xmodem holds the prefs file handle. A retry cannot
+    // succeed until the transfer releases it.
 #ifdef FSCom
     if (xModem.isBusy()) {
         LOG_DEBUG("Defer NodeDB save: xmodem in progress");
@@ -3182,7 +5371,18 @@ bool NodeDB::saveNodeDatabaseToDisk()
 
     size_t nodeDatabaseSize;
     pb_get_encoded_size(&nodeDatabaseSize, meshtastic_NodeDatabase_fields, &nodeDatabase);
-    bool ok = saveProto(nodeDatabaseFileName, nodeDatabaseSize, &meshtastic_NodeDatabase_msg, &nodeDatabase, false);
+    // The node database can consume most of small LittleFS partitions, so it cannot
+    // keep two generations during a save.
+    // Heltec V4 has a dedicated 0x360000 LittleFS partition, large enough to
+    // retain the old node database until the replacement passes readback. This
+    // also makes v24 migration retryable after a failed write.
+#if defined(HELTEC_V4_OLED)
+    constexpr bool keepPreviousGeneration = true;
+#else
+    constexpr bool keepPreviousGeneration = false;
+#endif
+    bool ok =
+        saveProto(nodeDatabaseFileName, nodeDatabaseSize, &meshtastic_NodeDatabase_msg, &nodeDatabase, keepPreviousGeneration);
 
     nodeDatabase.positions.clear();
     nodeDatabase.positions.shrink_to_fit();
@@ -3192,15 +5392,50 @@ bool NodeDB::saveNodeDatabaseToDisk()
     nodeDatabase.environment.shrink_to_fit();
     nodeDatabase.status.clear();
     nodeDatabase.status.shrink_to_fit();
+#if defined(HELTEC_V4_OLED)
+    if (!ok) {
+        // The hot tier is the commit prerequisite for warm.dat. Never publish
+        // a new warm generation after nodes.proto failed verification.
+        return false;
+    }
+#endif
 #if WARM_NODE_COUNT > 0
 #ifdef ARCH_RP2040
     // nodes.proto + warm.dat are written back-to-back without the loop running between them;
     // reset the 8s HW watchdog so the second write gets a full budget (issue #10746).
     watchdog_update();
 #endif
-    // Same cadence as the node DB; failure is logged but must not propagate -
-    // a false return from here would trigger saveToDisk()'s fsFormat() path.
-    warmStore.saveIfDirty();
+#if defined(HELTEC_V4_OLED)
+    // Encoding and committing nodes.proto can take long enough for the supply
+    // to change. Re-sample immediately before the independent warm.dat write;
+    // never carry the hot-tier authorization across that boundary.
+    const bool warmPreferenceEditActive = isPreferenceEditTransactionActive();
+    const bool warmDestructiveMutationActive = destructiveStorageMutationActive.load(std::memory_order_acquire);
+    const bool warmNeedsDestructivePower =
+        warmDestructiveMutationActive ||
+        (warmPreferenceEditActive && preferenceEditRequiresDestructivePower.load(std::memory_order_acquire));
+    const bool warmPowerSafe =
+        warmNeedsDestructivePower ? heltecDestructiveStoragePowerIsSafe() : heltecPreferenceStoragePowerIsSafe();
+    if (!warmPowerSafe) {
+        if (shouldQueueHeltecPreferenceWriteRetry(false, warmPreferenceEditActive, warmDestructiveMutationActive))
+            powerDeferredPreferenceSegments.fetch_or(SEGMENT_NODEDATABASE, std::memory_order_acq_rel);
+        LOG_WARN("NodeDB: deferring warm node store write until power recovers");
+        return false;
+    }
+#endif
+    // The Heltec warm tier is part of the node database generation. Propagate a
+    // failed warm.dat commit so a node reset cannot acknowledge success and
+    // reboot only to resurrect the supposedly removed identities.
+#if defined(HELTEC_V4_OLED)
+    const bool warmSaved = warmStore.saveIfDirty(warmNeedsDestructivePower);
+#else
+    const bool warmSaved = warmStore.saveIfDirty();
+#endif
+#if defined(HELTEC_V4_OLED)
+    ok &= warmSaved;
+#else
+    (void)warmSaved;
+#endif
 #endif
     return ok;
 }
@@ -3217,9 +5452,8 @@ bool NodeDB::saveToDiskNoRetry(int saveWhat)
 
 #ifdef MESHTASTIC_ENCRYPTED_STORAGE
     // When lockdown is ACTIVE but storage is still locked, encryptAndWrite()
-    // returns false for every file. That would cause saveToDisk()'s nRF52 retry
-    // path to call FSCom.format(), wiping all encrypted proto files from flash.
-    // Return true here - "nothing to save, not an error."
+    // returns false for every file. Return true here: nothing can be saved until
+    // unlock, and this is not a filesystem error.
     //
     // Gate on isLockdownActive(): a lockdown-capable but DISABLED device (never
     // provisioned) also has isUnlocked()==false, but it must persist plaintext
@@ -3261,7 +5495,7 @@ bool NodeDB::saveToDiskNoRetry(int saveWhat)
         config.has_bluetooth = true;
         config.has_security = true;
 
-        success &= saveProto(configFileName, meshtastic_LocalConfig_size, &meshtastic_LocalConfig_msg, &config);
+        success &= saveProto(configFileName, meshtastic_LocalConfig_size, &meshtastic_LocalConfig_msg, &config, true);
     }
 
     if (saveWhat & SEGMENT_MODULECONFIG) {
@@ -3284,8 +5518,8 @@ bool NodeDB::saveToDiskNoRetry(int saveWhat)
         moduleConfig.has_mesh_beacon = true;
 #endif
 
-        success &=
-            saveProto(moduleConfigFileName, meshtastic_LocalModuleConfig_size, &meshtastic_LocalModuleConfig_msg, &moduleConfig);
+        success &= saveProto(moduleConfigFileName, meshtastic_LocalModuleConfig_size, &meshtastic_LocalModuleConfig_msg,
+                             &moduleConfig, true);
     }
 
     if (saveWhat & SEGMENT_CHANNELS) {
@@ -3307,6 +5541,59 @@ bool NodeDB::saveToDisk(int saveWhat)
 {
     LOG_DEBUG("Save to disk %d", saveWhat);
 
+#if defined(HELTEC_V4_OLED)
+    if (shouldDeferBootPersistence(bootInitializationInProgress, configLoadComplete, configDecodeFailed)) {
+        bootDeferredPreferenceSegments |= saveWhat;
+        LOG_DEBUG("NodeDB: defer core save 0x%x until complete boot scan", saveWhat);
+        return true;
+    }
+    PreferenceStorageWriteGuard storageWrite(*this);
+    if (!storageWrite) {
+        LOG_WARN("NodeDB: reject save during destructive storage mutation");
+        return false;
+    }
+    const bool authorizedRecoveryWriter =
+        destructiveStorageMutationActive.load(std::memory_order_acquire) &&
+        destructiveStorageOwnerTask.load(std::memory_order_acquire) == reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+    if (requiresConfigRecovery() && !authorizedRecoveryWriter) {
+        LOG_WARN("NodeDB: reject automatic/core save while configuration recovery is required");
+        return false;
+    }
+    if (!preferenceWriteAllowedDuringEdit()) {
+        LOG_WARN("NodeDB: reject external save while a settings edit is open");
+        return false;
+    }
+#endif
+
+    if (!shouldUseFilesystemPersistence(fsIsMounted())) {
+        LOG_ERROR("NodeDB: refusing preference write while filesystem is unavailable");
+#if defined(HELTEC_V4_OLED)
+        // Preserve the degraded-boot recovery channel and the board's GPS-off default even if a
+        // physical/UI caller mutated RAM before discovering that the change cannot be persisted.
+        config.bluetooth.enabled = true;
+        config.position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_DISABLED;
+        config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+        config.lora.tx_enabled = false;
+#endif
+        return false;
+    }
+
+#if defined(HELTEC_V4_OLED)
+    const bool preferenceEditActive = isPreferenceEditTransactionActive();
+    const bool destructiveMutationActiveNow = destructiveStorageMutationActive.load(std::memory_order_acquire);
+    const bool destructivePowerRequired =
+        destructiveMutationActiveNow ||
+        (preferenceEditActive && preferenceEditRequiresDestructivePower.load(std::memory_order_acquire));
+    const bool heltecPowerSafe =
+        destructivePowerRequired ? heltecDestructiveStoragePowerIsSafe() : heltecPreferenceStoragePowerIsSafe();
+    if (!heltecPowerSafe) {
+        if (shouldQueueHeltecPreferenceWriteRetry(false, preferenceEditActive, destructiveMutationActiveNow))
+            powerDeferredPreferenceSegments.fetch_or(saveWhat, std::memory_order_acq_rel);
+        LOG_ERROR("NodeDB: refusing core preference save while fresh power is unsafe");
+        return false;
+    }
+#endif
+
     // do not try to save anything if power level is not safe. In many cases flash will be lock-protected
     // and all writes will fail anyway. Device should be sleeping at this point anyway.
     if (!powerHAL_isPowerLevelSafe()) {
@@ -3317,18 +5604,666 @@ bool NodeDB::saveToDisk(int saveWhat)
     bool success = saveToDiskNoRetry(saveWhat);
 
     if (!success) {
-        LOG_ERROR("Save to disk failed, retry");
-        spiLock->lock();
-        fsFormat();
-        spiLock->unlock();
-
+#if defined(HELTEC_V4_OLED)
+        // A supply that sagged between files is not flash corruption. Leave
+        // ordinary segments dirty and wait for the periodic power thread.
+        const bool retryPowerSafe =
+            destructivePowerRequired ? heltecDestructiveStoragePowerIsSafe() : heltecPreferenceStoragePowerIsSafe();
+        if (!retryPowerSafe) {
+            if (shouldQueueHeltecPreferenceWriteRetry(false, preferenceEditActive, destructiveMutationActiveNow))
+                powerDeferredPreferenceSegments.fetch_or(saveWhat, std::memory_order_acq_rel);
+            LOG_WARN("NodeDB: deferring failed save until power recovers");
+            return false;
+        }
+#endif
+        LOG_ERROR("Save to disk failed, retry without formatting");
         success = saveToDiskNoRetry(saveWhat);
 
         RECORD_CRITICALERROR(success ? meshtastic_CriticalErrorCode_FLASH_CORRUPTION_RECOVERABLE
                                      : meshtastic_CriticalErrorCode_FLASH_CORRUPTION_UNRECOVERABLE);
     }
 
+#if defined(HELTEC_V4_OLED)
+    if (success)
+        powerDeferredPreferenceSegments.fetch_and(~saveWhat, std::memory_order_acq_rel);
+#endif
+
     return success;
+}
+
+#if defined(HELTEC_V4_OLED)
+void NodeDB::retryPowerDeferredPreferenceWrites()
+{
+    const int saveWhat = powerDeferredPreferenceSegments.load(std::memory_order_acquire);
+    if (saveWhat == 0 || bootInitializationInProgress || requiresConfigRecovery() || rebootAtMsec != 0 || shutdownAtMsec != 0 ||
+        isPreferenceEditTransactionActive() || destructiveStorageMutationActive.load(std::memory_order_acquire))
+        return;
+    if (!heltecPreferenceStoragePowerIsSafe())
+        return;
+
+    LOG_INFO("NodeDB: retrying low-voltage deferred preference segments 0x%x", saveWhat);
+    (void)saveToDisk(saveWhat);
+}
+#endif
+
+bool NodeDB::beginPreferenceEdit(bool requireDestructivePower)
+{
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (rebootAtMsec != 0 || shutdownAtMsec != 0) {
+        LOG_WARN("Settings edit refused while reboot/shutdown is pending");
+        return false;
+    }
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire)) {
+        LOG_WARN("Settings edit refused during destructive storage mutation");
+        return false;
+    }
+    concurrency::LockGuard transactionGuard(&heltecPreferencesTransactionLock);
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire)) {
+        LOG_WARN("Settings edit refused during destructive storage mutation");
+        return false;
+    }
+    HeltecXModemStorageGuard xmodemGuard;
+    if (!xmodemGuard) {
+        LOG_ERROR("Settings edit refused while XMODEM transfer is active");
+        return false;
+    }
+    if (requiresConfigRecovery() || readHeltecResetPendingMarker() != HeltecResetPendingKind::NONE) {
+        LOG_ERROR("Settings edit refused while configuration recovery is active");
+        return false;
+    }
+    const bool powerIsSafe =
+        requireDestructivePower ? heltecDestructiveStoragePowerIsSafe() : heltecPreferenceStoragePowerIsSafe();
+    if (!powerIsSafe) {
+        LOG_ERROR("Settings edit refused: power is not safe for a multi-file transaction");
+        return false;
+    }
+
+    PreferenceEditState expected = PreferenceEditState::NONE;
+    if (!preferenceEditState.compare_exchange_strong(expected, PreferenceEditState::QUIESCING, std::memory_order_acq_rel)) {
+        LOG_WARN("Settings edit refused: another edit is already open");
+        return false;
+    }
+    preferenceEditOwnerTask.store(reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle()), std::memory_order_release);
+    preferenceEditOwnerClient.store(currentExternalStateClientToken(), std::memory_order_release);
+    preferenceEditRequiresDestructivePower.store(requireDestructivePower, std::memory_order_release);
+    preferenceEditRadioParked.store(false, std::memory_order_release);
+
+    RadioInterface *const radio = router ? router->getRadioIface() : nullptr;
+    const auto resumeTrafficAfterFence = [&]() {
+        // Release-store NONE before waking either worker. They must never
+        // observe the wake while the generation fence is still active.
+        if (radio)
+            radio->resumeQueuedTransmissions();
+        if (router)
+            router->setReceivedMessage();
+    };
+    const auto cancelBegin = [&]() {
+        // Once radioParked is latched, QUIESCING may already have suppressed
+        // the post-RX rearm even if sleep itself was never needed. Reapply the
+        // unchanged durable generation before releasing either queue.
+        if (preferenceEditRadioParked.load(std::memory_order_acquire)) {
+            preferenceEditState.store(PreferenceEditState::ACTIVATING, std::memory_order_release);
+        }
+        if (preferenceEditRadioParked.load(std::memory_order_acquire) && (!radio || !radio->reconfigure())) {
+            preferenceEditState.store(PreferenceEditState::OPEN, std::memory_order_release);
+            scheduleHeltecRecoveryReboot();
+            return false;
+        }
+        preferenceEditOwnerTask.store(0, std::memory_order_release);
+        preferenceEditOwnerClient.store(0, std::memory_order_release);
+        preferenceEditRequiresDestructivePower.store(false, std::memory_order_release);
+        preferenceEditRadioParked.store(false, std::memory_order_release);
+        preferenceEditState.store(PreferenceEditState::NONE, std::memory_order_release);
+        resumeTrafficAfterFence();
+        return false;
+    };
+
+    // QUIESCING blocks new mesh egress and new Router decoding, but permits a
+    // TX/RX admitted under the committed generation to finish. Never call
+    // sleep() while a TX is active: forced standby is not a successful TX and
+    // must not be reported as one. A bounded refusal leaves the active radio
+    // operation untouched and lets the client retry BEGIN.
+    const auto waitForRadioQuiesce = [&]() {
+        if (!radio)
+            return true;
+        constexpr uint32_t radioQuiesceWaitMs = 5000;
+        const uint32_t started = millis();
+        while (!radio->canParkForConfig()) {
+            if (!Throttle::isWithinTimespanMs(started, radioQuiesceWaitMs)) {
+                LOG_WARN("Settings edit refused: LoRa did not quiesce in time");
+                return false;
+            }
+            delay(1);
+        }
+        return true;
+    };
+    if (!waitForRadioQuiesce())
+        return cancelBegin();
+    if (radio) {
+        // Once the first stable handoff is observed, a just-completed RX/TX
+        // may already have suppressed its normal rearm. Every later exit must
+        // therefore reapply the unchanged committed generation.
+        preferenceEditRadioParked.store(true, std::memory_order_release);
+    }
+
+    // Drain operations admitted just before the CAS while they can still nest
+    // old-generation scopes and enqueue their resulting ACK/relay packet. The
+    // TX worker remains fenced, so those packets stay queued and make BEGIN
+    // retry rather than crossing a key/radio generation.
+    if (!waitForExternalStateReaders()) {
+        LOG_ERROR("Settings edit refused: state readers/writers did not quiesce");
+        return cancelBegin();
+    }
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire) || rebootAtMsec != 0 || shutdownAtMsec != 0) {
+        LOG_WARN("Settings edit cancelled while reset/shutdown became pending");
+        return cancelBegin();
+    }
+
+    // A finishing admitted reader may have been the last producer of radio
+    // work. Revalidate hardware idleness after the reader fence drains.
+    if (!waitForRadioQuiesce())
+        return cancelBegin();
+
+    if (radio) {
+
+        // Queued ciphertext belongs to the currently committed channel keys.
+        // Do not carry it across a settings generation; release the fence and
+        // let its existing owner transmit/decode it before BEGIN is retried.
+        if (radio->hasPendingTransmissionsForConfig() || (router && router->hasPendingRadioPacketsForConfig())) {
+            LOG_INFO("Settings edit deferred until committed-generation LoRa queues drain");
+            return cancelBegin();
+        }
+    }
+
+    if (radio) {
+        if (!radio->sleep()) {
+            LOG_ERROR("Settings edit could not park LoRa safely");
+            return cancelBegin();
+        }
+        // A terminal ISR worker can become runnable immediately after the
+        // pre-sleep snapshot. Driver SPI operations are serialized and
+        // QUIESCING forbids rearm; wait until that worker has fully handed off
+        // its packet before inspecting queues or permitting RAM mutation.
+        if (!waitForRadioQuiesce()) {
+            LOG_ERROR("Settings edit could not verify the parked LoRa handoff");
+            return cancelBegin();
+        }
+        // sleep() first services any already-pending terminal IRQ. If that
+        // captured a frame, decode it under the old keys before allowing the
+        // caller to mutate RAM.
+        if (radio->hasPendingTransmissionsForConfig() || (router && router->hasPendingRadioPacketsForConfig())) {
+            LOG_INFO("Settings edit deferred for LoRa work completed at the quiesce boundary");
+            return cancelBegin();
+        }
+    }
+
+    // No core file is allowed to write while OPEN, so an interruption before
+    // commit leaves the previous on-disk generation intact. The durable EDIT
+    // marker is written immediately before the first commit write, avoiding a
+    // false recovery state when a client disconnects just after BEGIN.
+    preferenceEditState.store(PreferenceEditState::OPEN, std::memory_order_release);
+    return true;
+#else
+    (void)requireDestructivePower;
+    return true;
+#endif
+}
+
+bool NodeDB::cancelPreferenceEdit()
+{
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    concurrency::LockGuard transactionGuard(&heltecPreferencesTransactionLock);
+    if (preferenceEditState.load(std::memory_order_acquire) != PreferenceEditState::OPEN || !isPreferenceEditOwnerCurrentTask() ||
+        requiresConfigRecovery() || readHeltecResetPendingMarker() != HeltecResetPendingKind::NONE) {
+        LOG_ERROR("Settings edit cancellation refused from non-owner or unsafe state");
+        return false;
+    }
+
+    // Keep ingress/egress fenced while the caller-proven-unchanged durable
+    // generation is re-applied.
+    // The radio driver permits only this owner task to rearm RX in ACTIVATING.
+    preferenceEditState.store(PreferenceEditState::ACTIVATING, std::memory_order_release);
+    if (preferenceEditRadioParked.load(std::memory_order_acquire) &&
+        (!router || !router->getRadioIface() || !router->getRadioIface()->reconfigure())) {
+        preferenceEditState.store(PreferenceEditState::OPEN, std::memory_order_release);
+        LOG_ERROR("Settings edit cancellation could not restore radio configuration");
+        scheduleHeltecRecoveryReboot();
+        return false;
+    }
+
+    RadioInterface *const radio = router ? router->getRadioIface() : nullptr;
+    preferenceEditOwnerTask.store(0, std::memory_order_release);
+    preferenceEditOwnerClient.store(0, std::memory_order_release);
+    preferenceEditRequiresDestructivePower.store(false, std::memory_order_release);
+    preferenceEditRadioParked.store(false, std::memory_order_release);
+    preferenceEditState.store(PreferenceEditState::NONE, std::memory_order_release);
+    if (radio)
+        radio->resumeQueuedTransmissions();
+    if (router)
+        router->setReceivedMessage();
+#endif
+    return true;
+}
+
+#if defined(HELTEC_V4_OLED)
+bool NodeDB::isPreferenceEditTransactionActive() const
+{
+    return preferenceEditState.load(std::memory_order_acquire) != PreferenceEditState::NONE;
+}
+
+bool NodeDB::isPreferenceEditQuiescing() const
+{
+    return preferenceEditState.load(std::memory_order_acquire) == PreferenceEditState::QUIESCING;
+}
+
+bool NodeDB::isPreferenceEditRadioActivationAllowed() const
+{
+    return preferenceEditState.load(std::memory_order_acquire) == PreferenceEditState::ACTIVATING &&
+           isPreferenceEditOwnerCurrentTask();
+}
+
+bool NodeDB::isPreferenceEditOwnerCurrentTask() const
+{
+    if (preferenceEditState.load(std::memory_order_acquire) == PreferenceEditState::NONE ||
+        preferenceEditOwnerTask.load(std::memory_order_acquire) != reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle()))
+        return false;
+    const uintptr_t ownerClient = preferenceEditOwnerClient.load(std::memory_order_acquire);
+    return ownerClient == 0 || ownerClient == currentExternalStateClientToken();
+}
+
+bool NodeDB::isDestructiveStorageMutationOwnerCurrentTask() const
+{
+    return destructiveStorageMutationActive.load(std::memory_order_acquire) &&
+           destructiveStorageOwnerTask.load(std::memory_order_acquire) ==
+               reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+}
+
+bool NodeDB::adoptAbandonedPreferenceEdit()
+{
+    if (preferenceEditState.load(std::memory_order_acquire) != PreferenceEditState::OPEN)
+        return false;
+    preferenceEditOwnerTask.store(reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle()), std::memory_order_release);
+    preferenceEditOwnerClient.store(currentExternalStateClientToken(), std::memory_order_release);
+    return true;
+}
+
+bool NodeDB::preferenceWriteAllowedDuringEdit() const
+{
+    const PreferenceEditState state = preferenceEditState.load(std::memory_order_acquire);
+    if (state == PreferenceEditState::NONE)
+        return true;
+    if (state != PreferenceEditState::COMMITTING)
+        return false;
+
+    // Only the task executing commitPreferenceEdit() may write while the
+    // transaction is in its commit phase. Background autosaves on another
+    // task must not join the generation accidentally.
+    return preferenceEditOwnerTask.load(std::memory_order_acquire) == reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+}
+#else
+bool NodeDB::isPreferenceEditTransactionActive() const
+{
+    return false;
+}
+bool NodeDB::isPreferenceEditQuiescing() const
+{
+    return false;
+}
+bool NodeDB::isPreferenceEditOwnerCurrentTask() const
+{
+    return true;
+}
+bool NodeDB::isDestructiveStorageMutationOwnerCurrentTask() const
+{
+    return false;
+}
+bool NodeDB::adoptAbandonedPreferenceEdit()
+{
+    return true;
+}
+bool NodeDB::isPreferenceEditRadioActivationAllowed() const
+{
+    return true;
+}
+#endif
+
+#if defined(HELTEC_V4_OLED)
+uintptr_t NodeDB::currentExternalStateClientToken() const
+{
+    const uintptr_t task = reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+    concurrency::LockGuard guard(&externalStateReaderLock);
+    uintptr_t token = 0;
+    for (const auto &slot : externalStateReaderSlots) {
+        if (slot.task != task || slot.depth == 0 || slot.clientToken == 0)
+            continue;
+        if (token != 0 && token != slot.clientToken)
+            return 0;
+        token = slot.clientToken;
+    }
+    return token;
+}
+
+bool NodeDB::isCurrentExternalStateStatelessClient() const
+{
+    // PhoneAPI reserves bit zero for request-scoped transports such as HTTP;
+    // process-unique connection/session tokens are always even.
+    return (currentExternalStateClientToken() & uintptr_t{1}) != 0;
+}
+
+bool NodeDB::hasCurrentExternalStateAccess() const
+{
+    const uintptr_t task = reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+    concurrency::LockGuard guard(&externalStateReaderLock);
+    for (const auto &slot : externalStateReaderSlots) {
+        if (slot.task == task && slot.depth != 0)
+            return true;
+    }
+    return false;
+}
+#else
+bool NodeDB::hasCurrentExternalStateAccess() const
+{
+    return false;
+}
+bool NodeDB::isCurrentExternalStateStatelessClient() const
+{
+    return false;
+}
+#endif
+
+bool NodeDB::beginPreferenceStorageWrite()
+{
+#if defined(HELTEC_V4_OLED)
+    const uintptr_t task = reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+    const auto ownedByCurrentTask = [&]() { return destructiveStorageOwnerTask.load(std::memory_order_acquire) == task; };
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire) && !ownedByCurrentTask())
+        return false;
+    preferenceStorageWriters.fetch_add(1, std::memory_order_acq_rel);
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire) && !ownedByCurrentTask()) {
+        preferenceStorageWriters.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+    }
+#endif
+    return true;
+}
+
+void NodeDB::endPreferenceStorageWrite()
+{
+#if defined(HELTEC_V4_OLED)
+    preferenceStorageWriters.fetch_sub(1, std::memory_order_acq_rel);
+#endif
+}
+
+bool NodeDB::beginExternalStateAccess(uintptr_t clientToken)
+{
+#if defined(HELTEC_V4_OLED)
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire))
+        return false;
+
+    const uintptr_t task = reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+    {
+        concurrency::LockGuard guard(&externalStateReaderLock);
+        if (destructiveStorageMutationActive.load(std::memory_order_acquire))
+            return false;
+
+        const PreferenceEditState editState = preferenceEditState.load(std::memory_order_acquire);
+        if (editState != PreferenceEditState::NONE) {
+            const uintptr_t ownerTask = preferenceEditOwnerTask.load(std::memory_order_acquire);
+            if (ownerTask != task) {
+                // A Router/MQTT operation admitted before NONE->QUIESCING may
+                // nest more token-zero scopes while it finishes under the old
+                // generation. Do not admit a new request merely because its
+                // executor task was reused.
+                bool continuingAdmittedReader = false;
+                for (const auto &slot : externalStateReaderSlots) {
+                    if (slot.task == task && slot.depth != 0 && (clientToken == 0 || slot.clientToken == clientToken)) {
+                        continuingAdmittedReader = true;
+                        break;
+                    }
+                }
+                if (!continuingAdmittedReader)
+                    return false;
+            }
+            const uintptr_t ownerClient = preferenceEditOwnerClient.load(std::memory_order_acquire);
+            if (ownerTask == task && ownerClient != 0) {
+                bool ownerSessionStillOnStack = false;
+                for (const auto &slot : externalStateReaderSlots) {
+                    if (slot.task == task && slot.depth != 0 && slot.clientToken == ownerClient) {
+                        ownerSessionStillOnStack = true;
+                        break;
+                    }
+                }
+                // Nested Router/MeshService scopes use token zero; allow them
+                // only while the owning PhoneAPI request is visibly on this
+                // same stack. A later HTTP request or reconnected client must
+                // not inherit the transaction merely by reusing a task.
+                if (!ownerSessionStillOnStack && clientToken != ownerClient)
+                    return false;
+            }
+        }
+        ExternalStateReaderSlot *available = nullptr;
+        for (auto &slot : externalStateReaderSlots) {
+            if (slot.task == task && slot.clientToken == clientToken && slot.depth != 0) {
+                available = &slot;
+                break;
+            }
+            if (!available && slot.depth == 0)
+                available = &slot;
+        }
+        if (!available || available->depth == UINT16_MAX) {
+            LOG_ERROR("No PhoneAPI/HTTP reader slot available");
+            return false;
+        }
+        available->task = task;
+        available->clientToken = clientToken;
+        available->depth++;
+        externalStateReaders.fetch_add(1, std::memory_order_release);
+    }
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire)) {
+        endExternalStateAccess(clientToken);
+        return false;
+    }
+#endif
+    return true;
+}
+
+void NodeDB::endExternalStateAccess(uintptr_t clientToken)
+{
+#if defined(HELTEC_V4_OLED)
+    const uintptr_t task = reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+    concurrency::LockGuard guard(&externalStateReaderLock);
+    for (auto &slot : externalStateReaderSlots) {
+        if (slot.task != task || slot.clientToken != clientToken || slot.depth == 0)
+            continue;
+        slot.depth--;
+        if (slot.depth == 0) {
+            slot.task = 0;
+            slot.clientToken = 0;
+        }
+        externalStateReaders.fetch_sub(1, std::memory_order_release);
+        return;
+    }
+    LOG_ERROR("Unbalanced PhoneAPI/HTTP state reader release");
+#endif
+}
+
+bool NodeDB::waitForExternalStateReaders()
+{
+#if defined(HELTEC_V4_OLED)
+    constexpr uint32_t waitLimitMs = 5000;
+    const uint32_t started = millis();
+    const uintptr_t currentTask = reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+    while (true) {
+        uint32_t currentTaskReaders = 0;
+        uint32_t totalReaders = 0;
+        {
+            concurrency::LockGuard guard(&externalStateReaderLock);
+            totalReaders = externalStateReaders.load(std::memory_order_acquire);
+            for (const auto &slot : externalStateReaderSlots) {
+                if (slot.task == currentTask)
+                    currentTaskReaders += slot.depth;
+            }
+        }
+        // A destructive Admin request may be dispatched synchronously inside
+        // its own PhoneAPI callback. That stack cannot race itself; wait only
+        // for readers owned by other tasks before replacing shared state.
+        const uint32_t storageWriters = preferenceStorageWriters.load(std::memory_order_acquire);
+        if (totalReaders <= currentTaskReaders && storageWriters == 0)
+            return true;
+        if (!Throttle::isWithinTimespanMs(started, waitLimitMs)) {
+            LOG_ERROR("Timed out waiting for PhoneAPI/HTTP readers or preference writers");
+            return false;
+        }
+        delay(1);
+    }
+#endif
+    return true;
+}
+
+bool NodeDB::commitPreferenceEdit(int saveWhat, bool commitOpenEdit)
+{
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire)) {
+        LOG_WARN("Settings commit refused during destructive storage mutation");
+        return false;
+    }
+    concurrency::LockGuard transactionGuard(&heltecPreferencesTransactionLock);
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire)) {
+        LOG_WARN("Settings commit refused during destructive storage mutation");
+        return false;
+    }
+    PreferenceEditState initialState = preferenceEditState.load(std::memory_order_acquire);
+    if (initialState == PreferenceEditState::QUIESCING || initialState == PreferenceEditState::COMMITTING ||
+        initialState == PreferenceEditState::ACTIVATING) {
+        LOG_ERROR("Settings commit refused: another commit is already active");
+        return false;
+    }
+    if (initialState == PreferenceEditState::NONE) {
+        // Opening here is too late: reloadConfig() is called after setters have
+        // already changed shared RAM. Every Heltec mutation must establish
+        // BEGIN/QUIESCING before touching that state.
+        LOG_ERROR("Settings commit refused without a pre-mutation transaction fence");
+        return false;
+    }
+    if (initialState == PreferenceEditState::OPEN && !commitOpenEdit) {
+        // A menu/autosave racing a client bulk import must not commit one
+        // segment and clear the client's durable EDIT marker.
+        LOG_WARN("One-shot settings commit refused while a bulk edit is open");
+        return false;
+    }
+    if (initialState == PreferenceEditState::OPEN && commitOpenEdit && !isPreferenceEditOwnerCurrentTask()) {
+        LOG_WARN("Settings commit refused from a different local transport task");
+        return false;
+    }
+
+    const auto failBeforeCommit = []() { return false; };
+
+    HeltecXModemStorageGuard xmodemGuard;
+    if (!xmodemGuard) {
+        LOG_ERROR("Settings commit refused while XMODEM transfer is active");
+        return failBeforeCommit();
+    }
+    const HeltecResetPendingKind pendingKind = readHeltecResetPendingMarker();
+    if (pendingKind != HeltecResetPendingKind::NONE) {
+        LOG_ERROR("Settings commit refused while another recovery transaction is active");
+        return failBeforeCommit();
+    }
+    const bool editRequiresDestructivePower = preferenceEditRequiresDestructivePower.load(std::memory_order_acquire);
+    const auto commitPowerIsSafe = [editRequiresDestructivePower]() {
+        return editRequiresDestructivePower ? heltecDestructiveStoragePowerIsSafe() : heltecPreferenceStoragePowerIsSafe();
+    };
+    if (!commitPowerIsSafe()) {
+        LOG_ERROR("Settings commit refused: power is not safe for a multi-file transaction");
+        return failBeforeCommit();
+    }
+    if (!writeHeltecResetPendingMarker(HeltecResetPendingKind::EDIT, editRequiresDestructivePower)) {
+        LOG_ERROR("Settings commit refused: durable intent could not be verified");
+        return failBeforeCommit();
+    }
+
+    preferenceEditOwnerTask.store(reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle()), std::memory_order_release);
+    preferenceEditState.store(PreferenceEditState::COMMITTING, std::memory_order_release);
+    const bool saved = saveToDisk(saveWhat);
+    const bool powerStillSafe = commitPowerIsSafe();
+    const bool markerCleared =
+        saved && powerStillSafe && clearHeltecResetPendingMarker(HeltecResetPendingKind::EDIT, editRequiresDestructivePower);
+    if (markerCleared) {
+        // Keep mesh traffic fenced until MeshService has applied the committed
+        // channel/radio generation to hardware. The owner task alone may rearm
+        // RX during that activation window.
+        preferenceEditState.store(PreferenceEditState::ACTIVATING, std::memory_order_release);
+        return true;
+    }
+
+    // Keep every unrelated preference writer blocked until the guarded reboot.
+    preferenceEditOwnerTask.store(0, std::memory_order_release);
+    preferenceEditOwnerClient.store(0, std::memory_order_release);
+    preferenceEditState.store(PreferenceEditState::OPEN, std::memory_order_release);
+
+    LOG_ERROR("Settings commit incomplete - entering local recovery");
+    configDecodeFailed = true;
+    incompleteConfigResetDetected = true;
+    unreadablePreferenceSegments |= saveWhat;
+    forceHeltecLocalRecoveryConfiguration();
+#if !MESHTASTIC_EXCLUDE_GPS
+    if (gps)
+        gps->disable();
+#endif
+    if (router && router->getRadioIface())
+        router->getRadioIface()->sleep();
+    scheduleHeltecRecoveryReboot();
+    return false;
+#else
+    (void)commitOpenEdit;
+    return saveToDisk(saveWhat);
+#endif
+}
+
+bool NodeDB::activatePreferenceEditRadio(bool radioConfigChanged)
+{
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    concurrency::LockGuard transactionGuard(&heltecPreferencesTransactionLock);
+    if (!isPreferenceEditRadioActivationAllowed()) {
+        LOG_ERROR("Settings radio activation refused from non-owner task/state");
+        return false;
+    }
+    const bool mustReconfigure = radioConfigChanged || preferenceEditRadioParked.load(std::memory_order_acquire);
+    if (mustReconfigure && (!router || !router->getRadioIface() || !router->getRadioIface()->reconfigure())) {
+        LOG_ERROR("Committed settings could not restore LoRa RX");
+        scheduleHeltecRecoveryReboot();
+        return false;
+    }
+    preferenceEditRadioParked.store(false, std::memory_order_release);
+#else
+    (void)radioConfigChanged;
+#endif
+    return true;
+}
+
+bool NodeDB::finishPreferenceEditActivation()
+{
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    concurrency::LockGuard transactionGuard(&heltecPreferencesTransactionLock);
+    if (!isPreferenceEditRadioActivationAllowed()) {
+        LOG_ERROR("Settings activation finish refused from non-owner task/state");
+        return false;
+    }
+    if (preferenceEditRadioParked.load(std::memory_order_acquire)) {
+        LOG_ERROR("Settings activation cannot finish while LoRa remains parked");
+        scheduleHeltecRecoveryReboot();
+        return false;
+    }
+    preferenceEditOwnerTask.store(0, std::memory_order_release);
+    preferenceEditOwnerClient.store(0, std::memory_order_release);
+    preferenceEditRequiresDestructivePower.store(false, std::memory_order_release);
+    preferenceEditRadioParked.store(false, std::memory_order_release);
+    preferenceEditState.store(PreferenceEditState::NONE, std::memory_order_release);
+    if (router && router->getRadioIface())
+        router->getRadioIface()->resumeQueuedTransmissions();
+    if (router)
+        router->setReceivedMessage();
+#endif
+    return true;
 }
 
 const meshtastic_NodeInfoLite *NodeDB::readNextMeshNode(uint32_t &readIndex)
@@ -3423,7 +6358,6 @@ size_t NodeDB::getNumOnlineMeshNodes(bool localOnly)
 }
 
 #include "MeshModule.h"
-#include "Throttle.h"
 
 // Minimum spacing between evictions once the node database is full.
 #define NODEDB_FULL_EVICTION_INTERVAL_MS (2 * 1000UL)
@@ -3551,19 +6485,23 @@ void NodeDB::updateTelemetry(uint32_t nodeId, const meshtastic_Telemetry &t, RxS
 /**
  * Update the node database with a new contact
  */
-void NodeDB::addFromContact(meshtastic_SharedContact contact)
+bool NodeDB::addFromContact(meshtastic_SharedContact contact, bool persist)
 {
+    // Validate before getOrCreateMeshNode(), which may evict another entry.
+    // Every false return below must be a proven no-op so a surrounding edit
+    // transaction can safely cancel.
+    if (!contact.has_user)
+        return false;
     meshtastic_NodeInfoLite *info = getOrCreateMeshNode(contact.node_num);
-    if (!info || !contact.has_user) {
-        return;
-    }
+    if (!info)
+        return false;
     // If the local node has this node marked as manually verified
     // and the client does not, do not allow the client to update the
     // saved public key.
     if (nodeInfoLiteIsKeyManuallyVerified(info) && !contact.manually_verified) {
         if (contact.user.public_key.size != info->public_key.size ||
             memcmp(contact.user.public_key.bytes, info->public_key.bytes, info->public_key.size) != 0) {
-            return;
+            return false;
         }
     }
     info->num = contact.node_num;
@@ -3586,7 +6524,9 @@ void NodeDB::addFromContact(meshtastic_SharedContact contact)
         nodeInfoLiteSetBit(info, NODEINFO_BITFIELD_IS_FAVORITE_MASK, false);
         eraseNodeSatellites(contact.node_num);
 #if HAS_SCREEN || defined(MESHTASTIC_INCLUDE_NICHE_GRAPHICS)
-        messageStore.deleteAllMessagesFromNode(contact.node_num);
+        // History lives in a separate file and must follow, never precede,
+        // the durable ignored flag. AdminModule applies it after COMMIT; direct
+        // persistent callers do so below only after nodes.proto verifies.
 #endif
     } else {
         /* Clients are sending add_contact before every text message DM (because clients may hold a larger node database with
@@ -3624,12 +6564,17 @@ void NodeDB::addFromContact(meshtastic_SharedContact contact)
         sortMeshDB();
         notifyObservers(true); // Force an update whether or not our node counts have changed
     }
-    saveNodeDatabaseToDisk();
+    const bool saved = !persist || saveNodeDatabaseToDisk();
+#if HAS_SCREEN || defined(MESHTASTIC_INCLUDE_NICHE_GRAPHICS)
+    if (saved && persist && contact.should_ignore)
+        messageStore.deleteAllMessagesFromNode(contact.node_num);
+#endif
+    return saved;
 }
 
 /** Update user info and channel for this node based on received user data
  */
-bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelIndex, bool xeddsaSigned)
+bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelIndex, bool xeddsaSigned, bool persist)
 {
     // Only a signed update may change the identity of a proven signer; our own record is exempt.
     // Checked before getOrCreateMeshNode so a refusal cannot evict; isKnownXeddsaSigner covers the warm tier.
@@ -3711,10 +6656,10 @@ bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelInde
         // We just changed something about a User,
         // store our DB unless we just did so less than a minute ago
 
-        if (!Throttle::isWithinTimespanMs(lastNodeDbSave, ONE_MINUTE_MS)) {
+        if (persist && !Throttle::isWithinTimespanMs(lastNodeDbSave, ONE_MINUTE_MS)) {
             saveToDisk(SEGMENT_NODEDATABASE);
             lastNodeDbSave = millis();
-        } else {
+        } else if (persist) {
             LOG_DEBUG("Defer NodeDB saveToDisk");
         }
     }
@@ -3847,7 +6792,7 @@ bool NodeDB::setProtectedFlag(meshtastic_NodeInfoLite *node, uint32_t mask, bool
     return false;
 }
 
-bool NodeDB::set_favorite(bool is_favorite, uint32_t nodeId)
+bool NodeDB::set_favorite(bool is_favorite, uint32_t nodeId, bool persist)
 {
     meshtastic_NodeInfoLite *lite = getMeshNode(nodeId);
     if (!lite)
@@ -3856,8 +6801,7 @@ bool NodeDB::set_favorite(bool is_favorite, uint32_t nodeId)
         return true; // already in the requested state
     if (setProtectedFlag(lite, NODEINFO_BITFIELD_IS_FAVORITE_MASK, is_favorite)) {
         sortMeshDB();
-        saveNodeDatabaseToDisk();
-        return true;
+        return !persist || saveNodeDatabaseToDisk();
     }
     LOG_WARN(PROTECTED_CAP_WARN_FMT, "favorite", nodeId, MAX_NUM_NODES - 2);
     return false;
@@ -4419,17 +7363,60 @@ bool NodeDB::checkLowEntropyPublicKey(const meshtastic_Config_SecurityConfig_pub
 }
 #endif
 
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+// A freshly minted keypair must not itself land on the blacklist. Fail with no key rather than persist
+// a known-weak identity: only a broken entropy source can land here, and retrying would not fix that.
+bool NodeDB::generateBlacklistCheckedKeyPair()
+{
+    crypto->generateKeyPair(config.security.public_key.bytes, config.security.private_key.bytes);
+    if (!checkLowEntropyPublicKey(config.security.public_key))
+        return true;
+    LOG_ERROR("PKI keygen produced a known low-entropy key; entropy source is broken");
+    config.security.public_key.size = 0;
+    config.security.private_key.size = 0;
+    crypto->restoreIdentity(nullptr);
+    return false;
+}
+
+// Derive the public key from the stored private key and vet it. The entry check cannot see a weak key
+// when the stored public key is absent, and a failed derivation must not leave sizes claiming a pair.
+bool NodeDB::derivePublicKeyFromPrivate()
+{
+    config.security.public_key.size = 32;
+    if (!crypto->regeneratePublicKey(config.security.public_key.bytes, config.security.private_key.bytes)) {
+        LOG_ERROR("Can't generate public key from private key");
+        config.security.public_key.size = 0;
+        config.security.private_key.size = 0;
+        return false;
+    }
+    if (!checkLowEntropyPublicKey(config.security.public_key))
+        return true;
+    keyIsLowEntropy = true;
+    LOG_WARN("Private key derives a known low-entropy public key; generating a new keypair");
+    return generateBlacklistCheckedKeyPair();
+}
+#endif
+
 bool NodeDB::generateCryptoKeyPair(const uint8_t *privateKey)
 {
 #if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
-    // Generate identity keys once a LoRa region is set. Licensed operation still needs the identity
-    // key for plaintext signatures, even though the key is never used for PKI encryption.
+    if (!shouldUseFilesystemPersistence(fsIsMounted())) {
+        LOG_ERROR("NodeDB: refusing PKI key generation while filesystem is unavailable");
+        return false;
+    }
+
+    // Mint a new identity only after a LoRa region is selected. Restoring an
+    // existing private key is safe while region is UNSET: it enables no radio
+    // traffic and prevents a temporary MAC-derived Node ID during migrations.
+    // Licensed operation still needs the identity key for plaintext
+    // signatures, even though the key is never used for PKI encryption.
     bool regionBlocksKeygen = config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET;
 #if ARCH_PORTDUINO
     if (portduino_config.lora_module == use_simradio)
         regionBlocksKeygen = false;
 #endif
-    if (regionBlocksKeygen) {
+    const bool canRestoreExistingKey = privateKey != nullptr || config.security.private_key.size == 32;
+    if (regionBlocksKeygen && !canRestoreExistingKey) {
         return false;
     }
 
@@ -4444,29 +7431,24 @@ bool NodeDB::generateCryptoKeyPair(const uint8_t *privateKey)
         LOG_INFO("Using provided private key for PKI");
         memcpy(config.security.private_key.bytes, privateKey, 32);
         config.security.private_key.size = 32;
-        config.security.public_key.size = 32;
 
-        // Generate public key from the provided private key
-        if (crypto->regeneratePublicKey(config.security.public_key.bytes, config.security.private_key.bytes)) {
-            keygenSuccess = true;
-        } else {
-            LOG_ERROR("Can't generate public key from private key");
+        if (!derivePublicKeyFromPrivate())
             return false;
-        }
+        keygenSuccess = true;
     }
     // Try to regenerate public key from existing private key if it's valid and not low entropy
     else if (config.security.private_key.size == 32 && !keyIsLowEntropy) {
-        config.security.public_key.size = 32;
         LOG_DEBUG("Regenerate PKI public key from private key");
-        if (crypto->regeneratePublicKey(config.security.public_key.bytes, config.security.private_key.bytes)) {
-            keygenSuccess = true;
-        }
+        if (!derivePublicKeyFromPrivate())
+            return false;
+        keygenSuccess = true;
     } else {
         // Generate a new key pair
         LOG_INFO("Generate new PKI keys");
         config.security.public_key.size = 32;
         config.security.private_key.size = 32;
-        crypto->generateKeyPair(config.security.public_key.bytes, config.security.private_key.bytes);
+        if (!generateBlacklistCheckedKeyPair())
+            return false;
         keygenSuccess = true;
     }
 
@@ -4484,6 +7466,17 @@ bool NodeDB::generateCryptoKeyPair(const uint8_t *privateKey)
     }
     return keygenSuccess;
 #else
+    return false;
+#endif
+}
+
+bool NodeDB::derivePublicKeyForValidation(const uint8_t privateKey[32], uint8_t publicKey[32]) const
+{
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+    return privateKey && publicKey && derivePublicKeyWithoutInstalling(privateKey, publicKey);
+#else
+    (void)privateKey;
+    (void)publicKey;
     return false;
 #endif
 }
@@ -4525,14 +7518,21 @@ bool NodeDB::createNewIdentity()
     }
 
     myNodeInfo.my_node_num = newNodeNum;
+    snprintf(owner.id, sizeof(owner.id), "!%08x", newNodeNum);
 
     // The number has moved, so the caller must persist it whatever happens next. Returning false here
     // would leave the new key saved against the old number, which is the break this exists to prevent.
-    meshtastic_NodeInfoLite *info = getOrCreateMeshNode(getNodeNum());
+    // Identity rotation can run inside an OPEN settings transaction. Repair
+    // the hot-store invariant in RAM without attempting an out-of-generation
+    // write; the caller persists NODEDATABASE with the rest of the identity.
+    nodeDBSelfCare(false);
+    meshtastic_NodeInfoLite *info = getMeshNode(getNodeNum());
     if (info)
         TypeConversions::CopyUserToNodeInfoLite(info, owner);
-    else
+    else {
         LOG_ERROR("No room for our own node 0x%08x, identity moved without a self record", newNodeNum);
+        return false;
+    }
 
     return true;
 }
@@ -4540,6 +7540,11 @@ bool NodeDB::createNewIdentity()
 bool NodeDB::ensurePkiIdentity()
 {
 #if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+    if (!shouldUsePersistentConfiguration(shouldUseFilesystemPersistence(fsIsMounted()), requiresConfigRecovery())) {
+        LOG_ERROR("NodeDB: refusing PKI identity creation while persistent configuration is unavailable");
+        return false;
+    }
+
     // A failed or declined keygen leaves the existing key, and so the existing node num, untouched.
     if (!crypto || !crypto->ensurePkiKeys(config.security, owner))
         return false;
@@ -4554,6 +7559,30 @@ bool NodeDB::ensurePkiIdentity()
 
 bool NodeDB::backupPreferences(meshtastic_AdminMessage_BackupLocation location)
 {
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire)) {
+        LOG_ERROR("Backup refused during destructive storage mutation");
+        return false;
+    }
+    concurrency::LockGuard transactionGuard(&heltecPreferencesTransactionLock);
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire)) {
+        LOG_ERROR("Backup refused during destructive storage mutation");
+        return false;
+    }
+    if (isPreferenceEditTransactionActive()) {
+        LOG_ERROR("Backup refused while a settings edit is open");
+        return false;
+    }
+    HeltecXModemStorageGuard xmodemGuard;
+    if (!xmodemGuard) {
+        LOG_ERROR("Backup refused while XMODEM transfer is active");
+        return false;
+    }
+    if (readHeltecResetPendingMarker() != HeltecResetPendingKind::NONE) {
+        LOG_ERROR("Backup refused while a recovery transaction is active");
+        return false;
+    }
+#endif
     bool success = false;
     lastBackupAttempt = millis();
 #ifdef FSCom
@@ -4576,7 +7605,7 @@ bool NodeDB::backupPreferences(meshtastic_AdminMessage_BackupLocation location)
         spiLock->lock();
         FSCom.mkdir("/backups");
         spiLock->unlock();
-        success = saveProto(backupFileName, backupSize, &meshtastic_BackupPreferences_msg, &backup);
+        success = saveProto(backupFileName, backupSize, &meshtastic_BackupPreferences_msg, &backup, true);
 
         if (success) {
             LOG_INFO("Saved backup preferences");
@@ -4590,9 +7619,88 @@ bool NodeDB::backupPreferences(meshtastic_AdminMessage_BackupLocation location)
     return success;
 }
 
+bool NodeDB::removeBackupPreferences(meshtastic_AdminMessage_BackupLocation location)
+{
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire)) {
+        LOG_ERROR("Backup removal refused during destructive storage mutation");
+        return false;
+    }
+    concurrency::LockGuard transactionGuard(&heltecPreferencesTransactionLock);
+    if (destructiveStorageMutationActive.load(std::memory_order_acquire)) {
+        LOG_ERROR("Backup removal refused during destructive storage mutation");
+        return false;
+    }
+    if (isPreferenceEditTransactionActive()) {
+        LOG_ERROR("Backup removal refused while a settings edit is open");
+        return false;
+    }
+    HeltecXModemStorageGuard xmodemGuard;
+    if (!xmodemGuard) {
+        LOG_ERROR("Backup removal refused while XMODEM transfer is active");
+        return false;
+    }
+    if (readHeltecResetPendingMarker() != HeltecResetPendingKind::NONE || requiresConfigRecovery()) {
+        LOG_ERROR("Backup removal refused while configuration recovery is active");
+        return false;
+    }
+#endif
+#ifdef FSCom
+    if (location == meshtastic_AdminMessage_BackupLocation_FLASH) {
+        concurrency::LockGuard guard(spiLock);
+#if defined(HELTEC_V4_OLED)
+        String temporaryPath = backupFileName;
+        temporaryPath += ".tmp";
+        return removeHeltecFileChecked(backupFileName) && removeHeltecFileChecked(temporaryPath.c_str()) &&
+               !FSCom.exists(backupFileName) && !FSCom.exists(temporaryPath.c_str());
+#else
+        return !FSCom.exists(backupFileName) || FSCom.remove(backupFileName);
+#endif
+    }
+#endif
+    return false;
+}
+
 bool NodeDB::restorePreferences(meshtastic_AdminMessage_BackupLocation location, int restoreWhat)
 {
-    bool success = false;
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+    if (rebootAtMsec != 0 || shutdownAtMsec != 0) {
+        LOG_ERROR("Restore refused while reboot/shutdown is pending");
+        return false;
+    }
+    bool expectedInactive = false;
+    if (!destructiveStorageMutationActive.compare_exchange_strong(expectedInactive, true, std::memory_order_acq_rel)) {
+        LOG_ERROR("Restore refused while another destructive operation is active");
+        return false;
+    }
+    destructiveStorageOwnerTask.store(reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle()), std::memory_order_release);
+    bool keepDestructiveFenceUntilReboot = false;
+    struct RestoreActivityGuard {
+        std::atomic<bool> &flag;
+        std::atomic<uintptr_t> &owner;
+        bool &keepUntilReboot;
+        ~RestoreActivityGuard()
+        {
+            owner.store(0, std::memory_order_release);
+            if (!keepUntilReboot)
+                flag.store(false, std::memory_order_release);
+        }
+    } activityGuard{destructiveStorageMutationActive, destructiveStorageOwnerTask, keepDestructiveFenceUntilReboot};
+    if (!waitForExternalStateReaders()) {
+        LOG_ERROR("Restore refused while a PhoneAPI/HTTP state reader is active");
+        return false;
+    }
+    concurrency::LockGuard transactionGuard(&heltecPreferencesTransactionLock);
+    if (isPreferenceEditTransactionActive()) {
+        LOG_ERROR("Restore refused while a settings edit is open");
+        return false;
+    }
+    HeltecXModemStorageGuard xmodemGuard;
+    if (!xmodemGuard) {
+        LOG_ERROR("Restore refused while XMODEM transfer is active");
+        return false;
+    }
+#endif
 #ifdef FSCom
     if (location == meshtastic_AdminMessage_BackupLocation_FLASH) {
         spiLock->lock();
@@ -4604,47 +7712,317 @@ bool NodeDB::restorePreferences(meshtastic_AdminMessage_BackupLocation location,
             spiLock->unlock();
         }
         meshtastic_BackupPreferences backup = meshtastic_BackupPreferences_init_zero;
-        success = loadProto(backupFileName, meshtastic_BackupPreferences_size, sizeof(meshtastic_BackupPreferences),
-                            &meshtastic_BackupPreferences_msg, &backup);
-        if (success) {
-            if (restoreWhat & SEGMENT_CONFIG) {
-                config = backup.config;
-                LOG_DEBUG("Restored config");
-            }
-            if (restoreWhat & SEGMENT_MODULECONFIG) {
-                moduleConfig = backup.module_config;
-                LOG_DEBUG("Restored module config");
-            }
-            if (restoreWhat & SEGMENT_DEVICESTATE) {
-                devicestate.owner = backup.owner;
-                LOG_DEBUG("Restored device state");
-            }
-            if (restoreWhat & SEGMENT_CHANNELS) {
-                channelFile = backup.channels;
-                LOG_DEBUG("Restored channels");
-            }
-
-            if (owner.is_licensed && channels.ensureLicensedOperation()) {
-                restoreWhat |= SEGMENT_CHANNELS;
-                LOG_WARN("Licensed operation sanitized restored channel encryption/admin access");
-            }
-            if (restoreWhat & SEGMENT_CHANNELS)
-                channels.onConfigChanged();
-
-            success = saveToDisk(restoreWhat);
-            if (success) {
-                LOG_INFO("Restored prefs from backup");
-            } else {
-                LOG_ERROR("Save restored prefs to flash failed");
-            }
-        } else {
+        const LoadFileResult loadResult =
+            loadProto(backupFileName, meshtastic_BackupPreferences_size, sizeof(meshtastic_BackupPreferences),
+                      &meshtastic_BackupPreferences_msg, &backup);
+        if (loadResult != LoadFileResult::LOAD_SUCCESS) {
             LOG_ERROR("Restore prefs from backup failed");
+            return false;
         }
+
+        constexpr int restorableSegments = SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS;
+        if (restoreWhat == 0 || (restoreWhat & ~restorableSegments) != 0 || backup.version < DEVICESTATE_MIN_VER ||
+            backup.version > DEVICESTATE_CUR_VER || ((restoreWhat & SEGMENT_CONFIG) && !backup.has_config) ||
+            ((restoreWhat & SEGMENT_MODULECONFIG) && !backup.has_module_config) ||
+            ((restoreWhat & SEGMENT_DEVICESTATE) && !backup.has_owner) ||
+            ((restoreWhat & SEGMENT_CHANNELS) && !backup.has_channels)) {
+            LOG_ERROR("Restore prefs rejected: backup is incomplete or incompatible");
+            return false;
+        }
+        if (((restoreWhat & SEGMENT_CONFIG) &&
+             (backup.config.version < DEVICESTATE_MIN_VER || backup.config.version > DEVICESTATE_CUR_VER)) ||
+            ((restoreWhat & SEGMENT_MODULECONFIG) && (backup.module_config.version < DEVICESTATE_MIN_VER ||
+                                                      backup.module_config.version > POSITION_TELEMETRY_OPTIN_VER)) ||
+            ((restoreWhat & SEGMENT_CHANNELS) &&
+             (backup.channels.version < DEVICESTATE_MIN_VER || backup.channels.version > POSITION_TELEMETRY_OPTIN_VER ||
+              !isCompleteChannelFile(backup.channels)))) {
+            LOG_ERROR("Restore prefs rejected: nested backup data is invalid");
+            return false;
+        }
+
+        meshtastic_LocalConfig candidateConfig = (restoreWhat & SEGMENT_CONFIG) ? backup.config : config;
+        meshtastic_User candidateOwner = (restoreWhat & SEGMENT_DEVICESTATE) ? backup.owner : owner;
+        if (restoreWhat & SEGMENT_CONFIG) {
+            if (!candidateConfig.has_lora) {
+                LOG_ERROR("Restore prefs rejected: backup config has no LoRa section");
+                return false;
+            }
+            if (candidateConfig.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UA_868) {
+                LOG_INFO("Restore prefs: migrate obsolete UA_868 region to EU_868");
+                candidateConfig.lora.region = meshtastic_Config_LoRaConfig_RegionCode_EU_868;
+            } else if (getRegion(candidateConfig.lora.region)->code != candidateConfig.lora.region) {
+                LOG_ERROR("Restore prefs rejected: backup contains an unknown LoRa region");
+                return false;
+            }
+
+            const RegionInfo *candidateRegion = getRegion(candidateConfig.lora.region);
+            if (candidateRegion->profile->licensedOnly && !candidateOwner.is_licensed) {
+                LOG_ERROR("Restore prefs rejected: licensed LoRa region requires a licensed backup owner");
+                return false;
+            }
+#if defined(HELTEC_V4_OLED)
+            // Heltec V4 carries a sub-GHz SX1262. Keep the check exact even
+            // in an unusual recovery path where RadioLibInterface::instance
+            // has not yet been constructed.
+            if (candidateRegion->wideLora) {
+                LOG_ERROR("Restore prefs rejected: 2.4 GHz LoRa is unsupported by Heltec V4");
+                return false;
+            }
+#endif
+            char regionError[160] = {};
+            if (!RadioInterface::checkConfigRegion(candidateConfig.lora, regionError, sizeof(regionError),
+                                                   candidateOwner.is_licensed) ||
+                !RadioInterface::validateConfigLora(candidateConfig.lora)) {
+                LOG_ERROR("Restore prefs rejected: LoRa settings are not usable on this hardware (%s)", regionError);
+                return false;
+            }
+        }
+        const size_t privateKeySize = candidateConfig.has_security ? candidateConfig.security.private_key.size : 0;
+        const size_t configPublicKeySize = candidateConfig.has_security ? candidateConfig.security.public_key.size : 0;
+        const size_t ownerPublicKeySize = candidateOwner.public_key.size;
+        const bool currentHasPersistentIdentity =
+            (config.has_security && (config.security.private_key.size != 0 || config.security.public_key.size != 0)) ||
+            owner.public_key.size != 0;
+        if ((privateKeySize != 0 && privateKeySize != 32) || (configPublicKeySize != 0 && configPublicKeySize != 32) ||
+            (ownerPublicKeySize != 0 && ownerPublicKeySize != 32) ||
+            (privateKeySize == 0 && (configPublicKeySize != 0 || ownerPublicKeySize != 0)) ||
+            (privateKeySize == 0 && currentHasPersistentIdentity)) {
+            LOG_ERROR("Restore prefs rejected: backup identity lengths are inconsistent");
+            return false;
+        }
+
+        uint32_t candidateNodeNum = myNodeInfo.my_node_num;
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+        if (privateKeySize == 32) {
+            uint8_t derivedPublicKey[32];
+            if (!derivePublicKeyWithoutInstalling(candidateConfig.security.private_key.bytes, derivedPublicKey) ||
+                (configPublicKeySize == 32 &&
+                 memcmp(candidateConfig.security.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey)) != 0) ||
+                (ownerPublicKeySize == 32 &&
+                 memcmp(candidateOwner.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey)) != 0)) {
+                LOG_ERROR("Restore prefs rejected: backup keypair is inconsistent");
+                return false;
+            }
+            candidateConfig.has_security = true;
+            candidateConfig.security.public_key.size = sizeof(derivedPublicKey);
+            memcpy(candidateConfig.security.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey));
+            if (checkLowEntropyPublicKey(candidateConfig.security.public_key)) {
+                LOG_ERROR("Restore prefs rejected: backup identity uses a compromised key");
+                return false;
+            }
+            candidateOwner.public_key.size = sizeof(derivedPublicKey);
+            memcpy(candidateOwner.public_key.bytes, derivedPublicKey, sizeof(derivedPublicKey));
+            candidateNodeNum = crc32Buffer(derivedPublicKey, sizeof(derivedPublicKey));
+        }
+#endif
+
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+        if (privateKeySize == 32 && (!crypto || !cryptLock)) {
+            LOG_ERROR("Restore prefs rejected: crypto engine is unavailable");
+            return false;
+        }
+#endif
+
+#if defined(HELTEC_V4_OLED)
+        const bool resolvingLegacyMigration = legacyPreferencesPendingCleanup || incompleteLegacyMigrationDetected;
+        const HeltecResetPendingKind pendingKind = readHeltecResetPendingMarker();
+        const bool replacingInterruptedCoreTransaction =
+            pendingKind == HeltecResetPendingKind::EDIT || pendingKind == HeltecResetPendingKind::CONFIG_ONLY;
+        if (pendingKind == HeltecResetPendingKind::NODEDB_RESET || incompleteNodeDatabaseResetDetected) {
+            LOG_ERROR("Restore prefs rejected: retry the interrupted node-db reset first");
+            return false;
+        }
+        if (incompletePreferenceRestoreDetected && restoreWhat != restorableSegments) {
+            LOG_ERROR("Restore prefs rejected: interrupted restore requires every backed-up segment");
+            return false;
+        }
+        if (replacingInterruptedCoreTransaction && restoreWhat != restorableSegments) {
+            LOG_ERROR("Restore prefs rejected: interrupted settings/reset recovery requires every backed-up segment");
+            return false;
+        }
+        if (resolvingLegacyMigration && restoreWhat != restorableSegments) {
+            LOG_ERROR("Restore prefs rejected: incomplete legacy migration requires every backed-up segment");
+            return false;
+        }
+        if (!heltecDestructiveStoragePowerIsSafe()) {
+            LOG_ERROR("Restore prefs refused: connect stable power or charge the battery");
+            return false;
+        }
+        const bool restoredNodeDatabaseRequired = privateKeySize == 32 || candidateOwner.is_licensed;
+        int saveWhat = restoreWhat;
+        if (candidateNodeNum != myNodeInfo.my_node_num || (resolvingLegacyMigration && restoredNodeDatabaseRequired))
+            saveWhat |= SEGMENT_DEVICESTATE | SEGMENT_NODEDATABASE;
+        if ((unreadablePreferenceSegments & ~saveWhat) != 0) {
+            LOG_ERROR("Restore prefs rejected: an unreadable segment is not repaired by this backup");
+            return false;
+        }
+        if (!writeHeltecResetPendingMarker(HeltecResetPendingKind::RESTORE, true)) {
+            LOG_ERROR("Restore prefs refused: pending marker could not be verified");
+            return false;
+        }
+        keepDestructiveFenceUntilReboot = true;
+
+        // A validated, explicit restore is authorization to replace exactly
+        // these segments. Keep unrelated unreadable data protected.
+        unreadablePreferenceSegments &= ~saveWhat;
+        incompleteConfigResetDetected = false;
+        incompletePreferenceRestoreDetected = false;
+        incompleteLegacyMigrationDetected = false;
+        if (restoreWhat & SEGMENT_CONFIG)
+            configDecodeFailed = false;
+#if HAS_WIFI
+        deinitWifi();
+#endif
+        disableBluetooth();
+#if !MESHTASTIC_EXCLUDE_GPS
+        if (gps)
+            gps->disable();
+#endif
+        if (!parkHeltecRadioForStorageMutation()) {
+            LOG_ERROR("Restore could not safely drain/park LoRa");
+            incompleteConfigResetDetected = true;
+            incompletePreferenceRestoreDetected = true;
+            incompleteLegacyMigrationDetected = resolvingLegacyMigration;
+            configDecodeFailed = true;
+            unreadablePreferenceSegments |= saveWhat;
+            forceHeltecLocalRecoveryConfiguration();
+            scheduleHeltecRecoveryReboot();
+            return false;
+        }
+        const auto abortRestore = [&]() {
+            incompleteConfigResetDetected = true;
+            incompletePreferenceRestoreDetected = true;
+            incompleteLegacyMigrationDetected = resolvingLegacyMigration;
+            configDecodeFailed = true;
+            unreadablePreferenceSegments |= saveWhat;
+            forceHeltecLocalRecoveryConfiguration();
+#if !MESHTASTIC_EXCLUDE_GPS
+            if (gps)
+                gps->disable();
+#endif
+            if (router && router->getRadioIface())
+                router->getRadioIface()->sleep();
+            scheduleHeltecRecoveryReboot();
+            return false;
+        };
+#else
+        int saveWhat = restoreWhat;
+#endif
+
+        if (restoreWhat & SEGMENT_CONFIG) {
+            config = candidateConfig;
+            LOG_DEBUG("Restored config");
+        }
+        if (restoreWhat & SEGMENT_MODULECONFIG) {
+            moduleConfig = backup.module_config;
+            LOG_DEBUG("Restored module config");
+        }
+        if (restoreWhat & SEGMENT_DEVICESTATE) {
+            devicestate.owner = candidateOwner;
+            LOG_DEBUG("Restored device state");
+        }
+        if (restoreWhat & SEGMENT_CHANNELS) {
+            channelFile = backup.channels;
+            LOG_DEBUG("Restored channels");
+        }
+
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+        if (candidateNodeNum != myNodeInfo.my_node_num) {
+            if (createNewIdentity())
+                saveWhat |= SEGMENT_DEVICESTATE | SEGMENT_NODEDATABASE;
+        } else if (owner.public_key.size == 32) {
+            snprintf(owner.id, sizeof(owner.id), "!%08x", candidateNodeNum);
+        }
+#endif
+
+        if (owner.is_licensed && channels.ensureLicensedOperation()) {
+            saveWhat |= SEGMENT_CHANNELS;
+            LOG_WARN("Licensed operation sanitized restored channel encryption/admin access");
+        }
+        if (saveWhat & SEGMENT_CHANNELS)
+            channels.onConfigChanged(false); // normalize only; restore remains fenced until its reboot
+
+#if defined(HELTEC_V4_OLED)
+        if (!heltecDestructiveStoragePowerIsSafe()) {
+            LOG_ERROR("Restore prefs stopped: power changed before persistent commit");
+            return abortRestore();
+        }
+#endif
+        if (!saveToDisk(saveWhat)) {
+            LOG_ERROR("Save restored prefs to flash failed");
+#if defined(HELTEC_V4_OLED)
+            return abortRestore();
+#else
+            config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+            config.lora.tx_enabled = false;
+            if (router && router->getRadioIface())
+                router->getRadioIface()->sleep();
+            return false;
+#endif
+        }
+#if defined(HELTEC_V4_OLED) && defined(FSCom)
+        if (resolvingLegacyMigration) {
+            bool requiredFilesPresent = false;
+            {
+                concurrency::LockGuard guard(spiLock);
+                requiredFilesPresent = FSCom.exists(configFileName) && FSCom.exists(moduleConfigFileName) &&
+                                       FSCom.exists(deviceStateFileName) && FSCom.exists(channelFileName) &&
+                                       (!restoredNodeDatabaseRequired || FSCom.exists(nodeDatabaseFileName));
+            }
+            const bool residualsRemoved =
+                requiredFilesPresent && removeHeltecPreferenceResidualsChecked(restoredNodeDatabaseRequired, true);
+            bool legacyMarkerRemoved = false;
+            if (residualsRemoved) {
+                concurrency::LockGuard guard(spiLock);
+                legacyMarkerRemoved = !FSCom.exists(legacyPrefFileName) || FSCom.remove(legacyPrefFileName);
+                legacyMarkerRemoved &= !FSCom.exists(legacyPrefFileName);
+            }
+            if (!legacyMarkerRemoved) {
+                LOG_ERROR("Restore committed but legacy migration marker could not be removed");
+                return abortRestore();
+            }
+            legacyPreferencesPendingCleanup = false;
+            incompleteLegacyMigrationDetected = false;
+        }
+#endif
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
+        if (privateKeySize == 32) {
+            uint8_t installedPublicKey[32];
+            bool installed = false;
+            concurrency::LockGuard guard(cryptLock);
+            installed = crypto->regeneratePublicKey(installedPublicKey, config.security.private_key.bytes) &&
+                        memcmp(installedPublicKey, config.security.public_key.bytes, sizeof(installedPublicKey)) == 0;
+            if (!installed) {
+                LOG_ERROR("Restored identity could not be installed in the crypto engine");
+#if defined(HELTEC_V4_OLED)
+                return abortRestore();
+#else
+                config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+                config.lora.tx_enabled = false;
+                if (router && router->getRadioIface())
+                    router->getRadioIface()->sleep();
+                return false;
+#endif
+            }
+        }
+#endif
+#if defined(HELTEC_V4_OLED)
+        if (!heltecDestructiveStoragePowerIsSafe()) {
+            LOG_ERROR("Restore prefs stopped: power changed before final marker commit");
+            return abortRestore();
+        }
+        if (!clearHeltecResetPendingMarker(HeltecResetPendingKind::RESTORE, true)) {
+            LOG_ERROR("Restore prefs committed but pending marker could not be cleared");
+            return abortRestore();
+        }
+#endif
+        LOG_INFO("Restored prefs from backup");
+        return true;
     } else if (location == meshtastic_AdminMessage_BackupLocation_SD) {
         // TODO: After more mainline SD card support
     }
 #endif
-    return success;
+    return false;
 }
 
 /// Record an error that should be reported via analytics

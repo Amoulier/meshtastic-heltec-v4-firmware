@@ -16,6 +16,7 @@
 #include "graphics/Screen.h"
 #include "main.h"
 #include "modules/StatusLEDModule.h"
+#include "power/PowerFSMPolicy.h"
 #include "sleep.h"
 #include "target_specific.h"
 
@@ -104,8 +105,7 @@ static void lowBattSDSEnter()
 #ifdef BATTERY_CRITICAL_SLEEP_MSEC
     doDeepSleep(BATTERY_CRITICAL_SLEEP_MSEC, false, true, criticalBatteryDeepSleepWakePolicy());
 #else
-    doDeepSleep(Default::getConfiguredOrDefaultMs(config.power.sds_secs), false, true,
-                criticalBatteryDeepSleepWakePolicy());
+    doDeepSleep(Default::getConfiguredOrDefaultMs(config.power.sds_secs), false, true, criticalBatteryDeepSleepWakePolicy());
 #endif
 }
 extern Power *power;
@@ -222,7 +222,8 @@ static void nbEnter()
         screen->setOn(false);
 #ifdef ARCH_ESP32
     // Only ESP32 should turn off bluetooth
-    setBluetoothEnable(false);
+    if (!shouldKeepBluetoothConnectableDuringIdle(config.bluetooth.enabled))
+        setBluetoothEnable(false);
 #endif
 
     // FIXME - check if we already have packets for phone and immediately trigger EVENT_PACKETS_FOR_PHONE
@@ -330,6 +331,12 @@ void PowerFSM_setup()
                          ? 1
                          : 0);
     bool hasPower = isPowered();
+    const bool keepBluetoothConnectable = shouldKeepBluetoothConnectableDuringIdle(config.bluetooth.enabled);
+#ifdef ARCH_ESP32
+    const bool useNoBluetoothState = shouldUseNoBluetoothStateAfterLightSleep(true, isRouter, keepBluetoothConnectable);
+#else
+    const bool useNoBluetoothState = false;
+#endif
 
     LOG_INFO("PowerFSM init, USB power=%d", hasPower ? 1 : 0);
     powerFSM.add_timed_transition(&stateBOOT, hasPower ? &statePOWER : &stateON, 3 * 1000, NULL, "boot timeout");
@@ -337,14 +344,14 @@ void PowerFSM_setup()
     // wake timer expired or a packet arrived
     // if we are a router node, we go to NB (no need for bluetooth) otherwise we go to DARK (so we can send message to phone)
 #ifdef ARCH_ESP32
-    powerFSM.add_transition(&stateLS, isRouter ? &stateNB : &stateDARK, EVENT_WAKE_TIMER, NULL, "Wake timer");
+    powerFSM.add_transition(&stateLS, useNoBluetoothState ? &stateNB : &stateDARK, EVENT_WAKE_TIMER, NULL, "Wake timer");
 #else // Don't go into a no-bluetooth state on low power platforms
     powerFSM.add_transition(&stateLS, &stateDARK, EVENT_WAKE_TIMER, NULL, "Wake timer");
 #endif
 
     // We need this transition, because we might not transition if we were waiting to enter light-sleep, because when we wake from
     // light sleep we _always_ transition to NB or dark and
-    powerFSM.add_transition(&stateLS, isRouter ? &stateNB : &stateDARK, EVENT_PACKET_FOR_PHONE, NULL,
+    powerFSM.add_transition(&stateLS, useNoBluetoothState ? &stateNB : &stateDARK, EVENT_PACKET_FOR_PHONE, NULL,
                             "Received packet, exiting light sleep");
     powerFSM.add_transition(&stateNB, &stateNB, EVENT_PACKET_FOR_PHONE, NULL, "Received packet, resetting win wake");
 
@@ -445,7 +452,8 @@ void PowerFSM_setup()
                              config.device.role == meshtastic_Config_DeviceConfig_Role_TAK_TRACKER ||
                              config.device.role == meshtastic_Config_DeviceConfig_Role_SENSOR;
 
-    if ((isRouter || config.power.is_power_saving) && !isWifiAvailable() && !isTrackerOrSensor) {
+    if (shouldEnterLightSleepFromIdle(true, isRouter, config.power.is_power_saving, isWifiAvailable(), isTrackerOrSensor,
+                                      keepBluetoothConnectable)) {
         powerFSM.add_timed_transition(&stateNB, &stateLS,
                                       Default::getConfiguredOrDefaultMs(config.power.min_wake_secs, default_min_wake_secs), NULL,
                                       "Min wake timeout");

@@ -278,15 +278,29 @@ class Screen : public concurrency::OSThread
 
     bool isOverlayBannerShowing();
 
-    // True if the always-present games frame is the one currently on screen. Lets the games module
-    // ignore D-pad input when the player has navigated to a different frame.
+    // Thread-safe snapshot of whether the text-message frame is currently shown.
+    bool isTextMessageFrameShown() const;
+
+    // True if the always-present games frame is the one currently on screen. Lets
+    // the games module ignore D-pad input when the player has navigated to a
+    // different frame.
     bool isGamesFrameShown();
 
     bool isScreenOn() { return screenOn; }
 
     /// Prevent automatic screen wakes until the user explicitly restores the display.
-    void setDisplayDisabled(bool disabled);
+    /// Returns false only when a disable request could not be persisted safely;
+    /// restoring with PRG is always allowed for the current boot.
+    bool setDisplayDisabled(bool disabled);
     bool isDisplayDisabled() const { return displayDisabled.load(std::memory_order_acquire); }
+#if defined(HELTEC_V4_OLED)
+    /// Read the durable display-disable key without constructing a Screen.
+    /// Returns false when the namespace/key cannot be verified.
+    static bool readDisplayDisabledPreference(bool &disabled);
+    /// Record whether the completed boot scan found a non-OLED I2C device on
+    /// the GPIO36 VEXT/QuickLink rail.
+    static void setSharedVextAccessoryDetected(bool detected);
+#endif
 
     // Stores the last 4 of our hardware ID, to make finding the device for pairing easier
     // FIXME: Needs refactoring and getMacAddr needs to be moved to a utility class
@@ -808,12 +822,13 @@ class Screen : public concurrency::OSThread
     // Whether we are showing the regular screen (as opposed to booth screen or
     // Bluetooth PIN screen)
     bool showingNormalScreen = false;
+    std::atomic<bool> textMessageFrameShown{false};
     /// Track USB power state to only wake screen on actual power state changes
     bool lastPowerUSBState = false;
 
     void setDisplayRailPower(bool on);
     static bool loadDisplayDisabled();
-    static void saveDisplayDisabled(bool disabled);
+    static bool saveDisplayDisabled(bool disabled);
 
     // Implementation to Adjust Brightness
     uint8_t brightness = BRIGHTNESS_DEFAULT; // H = 254, MH = 192, ML = 130 L = 103

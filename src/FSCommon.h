@@ -1,5 +1,6 @@
 #pragma once
 
+#include "FilesystemMountPolicy.h"
 #include "configuration.h"
 #include <vector>
 
@@ -35,7 +36,7 @@ using namespace STM32_LittleFS_Namespace;
 // ESP32 version
 #include "LittleFS.h"
 #define FSCom LittleFS
-#define FSBegin() FSCom.begin(true) // format on failure
+#define FSBegin() FSCom.begin(shouldAutoFormatFilesystemOnMountFailure())
 #define FILE_O_WRITE "w"
 #define FILE_O_READ "r"
 #endif
@@ -63,6 +64,7 @@ size_t fsTotalBytes();
 size_t fsUsedBytes();
 
 void fsInit();
+bool fsIsMounted();
 bool renameFile(const char *pathFrom, const char *pathTo);
 bool fsFormat();
 std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels, size_t maxCount = 64, bool *wasLimited = nullptr);

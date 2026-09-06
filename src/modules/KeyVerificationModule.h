@@ -62,7 +62,7 @@ class KeyVerificationModule : public ProtobufModule<meshtastic_KeyVerification> 
     bool sendInitialRequest(NodeNum remoteNode);
     void generateVerificationCode(char *); // fills char with the user readable verification code
     uint32_t getCurrentRemoteNode() { return currentRemoteNode; }
-    void commitVerifiedRemoteNode(); // Commit a pending key to NodeDB and mark the node manually verified
+    bool commitVerifiedRemoteNode(bool adminTransactionActive = false); // Commit a pending key and verified flag
 
   protected:
     /* Called to handle a particular incoming message

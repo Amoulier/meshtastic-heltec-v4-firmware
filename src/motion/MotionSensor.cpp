@@ -135,6 +135,10 @@ bool MotionSensor::loadMagnetometerCalibration(const char *filePath, float &high
 void MotionSensor::beginCalibrationDisplay(bool &showingScreen)
 {
 #if !defined(MESHTASTIC_EXCLUDE_SCREEN) && HAS_SCREEN
+#if defined(HELTEC_V4_OLED)
+    if (screen && screen->isDisplayDisabled())
+        return;
+#endif
     if (!showingScreen) {
         powerFSM.trigger(EVENT_PRESS); // keep screen alive during calibration
         showingScreen = true;
@@ -374,6 +378,10 @@ void MotionSensor::drawFrameCalibration(OLEDDisplay *display, OLEDDisplayUiState
 #if !MESHTASTIC_EXCLUDE_POWER_FSM
 void MotionSensor::wakeScreen()
 {
+#if defined(HELTEC_V4_OLED)
+    if (screen && screen->isDisplayDisabled())
+        return;
+#endif
     if (powerFSM.getState() == &stateDARK) {
         LOG_DEBUG("Motion wakeScreen detected");
         if (config.display.wake_on_tap_or_motion)
@@ -383,6 +391,10 @@ void MotionSensor::wakeScreen()
 
 void MotionSensor::buttonPress()
 {
+#if defined(HELTEC_V4_OLED)
+    if (screen && screen->isDisplayDisabled())
+        return;
+#endif
     LOG_DEBUG("Motion buttonPress detected");
     powerFSM.trigger(EVENT_PRESS);
 }

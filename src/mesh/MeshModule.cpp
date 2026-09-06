@@ -311,7 +311,10 @@ AdminMessageHandleResult MeshModule::handleAdminMessageForAllModules(const mesht
         for (auto i = modules->begin(); i != modules->end(); ++i) {
             auto &pi = **i;
             AdminMessageHandleResult h = pi.handleAdminMessageForModule(mp, request, response);
-            if (h == AdminMessageHandleResult::HANDLED_WITH_RESPONSE) {
+            if (h == AdminMessageHandleResult::ERROR) {
+                LOG_ERROR("Module '%s' rejected admin mutation", pi.name);
+                return h;
+            } else if (h == AdminMessageHandleResult::HANDLED_WITH_RESPONSE) {
                 // In case we have a response it always has priority.
                 LOG_DEBUG("Reply prepared by module '%s' of variant: %d", pi.name, response->which_payload_variant);
                 handled = h;

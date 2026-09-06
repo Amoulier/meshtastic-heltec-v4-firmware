@@ -59,8 +59,10 @@ AdminMessageHandleResult KeyVerificationModule::handleAdminMessageForModule(cons
 
         } else if (request->key_verification.message_type == meshtastic_KeyVerificationAdmin_MessageType_DO_VERIFY &&
                    request->key_verification.nonce == currentNonce) {
-            commitVerifiedRemoteNode();
+            const bool committed = commitVerifiedRemoteNode(true);
             resetToIdle();
+            if (!committed)
+                return AdminMessageHandleResult::ERROR;
         } else if (request->key_verification.message_type == meshtastic_KeyVerificationAdmin_MessageType_DO_NOT_VERIFY) {
             resetToIdle();
         }
@@ -412,33 +414,52 @@ void KeyVerificationModule::resetToIdle()
     crypto->clearPendingPublicKey();
 }
 
-void KeyVerificationModule::commitVerifiedRemoteNode()
+bool KeyVerificationModule::commitVerifiedRemoteNode(bool adminTransactionActive)
 {
     // The remote node already has a NodeDB entry by this point (packets were exchanged during the
     // handshake), so getMeshNode is sufficient; bail defensively if it is somehow absent.
     meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(currentRemoteNode);
     if (!node) {
         LOG_WARN("Attempted to commit key, but unknown node");
-        return;
+        return false;
     }
-    // If we only held the peer's key as a pending (unverified) key during the handshake, commit it to
-    // NodeDB now that the user has confirmed the verification, so future PKI traffic can use it.
     meshtastic_NodeInfoLite_public_key_t pending = {0, {0}};
-    if (node->public_key.size != 32 && crypto->getPendingPublicKey(currentRemoteNode, pending))
-        node->public_key = pending;
-    node->bitfield |= NODEINFO_BITFIELD_IS_KEY_MANUALLY_VERIFIED_MASK;
-    // Re-commit via the bare-key primitive: writing the same bytes back is a no-op for the hot
-    // store, but it routes the TrafficManagement write-through. ManuallyVerified: the user just
-    // confirmed possession of exactly this key - the strongest provenance that cache can carry.
-    if (node->public_key.size == 32)
+    const bool hasPendingKey = node->public_key.size != 32 && crypto->getPendingPublicKey(currentRemoteNode, pending);
+    const auto mutate = [&]() {
+        meshtastic_NodeInfoLite *current = nodeDB->getMeshNode(currentRemoteNode);
+        if (!current)
+            return;
+        if (hasPendingKey)
+            current->public_key = pending;
+        current->bitfield |= NODEINFO_BITFIELD_IS_KEY_MANUALLY_VERIFIED_MASK;
+    };
+
+    bool committed = false;
+    if (adminTransactionActive) {
+        mutate();
+        committed = adminModule && adminModule->persistObservedAdminMutation(SEGMENT_NODEDATABASE, false);
+    } else if (adminModule) {
+        // Screen confirmation callbacks are outside AdminModule's request
+        // stack. Open the same serialized fence before touching NodeDB so a
+        // concurrent bulk edit cannot absorb or overwrite the decision.
+        committed = adminModule->runExternalConfigMutation(SEGMENT_NODEDATABASE, mutate);
+    }
+    if (!committed) {
+        LOG_ERROR("Verified key was not durably committed");
+        return false;
+    }
+
+    node = nodeDB->getMeshNode(currentRemoteNode);
+    // Update the optional TrafficManagement key cache only after NodeDB is
+    // durable. Rewriting the same bytes is a no-op for the hot row.
+    if (node && node->public_key.size == 32)
         nodeDB->commitRemoteKey(currentRemoteNode, node->public_key.bytes, NodeDB::KeyCommitTrust::ManuallyVerified);
     LOG_INFO("Node 0x%08x manually verified with security number %u", currentRemoteNode, currentSecurityNumber);
-    if (nodeInfoModule)
+    if (nodeInfoModule && node)
         nodeInfoModule->sendOurNodeInfo(currentRemoteNode, false, node->channel, true);
     crypto->clearPendingPublicKey();
     currentState = KEY_VERIFICATION_IDLE;
-    // Persist the committed key and verified flag so manual verification survives a reboot.
-    nodeDB->saveToDisk(SEGMENT_NODEDATABASE);
+    return true;
 }
 
 void KeyVerificationModule::generateVerificationCode(char *readableCode)

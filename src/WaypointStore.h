@@ -13,6 +13,7 @@
 #endif
 
 #include "Observer.h"
+#include "concurrency/Lock.h"
 #include "mesh/MeshTypes.h"
 #include "mesh/generated/meshtastic/mesh.pb.h"
 #include <cstdint>
@@ -44,12 +45,13 @@ class WaypointStore : public Observable<const WaypointStore *>
     bool removeWaypoint(uint32_t id);
     bool setNotificationPreference(uint32_t id, WaypointNotificationPreference preference, bool enabled);
 
-    const std::deque<StoredWaypoint> &getWaypoints() const { return waypoints; }
-    const StoredWaypoint *findWaypoint(uint32_t id) const;
+    std::deque<StoredWaypoint> getWaypoints() const;
+    bool findWaypoint(uint32_t id, StoredWaypoint &result) const;
 
-    void saveToFlash();
+    bool saveToFlash();
     void loadFromFlash();
-    void clearAllWaypoints();
+    bool clearAllWaypoints(bool requireDestructivePower = false);
+    void drainPersistenceWrites();
 
     static bool isExpired(const meshtastic_Waypoint &wp, uint32_t now = 0);
     static bool isExpired(const StoredWaypoint &entry, uint32_t now = 0);
@@ -58,12 +60,21 @@ class WaypointStore : public Observable<const WaypointStore *>
                                                 const meshtastic_Waypoint &incoming);
     static void clearWireNotificationPreferences(meshtastic_Waypoint &wp);
 
+#if ENABLE_WAYPOINT_PERSISTENCE
+    void autosaveTick();
+#endif
+
   private:
-    void addStoredWaypoint(const StoredWaypoint &entry);
-    bool removeWaypointById(uint32_t id);
+    void addStoredWaypointLocked(const StoredWaypoint &entry);
+    bool removeWaypointByIdLocked(uint32_t id);
+    void markUnsavedLocked();
     void notifyChanged();
 
-    std::deque<StoredWaypoint> waypoints;
+    mutable concurrency::Lock stateLock;
+    std::deque<StoredWaypoint> waypoints; // Protected by stateLock
+    bool hasUnsavedChanges = false;       // Protected by stateLock
+    uint32_t lastAutoSaveMs = 0;          // Protected by stateLock
+    uint32_t mutationGeneration = 0;      // Prevents a save from clearing a newer dirty state
 };
 
 #if ENABLE_WAYPOINT_PERSISTENCE

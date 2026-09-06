@@ -108,7 +108,8 @@ int GeofenceModule::onWaypointStoreChanged(const WaypointStore *store)
 
 void GeofenceModule::evaluatePosition(NodeNum node, const meshtastic_Position &p)
 {
-    if (waypointStore.getWaypoints().empty())
+    const auto waypointSnapshot = waypointStore.getWaypoints();
+    if (waypointSnapshot.empty())
         return;
     if (!p.has_latitude_i || !p.has_longitude_i)
         return;
@@ -123,7 +124,7 @@ void GeofenceModule::evaluatePosition(NodeNum node, const meshtastic_Position &p
     bool favoriteResolved = false;
     bool isFavorite = false;
 
-    for (const StoredWaypoint &entry : waypointStore.getWaypoints()) {
+    for (const StoredWaypoint &entry : waypointSnapshot) {
         const meshtastic_Waypoint &wp = entry.waypoint;
         if (!shouldTrack(wp, entry.notificationPreferences, now))
             continue;
@@ -186,7 +187,11 @@ void GeofenceModule::notify(const meshtastic_Waypoint &wp, NodeNum node, bool en
     LOG_INFO("Geofence: %s %s '%s'", who, entered ? "entered" : "left", wp.name);
 
 #if HAS_SCREEN
+#if defined(HELTEC_V4_OLED)
+    if (screen && !screen->isDisplayDisabled())
+#else
     if (screen)
+#endif
         powerFSM.trigger(EVENT_RECEIVED_MSG); // wake the screen so the banner is seen
 #endif
 

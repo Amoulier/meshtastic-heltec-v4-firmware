@@ -20,6 +20,7 @@
 #include "meshUtils.h" // for pow_of_2
 #include "sleep.h"
 #include <assert.h>
+#include <cmath>
 #include <pb_decode.h>
 #include <pb_encode.h>
 #include <string.h>
@@ -941,8 +942,7 @@ RadioInterface::RadioInterface()
 
 bool RadioInterface::reconfigure()
 {
-    applyModemConfig();
-    return true;
+    return applyModemConfig();
 }
 
 bool RadioInterface::init()
@@ -957,14 +957,15 @@ bool RadioInterface::init()
     // radioIf.setThisAddress(nodeDB->getNodeNum()); // Note: we must do this here, because the nodenum isn't inited at
     // constructor time.
 
-    applyModemConfig();
-
-    return true;
+    return applyModemConfig();
 }
 
-int RadioInterface::notifyDeepSleepCb(void *unused)
+int RadioInterface::notifyDeepSleepCb(void *context)
 {
-    sleep();
+    bool succeeded = sleep();
+    if (context) {
+        static_cast<DeepSleepContext *>(context)->radioSleepSucceeded &= succeeded;
+    }
     return 0;
 }
 
@@ -1057,6 +1058,56 @@ const RegionInfo *RadioInterface::regionSwapForPreset(meshtastic_Config_LoRaConf
  * receives the human-readable failure reason.
  * Returns false if not compatible.
  */
+bool RadioInterface::checkHardwareFrequencyRange(const meshtastic_Config_LoRaConfig &loraConfig, char *errBuf, size_t errLen)
+{
+#if defined(HELTEC_V4_OLED)
+    constexpr float heltecV4MinMHz = 150.0f;
+    constexpr float heltecV4MaxMHz = 960.0f;
+    const RegionInfo *region = getRegion(loraConfig.region);
+    if (!std::isfinite(loraConfig.override_frequency) || !std::isfinite(loraConfig.frequency_offset)) {
+        if (errBuf)
+            snprintf(errBuf, errLen, "LoRa frequency contains a non-finite value");
+        return false;
+    }
+    if (region->code != loraConfig.region) {
+        if (errBuf)
+            snprintf(errBuf, errLen, "LoRa region is not recognized");
+        return false;
+    }
+    if (region->code != meshtastic_Config_LoRaConfig_RegionCode_UNSET &&
+        (region->freqStart < heltecV4MinMHz || region->freqEnd > heltecV4MaxMHz)) {
+        if (errBuf)
+            snprintf(errBuf, errLen, "Region %s is outside the Heltec V4 radio range", region->name);
+        return false;
+    }
+    if (loraConfig.override_frequency != 0) {
+        const float occupiedBandwidthKHz =
+            loraConfig.use_preset ? modemPresetToBwKHz(loraConfig.modem_preset, region->wideLora)
+                                  : bwCodeToKHz(loraConfig.bandwidth);
+        if (region->code == meshtastic_Config_LoRaConfig_RegionCode_UNSET ||
+            !frequencyOccupancyFitsBounds(loraConfig.override_frequency, loraConfig.frequency_offset, occupiedBandwidthKHz,
+                                          heltecV4MinMHz, heltecV4MaxMHz) ||
+            !frequencyOccupancyFitsBounds(loraConfig.override_frequency, loraConfig.frequency_offset, occupiedBandwidthKHz,
+                                          region->freqStart, region->freqEnd)) {
+            if (errBuf)
+                snprintf(errBuf, errLen, "Frequency override bandwidth exceeds Heltec V4 region %s", region->name);
+            return false;
+        }
+    } else if (region->code != meshtastic_Config_LoRaConfig_RegionCode_UNSET &&
+               (region->freqStart + loraConfig.frequency_offset < heltecV4MinMHz ||
+                region->freqEnd + loraConfig.frequency_offset > heltecV4MaxMHz)) {
+        if (errBuf)
+            snprintf(errBuf, errLen, "Frequency offset exceeds the Heltec V4 radio range");
+        return false;
+    }
+#else
+    (void)loraConfig;
+    (void)errBuf;
+    (void)errLen;
+#endif
+    return true;
+}
+
 bool RadioInterface::checkConfigRegion(const meshtastic_Config_LoRaConfig &loraConfig, char *errBuf, size_t errLen,
                                        bool prospectiveLicensedOwner)
 {
@@ -1093,6 +1144,9 @@ bool RadioInterface::checkConfigRegion(const meshtastic_Config_LoRaConfig &loraC
         }
     }
 
+    if (!checkHardwareFrequencyRange(loraConfig, errBuf, errLen))
+        return false;
+
     return true;
 }
 
@@ -1124,6 +1178,24 @@ bool RadioInterface::checkOrClampConfigLora(meshtastic_Config_LoRaConfig &loraCo
     float check_bw;
 
     const RegionInfo *newRegion = getRegion(loraConfig.region);
+
+    char hardwareRangeError[160] = {};
+    if (!checkHardwareFrequencyRange(loraConfig, hardwareRangeError, sizeof(hardwareRangeError))) {
+        if (!clamp) {
+            LOG_ERROR("%s", hardwareRangeError);
+            return false;
+        }
+        // A malformed override/offset can be repaired without changing the
+        // regulatory region. A region outside the chip's physical range has
+        // no safe automatic substitute and must remain rejected.
+        loraConfig.override_frequency = 0;
+        loraConfig.frequency_offset = 0;
+        if (!checkHardwareFrequencyRange(loraConfig, hardwareRangeError, sizeof(hardwareRangeError))) {
+            LOG_ERROR("%s", hardwareRangeError);
+            return false;
+        }
+        LOG_WARN("Discard invalid LoRa frequency override/offset for this hardware");
+    }
 
     const char *presetName = DisplayFormatters::getModemPresetDisplayName(loraConfig.modem_preset, false, loraConfig.use_preset);
 
@@ -1176,18 +1248,40 @@ bool RadioInterface::checkOrClampConfigLora(meshtastic_Config_LoRaConfig &loraCo
             }
         }
     } else {
-        // Clamp at the source so numFreqSlots below can never be 0 (bandwidth 0 is reachable from a crafted set_config)
-        check_bw = clampBandwidthKHz(bwCodeToKHz(loraConfig.bandwidth));
+        const uint8_t clampedSf = clampSpreadFactor(loraConfig.spread_factor);
+        const uint8_t clampedCr = clampCodingRate(loraConfig.coding_rate);
+        uint16_t clampedBandwidth = clampBandwidthCode(loraConfig.bandwidth);
+#if defined(HELTEC_V4_OLED)
+        // Reject values outside the SX1262's discrete bandwidth set before airtime math.
+        if (!isSx126xBandwidthCode(clampedBandwidth))
+            clampedBandwidth = bwKHzToCode(LORA_BW_DEFAULT_KHZ);
+#endif
+
+        const bool customTupleValid = loraConfig.spread_factor == clampedSf && loraConfig.coding_rate == clampedCr &&
+                                      loraConfig.bandwidth == clampedBandwidth;
+        if (!customTupleValid) {
+            LOG_ERROR("Invalid custom LoRa tuple BW=%u SF=%u CR=%u", static_cast<unsigned>(loraConfig.bandwidth),
+                      static_cast<unsigned>(loraConfig.spread_factor), static_cast<unsigned>(loraConfig.coding_rate));
+            if (!clamp)
+                return false;
+            loraConfig.bandwidth = clampedBandwidth;
+            loraConfig.spread_factor = clampedSf;
+            loraConfig.coding_rate = clampedCr;
+            LOG_WARN("Repair custom LoRa tuple to BW=%u SF=%u CR=%u", static_cast<unsigned>(loraConfig.bandwidth),
+                     static_cast<unsigned>(loraConfig.spread_factor), static_cast<unsigned>(loraConfig.coding_rate));
+        }
+        check_bw = bwCodeToKHz(loraConfig.bandwidth);
     }
 
     // Calculate width of slots (aka channels) based on bandwidth and any spacing or padding required by the region:
     // spacing = gap between slots (0 for continuous spectrum) and at the beginning of the band
     // padding = gap at the beginning and end of the slots (0 for no padding)
     float freqSlotWidth = newRegion->profile->spacing + (newRegion->profile->padding * 2) + (check_bw / 1000); // in MHz
-    uint32_t numFreqSlots = round((newRegion->freqEnd - newRegion->freqStart + newRegion->profile->spacing) / freqSlotWidth);
+    uint32_t numFreqSlots = usableFrequencySlotCount(newRegion->freqStart, newRegion->freqEnd, check_bw,
+                                                     newRegion->profile->spacing, newRegion->profile->padding);
 
     // Check if the region supports the requested bandwidth
-    if ((newRegion->freqEnd - newRegion->freqStart) < freqSlotWidth) {
+    if (numFreqSlots == 0) {
         const float regionSpanKHz = (newRegion->freqEnd - newRegion->freqStart) * 1000.0f;
         snprintf(err_string, sizeof(err_string), "%s span %.0fkHz < requested %.0fkHz", newRegion->name, regionSpanKHz, check_bw);
         LOG_ERROR("%s", err_string);
@@ -1200,7 +1294,10 @@ bool RadioInterface::checkOrClampConfigLora(meshtastic_Config_LoRaConfig &loraCo
 
             // Recompute slot width and number of slots based on the new bandwidth
             freqSlotWidth = newRegion->profile->spacing + (newRegion->profile->padding * 2) + (check_bw / 1000); // in MHz
-            numFreqSlots = round((newRegion->freqEnd - newRegion->freqStart + newRegion->profile->spacing) / freqSlotWidth);
+            numFreqSlots = usableFrequencySlotCount(newRegion->freqStart, newRegion->freqEnd, check_bw,
+                                                     newRegion->profile->spacing, newRegion->profile->padding);
+            if (numFreqSlots == 0)
+                return false;
         } else {
             return false;
         }
@@ -1261,6 +1358,47 @@ bool RadioInterface::checkOrClampConfigLora(meshtastic_Config_LoRaConfig &loraCo
         // if we have a frequency override, we ignore the channel number and just use the override frequency
         snprintf(err_string, sizeof(err_string), "Frequency override in place, using %.3f", loraConfig.override_frequency);
     }
+
+    uint32_t selectedChannel = 0;
+    float selectedCenterMHz = loraConfig.override_frequency;
+    if (loraConfig.override_frequency == 0) {
+        if (uses_default_frequency_slot) {
+            if (newRegion->overrideSlot > 0)
+                selectedChannel = newRegion->overrideSlot - 1;
+            else if (newRegion->overrideSlot == OVERRIDE_SLOT_PRESET_HASH)
+                selectedChannel = presetNameHashSlot;
+            else
+                selectedChannel = channelNameHashSlot;
+        } else {
+            selectedChannel = loraConfig.channel_num - 1;
+        }
+        selectedCenterMHz =
+            newRegion->freqStart + (check_bw / 2000.0f) + newRegion->profile->padding + (selectedChannel * freqSlotWidth);
+    }
+
+    auto effectiveFrequencyIsValid = [&](float offsetMHz) {
+        if (!frequencyOccupancyFitsBounds(selectedCenterMHz, offsetMHz, check_bw, newRegion->freqStart, newRegion->freqEnd))
+            return false;
+#if defined(HELTEC_V4_OLED)
+        constexpr float heltecV4MinMHz = 150.0f;
+        constexpr float heltecV4MaxMHz = 960.0f;
+        if (!frequencyOccupancyFitsBounds(selectedCenterMHz, offsetMHz, check_bw, heltecV4MinMHz, heltecV4MaxMHz))
+            return false;
+#endif
+        return true;
+    };
+
+    if (!effectiveFrequencyIsValid(loraConfig.frequency_offset)) {
+        if (clamp && loraConfig.frequency_offset != 0.0f) {
+            LOG_WARN("Frequency offset %.3f exceeds occupied band; reset to zero", loraConfig.frequency_offset);
+            loraConfig.frequency_offset = 0.0f;
+        }
+        if (!effectiveFrequencyIsValid(loraConfig.frequency_offset)) {
+            LOG_ERROR("Occupied LoRa bandwidth %.3fkHz at %.3fMHz exceeds region %s", check_bw,
+                      selectedCenterMHz + loraConfig.frequency_offset, newRegion->name);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -1270,27 +1408,61 @@ bool RadioInterface::validateConfigLora(const meshtastic_Config_LoRaConfig &lora
     return checkOrClampConfigLora(copy, false);
 }
 
-void RadioInterface::clampConfigLora(meshtastic_Config_LoRaConfig &loraConfig)
+bool RadioInterface::clampConfigLora(meshtastic_Config_LoRaConfig &loraConfig)
 {
-    checkOrClampConfigLora(loraConfig, true);
+    return checkOrClampConfigLora(loraConfig, true);
 }
 
 /**
  * Pull our channel settings etc... from protobufs to the dumb interface settings
  * Note: this must be given only settings which have been validated or clamped!
  */
-void RadioInterface::applyModemConfig()
+bool RadioInterface::applyModemConfig()
 {
     // Set up default configuration
     // No Sync Words in LORA mode
     meshtastic_Config_LoRaConfig &loraConfig = config.lora;
+
+    auto parkInvalidConfig = [&]() -> bool {
+        // Do not guess a regulatory region; UNSET keeps boot/recovery silent.
+        LOG_ERROR("LoRa configuration cannot be applied safely; disable radio TX");
+        RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_INVALID_RADIO_SETTING);
+        loraConfig.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+        loraConfig.use_preset = true;
+        loraConfig.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+        loraConfig.tx_enabled = false;
+        loraConfig.override_frequency = 0;
+        loraConfig.frequency_offset = 0;
+        loraConfig.channel_num = 0;
+        uses_default_frequency_slot = true;
+        uses_custom_channel_name = false;
+        myRegion = getRegion(meshtastic_Config_LoRaConfig_RegionCode_UNSET);
+        saveChannelNum(0);
+        saveFreq(0);
+        return false;
+    };
+
+    // Validate and repair the complete tuple before retaining a RegionInfo pointer:
+    // clamping can intentionally move an EU preset to its compatible sibling region.
+    if (!validateConfigLora(loraConfig)) {
+        LOG_WARN("Invalid LoRa configuration; attempting a safe repair");
+        if (!clampConfigLora(loraConfig) || !validateConfigLora(loraConfig)) {
+            return parkInvalidConfig();
+        }
+    }
+
+    // Enforce licensing and hardware compatibility at the final apply boundary.
+    char regionError[160] = {};
+    if (!checkConfigRegion(loraConfig, regionError, sizeof(regionError))) {
+        LOG_ERROR("Reject LoRa hardware apply: %s", regionError);
+        sendErrorNotification(regionError);
+        return parkInvalidConfig();
+    }
+
     const RegionInfo *newRegion = getRegion(loraConfig.region);
     myRegion = newRegion;
 
     if (loraConfig.use_preset) {
-        if (!validateConfigLora(loraConfig)) {
-            loraConfig.modem_preset = newRegion->getDefaultPreset();
-        }
         uint8_t newcr;
         modemPresetToParams(loraConfig.modem_preset, newRegion->wideLora, bw, sf, newcr);
         // If custom CR is being used already, check if the new preset is higher
@@ -1307,11 +1479,6 @@ void RadioInterface::applyModemConfig()
         }
 
     } else { // if not using preset, then just use the custom settings
-        if (validateConfigLora(loraConfig)) {
-        } else {
-            LOG_WARN("Invalid LoRa config, can't apply modem config - fall back to %s defaults", newRegion->name);
-            clampConfigLora(loraConfig);
-        }
         // Clamp at the source so numFreqSlots below can never be 0 (a bandwidth-0 config may already be persisted)
         bw = clampBandwidthKHz(bwCodeToKHz(loraConfig.bandwidth));
         sf = loraConfig.spread_factor;
@@ -1330,6 +1497,7 @@ void RadioInterface::applyModemConfig()
 
     // Set final tx_power back onto config
     loraConfig.tx_power = (int8_t)power; // cppcheck-suppress assignmentAddressToInteger
+    requestedPower = power;
 
     uint32_t channel_num;
     float freq;
@@ -1338,7 +1506,10 @@ void RadioInterface::applyModemConfig()
     // spacing = gap between channels (0 for continuous spectrum) and at the beginning of the band
     // padding = gap at the beginning and end of the channel (0 for no padding)
     float freqSlotWidth = newRegion->profile->spacing + (newRegion->profile->padding * 2) + (bw / 1000); // in MHz
-    uint32_t numFreqSlots = round((newRegion->freqEnd - newRegion->freqStart + newRegion->profile->spacing) / freqSlotWidth);
+    uint32_t numFreqSlots = usableFrequencySlotCount(newRegion->freqStart, newRegion->freqEnd, bw, newRegion->profile->spacing,
+                                                     newRegion->profile->padding);
+    if (numFreqSlots == 0)
+        return parkInvalidConfig();
 
     // Calculate hash of channel name and preset name to pick a default frequency slot if user has not specified one.
     // Note that channel_num is actually (channel_num - 1), i.e. zero-based, since modulus (%) returns values from 0 to
@@ -1382,8 +1553,18 @@ void RadioInterface::applyModemConfig()
         freq = newRegion->freqStart + (bw / 2000) + newRegion->profile->padding + (channel_num * freqSlotWidth); // in MHz
     }
 
+    const float effectiveFrequency = freq + loraConfig.frequency_offset;
+    if (!frequencyOccupancyFitsBounds(freq, loraConfig.frequency_offset, bw, newRegion->freqStart, newRegion->freqEnd)
+#if defined(HELTEC_V4_OLED)
+        || !frequencyOccupancyFitsBounds(freq, loraConfig.frequency_offset, bw, 150.0f, 960.0f)
+#endif
+    ) {
+        LOG_ERROR("Final LoRa occupied bandwidth %.3fkHz at %.3fMHz exceeds safe bounds", bw, effectiveFrequency);
+        return parkInvalidConfig();
+    }
+
     saveChannelNum(channel_num);
-    saveFreq(freq + loraConfig.frequency_offset);
+    saveFreq(effectiveFrequency);
 
     if (newRegion->wideLora) {                          // clamp if wide freq range
         preambleLength = wideLoraPreambleLengthDefault; // 12 is the default for operation above 2GHz
@@ -1409,6 +1590,7 @@ void RadioInterface::applyModemConfig()
     LOG_INFO("channel_num: %d", channel_num + 1);
     LOG_INFO("frequency: %f", getFreq());
     LOG_INFO("Slot time: %u msec, preamble time: %u msec", slotTimeMsec, preambleTimeMsec);
+    return true;
 } // end of applyModemConfig
 
 /** Slottime is the time to detect a transmission has started, consisting of:
@@ -1436,6 +1618,9 @@ uint32_t RadioInterface::computeSlotTimeMsec()
  */
 void RadioInterface::limitPower(int8_t loraMaxPower)
 {
+    // FEM gain conversion is not idempotent, so recovery must restart from the normalized request.
+    power = requestedPower;
+
     uint8_t maxPower = 255; // No limit
 
     if (myRegion->powerLimit)

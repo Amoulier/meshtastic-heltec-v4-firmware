@@ -23,73 +23,114 @@ jobs:
     outputs:
       artifact-id: ${{ steps.upload-firmware.outputs.artifact-id }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
+          persist-credentials: false
 
-      - name: Test Standard low-battery sleep policy
+      - name: Verify Heltec V4 build scope
+        env:
+          PIO_PLATFORM: ${{ inputs.platform }}
+          PIO_ENV: ${{ inputs.pio_env }}
+        run: |
+          set -euo pipefail
+
+          test "$PIO_PLATFORM" = "esp32s3"
+          case "$PIO_ENV" in
+            heltec-v4-standard | heltec-v4-solar-router) ;;
+            *)
+              echo "Refusing out-of-scope environment: $PIO_ENV" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Test Heltec-only release policy
+        run: |
+          set -euo pipefail
+          python3 test/host/heltec_release_policy_test.py
+          bash -n bin/device-install.sh bin/device-update.sh
+
+      - name: Test Standard power policies
         run: |
           g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Isrc \
+            -DHELTEC_V4_OLED=1 \
             test/host/deep_sleep_policy_test.cpp \
             -o /tmp/heltec-v4-standard-deep-sleep-policy-test
           /tmp/heltec-v4-standard-deep-sleep-policy-test
 
-      - name: Test Solar Router low-battery sleep policy
+      - name: Test Solar Router power policies
         run: |
           g++ -std=c++17 -Wall -Wextra -Werror -pedantic \
-            -DHELTEC_V4_SOLAR_ROUTER_PROFILE=1 -Isrc \
+            -DHELTEC_V4_OLED=1 -DHELTEC_V4_SOLAR_ROUTER_PROFILE=1 -Isrc \
             test/host/deep_sleep_policy_test.cpp \
             -o /tmp/heltec-v4-solar-router-deep-sleep-policy-test
           /tmp/heltec-v4-solar-router-deep-sleep-policy-test
 
-      - name: Build ${{ inputs.platform }}
-        id: build
-        uses: meshtastic/gh-action-firmware@main
-        with:
-          pio_platform: ${{ inputs.platform }}
-          pio_env: ${{ inputs.pio_env }}
-          pio_target: build
+      - name: Test generic policy compatibility
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Isrc \
+            test/host/deep_sleep_policy_test.cpp \
+            -o /tmp/generic-deep-sleep-policy-test
+          /tmp/generic-deep-sleep-policy-test
 
-      - name: ESP32 - Download Unified OTA firmware
-        # Currently only esp32 and esp32s3 use the unified ota
-        if: inputs.platform == 'esp32' || inputs.platform == 'esp32s3'
+      - name: Audit source invariants
+        run: |
+          set -euo pipefail
+          source_rows=$(mktemp)
+          git ls-files -z '*.cpp' '*.h' > "$source_rows"
+          mapfile -d '' -t sources < "$source_rows"
+          rm "$source_rows"
+          test "${#sources[@]}" -gt 0
+          ./bin/lint-ifdef-complexity.sh "${sources[@]}"
+          ./bin/lint-node-id-format.sh "${sources[@]}"
+          ./bin/lint-unity-exit.sh test/host/deep_sleep_policy_test.cpp
+          ./bin/test-lint-unity-exit.sh
+
+      - name: Build ${{ inputs.platform }}
+        env:
+          # Digest recorded from audited workflow run 33337020816. Use the
+          # official Meshtastic image without relying on its mutable branch tag.
+          BUILD_IMAGE: ghcr.io/meshtastic/gh-action-firmware@sha256:f2fbd6fc139c464385b644f507ff6abeb1e20120c1dda063e7eb42d9de392048
+          PLATFORMIO_BUILD_DIR: /workspace/.pio/build
+          MT_ENV: ${{ inputs.pio_env }}
+          MT_PLATFORM: ${{ inputs.platform }}
+          MT_TARGET: build
+          MT_VERBOSE: ${{ runner.debug || 0 }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --env GITHUB_ACTIONS \
+            --env XDG_CACHE_HOME \
+            --env PLATFORMIO_BUILD_DIR \
+            --env MT_ENV \
+            --env MT_PLATFORM \
+            --env MT_TARGET \
+            --env MT_VERBOSE \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            "$BUILD_IMAGE"
+
+      - name: Download pinned ESP32-S3 Unified OTA firmware
+        if: inputs.platform == 'esp32s3'
         id: dl-ota-unified
         env:
-          PIO_PLATFORM: ${{ inputs.platform }}
-          PIO_ENV: ${{ inputs.pio_env }}
-          OTA_URL: https://github.com/meshtastic/esp32-unified-ota/releases/latest/download/mt-${{ inputs.platform }}-ota.bin
+          OTA_FILE: mt-esp32s3-ota.bin
+          OTA_URL: https://github.com/meshtastic/esp32-unified-ota/releases/download/v1.0.1/mt-esp32s3-ota.bin
+          OTA_SHA256: 3e62c5451afda604bac372444f058fc689dd588a87772ad4be90c228e04c1995
         working-directory: release
         run: |
-          curl -L -o "mt-$PIO_PLATFORM-ota.bin" $OTA_URL
-
-      - name: ESP32-C* - Download BLE-Only OTA firmware
-        if: inputs.platform == 'esp32c3' || inputs.platform == 'esp32c6'
-        id: dl-ota-ble
-        env:
-          PIO_ENV: ${{ inputs.pio_env }}
-          OTA_URL: https://github.com/meshtastic/firmware-ota/releases/latest/download/firmware-c3.bin
-        working-directory: release
-        run: |
-          curl -L -o bleota-c3.bin $OTA_URL
+          set -euo pipefail
+          curl --fail --show-error --location --retry 4 --retry-all-errors \
+            --connect-timeout 20 --output "$OTA_FILE" "$OTA_URL"
+          echo "$OTA_SHA256  $OTA_FILE" | sha256sum --check --strict
 
       - name: Update manifest with OTA file
-        if: inputs.platform == 'esp32' || inputs.platform == 'esp32s3' || inputs.platform == 'esp32c3' || inputs.platform == 'esp32c6'
+        if: inputs.platform == 'esp32s3'
         working-directory: release
-        env:
-          PIO_PLATFORM: ${{ inputs.platform }}
         run: |
-          # Determine OTA filename based on platform
-          if [[ "$PIO_PLATFORM" == "esp32" || "$PIO_PLATFORM" == "esp32s3" ]]; then
-            OTA_FILE="mt-${PIO_PLATFORM}-ota.bin"
-          else
-            OTA_FILE="bleota-c3.bin"
-          fi
-
-          # Check if OTA file exists
-          if [[ ! -f "$OTA_FILE" ]]; then
-            echo "OTA file $OTA_FILE not found, skipping manifest update"
-            exit 0
-          fi
+          set -euo pipefail
+          OTA_FILE="mt-esp32s3-ota.bin"
+          test -s "$OTA_FILE"
+          test "$(stat -c%s "$OTA_FILE")" -eq 636544
 
           # Calculate MD5 and size
           if command -v md5sum &> /dev/null; then
@@ -99,16 +140,22 @@ jobs:
           fi
           OTA_SIZE=$(stat -f%z "$OTA_FILE" 2>/dev/null || stat -c%s "$OTA_FILE")
 
-          # Find and update manifest file
-          for manifest in firmware-*.mt.json; do
-            if [[ -f "$manifest" ]]; then
-              echo "Updating $manifest with $OTA_FILE (md5: $OTA_MD5, size: $OTA_SIZE)"
-              # Add OTA entry to files array if not already present
-              jq --arg name "$OTA_FILE" --arg md5 "$OTA_MD5" --argjson bytes "$OTA_SIZE" --arg part "app1" \
-                'if .files | map(select(.name == $name)) | length == 0 then .files += [{"name": $name, "md5": $md5, "bytes": $bytes, "part_name": $part}] else . end' \
-                "$manifest" > "${manifest}.tmp" && mv "${manifest}.tmp" "$manifest"
-            fi
-          done
+          shopt -s nullglob
+          manifests=(firmware-*.mt.json)
+          if [[ "${#manifests[@]}" -ne 1 ]]; then
+            echo "Expected exactly one firmware manifest, found ${#manifests[@]}" >&2
+            exit 1
+          fi
+
+          manifest="${manifests[0]}"
+          echo "Updating $manifest with $OTA_FILE (md5: $OTA_MD5, size: $OTA_SIZE)"
+          jq -e '.files | type == "array"' "$manifest" >/dev/null
+          # Replace any stale OTA entry so the manifest always matches the pinned payload.
+          jq --arg name "$OTA_FILE" --arg md5 "$OTA_MD5" --argjson bytes "$OTA_SIZE" --arg part "app1" \
+            '.files = ([.files[] | select(.name != $name)] +
+              [{"name": $name, "md5": $md5, "bytes": $bytes, "part_name": $part}])' \
+            "$manifest" > "${manifest}.tmp"
+          mv "${manifest}.tmp" "$manifest"
 
       - name: Job summary
         env:
@@ -124,7 +171,7 @@ jobs:
           echo "</details>" >> $GITHUB_STEP_SUMMARY
 
       - name: Store binaries as an artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         id: upload-firmware
         with:
           name: firmware-${{ inputs.platform }}-${{ inputs.pio_env }}-${{ inputs.version }}
@@ -140,7 +187,7 @@ jobs:
             release/device-*.bat
 
       - name: Store manifests as an artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         id: upload-manifest
         with:
           name: manifest-${{ inputs.platform }}-${{ inputs.pio_env }}-${{ inputs.version }}

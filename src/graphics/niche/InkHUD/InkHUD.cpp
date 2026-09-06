@@ -98,8 +98,11 @@ static void migrateOldInkHUDMessages()
 
         uint8_t count = 0;
         f.readBytes(reinterpret_cast<char *>(&count), 1);
+        if (count > MAX_MESSAGES_SAVED)
+            count = MAX_MESSAGES_SAVED;
 
         std::vector<StoredMessage> channelMsgs;
+        channelMsgs.reserve(count);
         for (uint8_t i = 0; i < count; i++) {
             StoredMessage sm;
             f.readBytes(reinterpret_cast<char *>(&sm.timestamp), sizeof(sm.timestamp));
@@ -122,8 +125,7 @@ static void migrateOldInkHUDMessages()
             sm.isBootRelative = false;
             sm.ackStatus = AckStatus::ACKED;
             size_t storedLen = (textLen >= MAX_MESSAGE_SIZE) ? MAX_MESSAGE_SIZE - 1 : textLen;
-            sm.textOffset = MessageStore::storeText(textBuf, storedLen);
-            sm.textLength = static_cast<uint16_t>(storedLen);
+            MessageStore::setText(sm, textBuf, storedLen);
 
             channelMsgs.push_back(sm);
         }

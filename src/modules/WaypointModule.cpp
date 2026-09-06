@@ -124,10 +124,10 @@ std::string trimmedWaypointText(const char *text)
     return std::string(first, last);
 }
 
-size_t collectDrawableWaypoints(const StoredWaypoint *entries[], size_t maxEntries)
+size_t collectDrawableWaypoints(const std::deque<StoredWaypoint> &waypoints, const StoredWaypoint *entries[], size_t maxEntries)
 {
     size_t count = 0;
-    for (const StoredWaypoint &entry : waypointStore.getWaypoints()) {
+    for (const StoredWaypoint &entry : waypoints) {
         if (WaypointStore::isExpired(entry))
             continue;
         if (count >= maxEntries)
@@ -298,8 +298,9 @@ void WaypointModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
     display->clear();
     display->setTextAlignment(TEXT_ALIGN_LEFT);
     display->setFont(FONT_SMALL);
+    const auto waypointSnapshot = waypointStore.getWaypoints();
     const StoredWaypoint *entries[WAYPOINT_HISTORY_LIMIT];
-    const size_t totalWaypoints = collectDrawableWaypoints(entries, WAYPOINT_HISTORY_LIMIT);
+    const size_t totalWaypoints = collectDrawableWaypoints(waypointSnapshot, entries, WAYPOINT_HISTORY_LIMIT);
     if (totalWaypoints == 0)
         return;
 

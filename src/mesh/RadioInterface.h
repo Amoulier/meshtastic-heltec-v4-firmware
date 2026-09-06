@@ -153,6 +153,15 @@ class RadioInterface
      */
     virtual bool canSleep(bool deepSleep = false) { return true; }
 
+    /// True once an active TX or partially received packet can no longer be truncated.
+    virtual bool canParkForConfig() { return true; }
+
+    /// True when parking would strand a packet that has not started transmitting.
+    virtual bool hasPendingTransmissionsForConfig() { return false; }
+
+    /// Resume any queued work after a configuration transaction releases the radio.
+    virtual void resumeQueuedTransmissions() {}
+
     virtual bool wideLora() { return false; }
 
     /// Whether the radio can tune sub-GHz bands. False for 2.4 GHz-only chips (SX128x);
@@ -260,6 +269,11 @@ class RadioInterface
 
     static bool checkOrClampConfigLora(meshtastic_Config_LoRaConfig &loraConfig, bool clamp);
 
+    // Validate frequency values against board-specific radio limits without
+    // touching hardware. This is safe during early boot and backup restore.
+    static bool checkHardwareFrequencyRange(const meshtastic_Config_LoRaConfig &loraConfig, char *errBuf = nullptr,
+                                            size_t errLen = 0);
+
     // Check if a candidate region is compatible and valid, with no side effects (safe for
     // speculative UI checks). prospectiveLicensedOwner is for a UI flow that requires
     // confirmation before it sets the owner licensed. errBuf, if given, receives the failure reason.
@@ -273,8 +287,9 @@ class RadioInterface
     // Check if a candidate radio configuration is valid.
     static bool validateConfigLora(const meshtastic_Config_LoRaConfig &loraConfig);
 
-    // Make a candidate radio configuration valid, even if it isn't.
-    static void clampConfigLora(meshtastic_Config_LoRaConfig &loraConfig);
+    // Make a candidate radio configuration valid when a safe repair exists.
+    // Returns false when hardware/regulatory constraints make automatic repair unsafe.
+    static bool clampConfigLora(meshtastic_Config_LoRaConfig &loraConfig);
 
     // If preset is locked to a sibling of currentRegion among the swappable EU regions
     // (EU_868/EU_866/EU_N_868), return the sibling region owning the preset, else nullptr.
@@ -282,7 +297,8 @@ class RadioInterface
                                                  meshtastic_Config_LoRaConfig_ModemPreset preset);
 
   protected:
-    int8_t power = 17; // Set by applyModemConfig()
+    int8_t requestedPower = 17; // Requested EIRP, normalized by applyModemConfig()
+    int8_t power = 17;          // Effective radio output after regulatory/FEM/radio limits
 
     float savedFreq;
     uint32_t savedChannelNum;
@@ -323,13 +339,14 @@ class RadioInterface
      *
      * These parameters will be pull from the channelSettings global
      */
-    void applyModemConfig();
+    // Returns false rather than applying an irreparable configuration.
+    bool applyModemConfig();
 
     /// Return 0 if sleep is okay. A non-NULL argument means the radio is about to be powered
     /// down (deep sleep / shutdown), see doPreflightSleep()
     int preflightSleepCb(void *deepSleep = NULL) { return canSleep(deepSleep != NULL) ? 0 : 1; }
 
-    int notifyDeepSleepCb(void *unused = NULL);
+    int notifyDeepSleepCb(void *context = NULL);
 
     int reloadConfig(void *unused)
     {

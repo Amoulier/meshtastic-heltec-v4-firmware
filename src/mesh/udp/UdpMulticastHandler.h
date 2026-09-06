@@ -2,6 +2,9 @@
 #if HAS_UDP_MULTICAST
 #include "configuration.h"
 #include "main.h"
+#if defined(HELTEC_V4_OLED)
+#include "NodeDB.h"
+#endif
 #include "mesh/Router.h"
 
 #if HAS_ETHERNET && defined(ARCH_NRF52)
@@ -59,6 +62,16 @@ class UdpMulticastHandler final
 
     void onReceive(AsyncUDPPacket &packet)
     {
+#if defined(HELTEC_V4_OLED)
+        NodeDB::ExternalStateAccessScope stateAccess(nodeDB);
+        if (!stateAccess)
+            return;
+        if (nodeDB &&
+            (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive())) {
+            LOG_WARN("Ignore UDP ingress while a storage transaction is open");
+            return;
+        }
+#endif
         if (!isRunning) {
             return;
         }
@@ -104,6 +117,16 @@ class UdpMulticastHandler final
 
     bool onSend(const meshtastic_MeshPacket *mp)
     {
+#if defined(HELTEC_V4_OLED)
+        NodeDB::ExternalStateAccessScope stateAccess(nodeDB);
+        if (!stateAccess)
+            return false;
+        if (nodeDB &&
+            (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive())) {
+            LOG_WARN("Suppress UDP egress while a storage transaction is open");
+            return false;
+        }
+#endif
         if (!isRunning || !mp || !udp) {
             return false;
         }

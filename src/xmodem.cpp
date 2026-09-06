@@ -49,7 +49,9 @@
  **********************************************************************************************************************/
 
 #include "xmodem.h"
+#include "NodeDB.h"
 #include "SPILock.h"
+#include "concurrency/LockGuard.h"
 #include <cstring>
 
 #ifdef FSCom
@@ -57,6 +59,66 @@
 XModemAdapter xModem;
 
 XModemAdapter::XModemAdapter() {}
+
+bool XModemAdapter::isBusy()
+{
+    concurrency::LockGuard guard(&transactionLock);
+    return isReceiving || isTransmitting;
+}
+
+bool XModemAdapter::beginExclusiveStorageMutation(bool cancelActiveTransfer)
+{
+    concurrency::LockGuard guard(&transactionLock);
+    if (storageMutationBlocked)
+        return false;
+    if (isReceiving || isTransmitting) {
+        if (!cancelActiveTransfer)
+            return false;
+
+        // The full-reset path has already fenced PhoneAPI/HTTP readers. Close
+        // the abandoned handle and remove only a partial upload; a download's
+        // source is never deleted.
+        const bool removePartialReceive = isReceiving;
+        concurrency::LockGuard spiGuard(spiLock);
+        if (isReceiving)
+            file.flush();
+        file.close();
+        if (removePartialReceive && filename[0] != '\0')
+            FSCom.remove(filename);
+        isReceiving = false;
+        isTransmitting = false;
+        isEOT = false;
+        xmodemStore = meshtastic_XModem_init_zero;
+        LOG_WARN("XModem: abandoned transfer cancelled for full recovery");
+    }
+    storageMutationBlocked = true;
+    return true;
+}
+
+void XModemAdapter::endExclusiveStorageMutation()
+{
+    concurrency::LockGuard guard(&transactionLock);
+    storageMutationBlocked = false;
+}
+
+#if defined(HELTEC_V4_OLED)
+static bool isProtectedHeltecStoragePath(const char *name)
+{
+    if (!name)
+        return true;
+    while ((name[0] == '.' && (name[1] == '/' || name[1] == '\\')) || name[0] == '/' || name[0] == '\\') {
+        name += (name[0] == '.') ? 2 : 1;
+    }
+    const char *separator = strpbrk(name, "/\\");
+    const size_t componentLength = separator ? static_cast<size_t>(separator - name) : strlen(name);
+    const bool preferencesTree = componentLength == strlen("prefs") && memcmp(name, "prefs", componentLength) == 0;
+    const bool backupTree = componentLength == strlen("backups") && memcmp(name, "backups", componentLength) == 0;
+    const bool resetMarker = !separator &&
+                             (strcmp(name, "heltec-nvs-reset.pending") == 0 ||
+                              strcmp(name, "heltec-nvs-reset.pending.tmp") == 0);
+    return preferencesTree || backupTree || resetMarker;
+}
+#endif
 
 bool XModemAdapter::isValidFilename(const char *name)
 {
@@ -136,6 +198,27 @@ void XModemAdapter::resetForPhone()
 
 void XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket)
 {
+    concurrency::LockGuard transactionGuard(&transactionLock);
+#if defined(HELTEC_V4_OLED)
+    if (!shouldUseFilesystemPersistence(fsIsMounted())) {
+        LOG_WARN("XModem: filesystem unavailable");
+        sendControl(meshtastic_XModem_Control_NAK);
+        return;
+    }
+    if (storageMutationBlocked) {
+        LOG_WARN("XModem: storage transaction in progress");
+        sendControl(meshtastic_XModem_Control_NAK);
+        return;
+    }
+    if (nodeDB && nodeDB->requiresConfigRecovery()) {
+        // Recovery exposes only the narrowly allowlisted Admin/BLE-OTA path.
+        // Do not permit config/key/backup reads or writes through XMODEM.
+        LOG_WARN("XModem: disabled while configuration recovery is required");
+        sendControl(meshtastic_XModem_Control_NAK);
+        return;
+    }
+#endif
+
     switch (xmodemPacket.control) {
     case meshtastic_XModem_Control_SOH:
     case meshtastic_XModem_Control_STX:
@@ -152,17 +235,31 @@ void XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket)
                 break;
             }
 
+#if defined(HELTEC_V4_OLED)
+            // XMODEM has no per-connection authorization on this target and is
+            // reachable through the HTTP PhoneAPI transport. Neither upload
+            // nor download may expose/replace private keys, channel PSKs,
+            // network credentials, backups or recovery intent.
+            if (isProtectedHeltecStoragePath(filename)) {
+                LOG_WARN("XModem: transfer rejected for protected/recovery path");
+                sendControl(meshtastic_XModem_Control_NAK);
+                break;
+            }
+#endif
+
             if (xmodemPacket.control == meshtastic_XModem_Control_SOH) { // Receive this file and put to Flash
                 // FILE_O_WRITE on Adafruit_LittleFS is append, not truncate - remove first.
                 spiLock->lock();
-                if (FSCom.exists(filename))
-                    FSCom.remove(filename);
-                file = FSCom.open(filename, FILE_O_WRITE);
+                const bool oldFileRemoved = !FSCom.exists(filename) || (FSCom.remove(filename) && !FSCom.exists(filename));
+                if (oldFileRemoved)
+                    file = FSCom.open(filename, FILE_O_WRITE);
                 spiLock->unlock();
-                if (file) {
+                if (oldFileRemoved && file) {
                     LOG_INFO("XModem: receiving %s", filename);
                     sendControl(meshtastic_XModem_Control_ACK);
                     isReceiving = true;
+                    isEOT = false;
+                    retrans = MAXRETRANS;
                     packetno = 1;
                     break;
                 }
@@ -209,6 +306,13 @@ void XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket)
                     if (written != xmodemPacket.buffer.size) {
                         LOG_WARN("XModem: short write seq=%d expected=%d wrote=%d (LittleFS partition full?)",
                                  (int)xmodemPacket.seq, (int)xmodemPacket.buffer.size, (int)written);
+                        spiLock->lock();
+                        file.close();
+                        FSCom.remove(filename);
+                        spiLock->unlock();
+                        isReceiving = false;
+                        sendControl(meshtastic_XModem_Control_CAN);
+                        break;
                     }
                     sendControl(meshtastic_XModem_Control_ACK);
                     packetno++;
@@ -230,6 +334,10 @@ void XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket)
         break;
     case meshtastic_XModem_Control_EOT:
         // End of transmission
+        if (!isReceiving) {
+            sendControl(meshtastic_XModem_Control_NAK);
+            break;
+        }
         sendControl(meshtastic_XModem_Control_ACK);
         spiLock->lock();
         file.flush();
@@ -237,17 +345,23 @@ void XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket)
         spiLock->unlock();
         isReceiving = false;
         break;
-    case meshtastic_XModem_Control_CAN:
-        // Cancel transmission and remove file
+    case meshtastic_XModem_Control_CAN: {
+        // Cancel a receive and remove only its partial destination. Cancelling a
+        // download must never delete the source file.
         sendControl(meshtastic_XModem_Control_ACK);
+        const bool removePartialReceive = isReceiving;
         spiLock->lock();
-        file.flush();
+        if (isReceiving)
+            file.flush();
         file.close();
-
-        FSCom.remove(filename);
+        if (removePartialReceive)
+            FSCom.remove(filename);
         spiLock->unlock();
         isReceiving = false;
+        isTransmitting = false;
+        isEOT = false;
         break;
+    }
     case meshtastic_XModem_Control_ACK:
         // Acknowledge Send the next packet
         if (isTransmitting) {

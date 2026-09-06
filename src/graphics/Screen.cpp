@@ -64,6 +64,7 @@ extern NicheGraphics::BaseUIEInkDisplay *setupNicheGraphicsBaseUI();
 #include "MeshService.h"
 #include "MessageStore.h"
 #include "RadioLibInterface.h"
+#include "SafeFile.h"
 #include "SPILock.h"
 #include "error.h"
 #include "gps/GeoCoord.h"
@@ -88,7 +89,9 @@ extern NicheGraphics::BaseUIEInkDisplay *setupNicheGraphicsBaseUI();
 #include "sleep.h"
 #include "target_specific.h"
 #if defined(HELTEC_V4_OLED)
+#include "power/DeepSleepPolicy.h"
 #include <Preferences.h>
+static std::atomic<bool> heltecV4SharedVextAccessoryDetected{false};
 #endif
 extern MessageStore messageStore;
 
@@ -837,6 +840,10 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
 #if defined(T_WATCH_S3) // on T_WATCH_ULTRA, powering down this pin seems to goober the i2c bus.
             PMU->disablePowerOutput(XPOWERS_ALDO2);
 #endif
+            // runOnce() stops being scheduled as soon as enabled becomes false.
+            // Clear this snapshot here so Sleep Screen cannot leave a stale
+            // "message frame visible" value that suppresses the next wake.
+            textMessageFrameShown.store(false, std::memory_order_release);
             enabled = false;
         }
         screenOn = on;
@@ -1048,35 +1055,99 @@ void Screen::setup()
 bool Screen::loadDisplayDisabled()
 {
 #if defined(HELTEC_V4_OLED)
-    Preferences preferences;
-    if (!preferences.begin(DISPLAY_PREFS_NAMESPACE, true))
-        return false;
-    const bool disabled = preferences.getBool(DISPLAY_DISABLED_KEY, false);
-    preferences.end();
-    return disabled;
+    bool disabled = false;
+    return readDisplayDisabledPreference(disabled) ? disabled : false;
 #else
     return false;
 #endif
 }
 
-void Screen::saveDisplayDisabled(bool disabled)
+#if defined(HELTEC_V4_OLED)
+void Screen::setSharedVextAccessoryDetected(bool detected)
+{
+    heltecV4SharedVextAccessoryDetected.store(detected, std::memory_order_release);
+}
+
+bool Screen::readDisplayDisabledPreference(bool &disabled)
+{
+    disabled = false;
+    concurrency::LockGuard nvsGuard(&heltecV4NvsMutationLock);
+    Preferences preferences;
+    if (!preferences.begin(DISPLAY_PREFS_NAMESPACE, true))
+        return false;
+    const bool keyPresent = preferences.isKey(DISPLAY_DISABLED_KEY);
+    if (keyPresent)
+        disabled = preferences.getBool(DISPLAY_DISABLED_KEY, false);
+    preferences.end();
+    return keyPresent;
+}
+#endif
+
+bool Screen::saveDisplayDisabled(bool disabled)
 {
 #if defined(HELTEC_V4_OLED)
+#if !defined(FSCom)
+    LOG_ERROR("Display preference write unavailable without persistent storage");
+    return false;
+#else
+    // Do the fresh power measurement before taking the NVS lock. Full reset
+    // raises its destructive fence before taking this same lock, so the second
+    // check below closes the race without reversing lock order.
+    if (!heltecPreferenceStoragePowerIsSafe()) {
+        LOG_WARN("Display preference write refused: power is not safe");
+        return false;
+    }
+
+    concurrency::LockGuard nvsGuard(&heltecV4NvsMutationLock);
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive()) {
+        LOG_WARN("Display preference write suppressed during factory reset");
+        return false;
+    }
+    if (!heltecPreferenceStoragePowerIsSafe()) {
+        LOG_WARN("Display preference write refused after NVS wait because fresh power is unsafe");
+        return false;
+    }
+
     Preferences preferences;
-    if (!preferences.begin(DISPLAY_PREFS_NAMESPACE, false))
-        return;
-    preferences.putBool(DISPLAY_DISABLED_KEY, disabled);
+    if (!preferences.begin(DISPLAY_PREFS_NAMESPACE, false)) {
+        LOG_ERROR("Display preference NVS open failed");
+        return false;
+    }
+    const size_t written = preferences.putBool(DISPLAY_DISABLED_KEY, disabled);
     preferences.end();
+
+    if (written != sizeof(uint8_t)) {
+        LOG_ERROR("Display preference NVS write failed");
+        return false;
+    }
+
+    // Reopen read-only so success means the committed value is independently
+    // readable, rather than merely accepted by the Preferences wrapper.
+    if (!preferences.begin(DISPLAY_PREFS_NAMESPACE, true)) {
+        LOG_ERROR("Display preference NVS verification open failed");
+        return false;
+    }
+    const bool keyPresent = preferences.isKey(DISPLAY_DISABLED_KEY);
+    const bool persisted = preferences.getBool(DISPLAY_DISABLED_KEY, !disabled);
+    preferences.end();
+    if (!keyPresent || persisted != disabled) {
+        LOG_ERROR("Display preference NVS readback mismatch");
+        return false;
+    }
+    return true;
+#endif
 #else
     (void)disabled;
+    return true;
 #endif
 }
 
 void Screen::setDisplayRailPower(bool on)
 {
 #if defined(HELTEC_V4_OLED) && defined(VEXT_ENABLE)
-    // Reassert the disabled state even when our cached rail state already says off. This keeps
-    // RESET low and VEXT off if another asynchronous path touched either GPIO.
+    // Reassert the disabled state even when our cached display state already
+    // says off. RESET always stays low. GPIO36 is shared with QuickLink, so a
+    // completed boot scan can require that VEXT itself remain powered.
     if (on && displayRailPowered)
         return;
 
@@ -1086,8 +1157,10 @@ void Screen::setDisplayRailPower(bool on)
         digitalWrite(RESET_OLED, LOW);
     }
 #endif
+    const bool accessoryDetected = heltecV4SharedVextAccessoryDetected.load(std::memory_order_acquire);
+    const bool powerDownSharedRail = shouldPowerDownHeltecV4VextForDisplayDisable(!on, accessoryDetected);
     pinMode(VEXT_ENABLE, OUTPUT);
-    digitalWrite(VEXT_ENABLE, on ? VEXT_ON_VALUE : !VEXT_ON_VALUE);
+    digitalWrite(VEXT_ENABLE, powerDownSharedRail ? !VEXT_ON_VALUE : VEXT_ON_VALUE);
     displayRailPowered = on;
 
     if (on) {
@@ -1106,25 +1179,37 @@ void Screen::setDisplayRailPower(bool on)
 #endif
 }
 
-void Screen::setDisplayDisabled(bool disabled)
+bool Screen::setDisplayDisabled(bool disabled)
 {
     if (isDisplayDisabled() == disabled) {
         if (disabled) {
+            textMessageFrameShown.store(false, std::memory_order_release);
             enabled = false;
             setDisplayRailPower(false);
         }
-        return;
+        return true;
     }
 
     if (disabled) {
+        // "Disable Display" promises persistence. Keep the display usable if
+        // low voltage, reset activity, or NVS failure prevents that promise;
+        // the temporary "Sleep Screen" action remains available in that case.
+        if (!saveDisplayDisabled(true)) {
+            LOG_ERROR("Display disable rejected because persistence failed");
+            return false;
+        }
+        textMessageFrameShown.store(false, std::memory_order_release);
         displayDisabled.store(true, std::memory_order_release);
-        saveDisplayDisabled(true);
         handleSetOn(false);
         dispdev->displayOff();
         enabled = false;
         setDisplayRailPower(false);
         LOG_INFO("Display disabled persistently");
     } else {
+        // Never trap the user behind a failed flash write: PRG restores the
+        // panel for this boot even if the durable flag cannot yet be cleared.
+        // A later powered reboot remains safely dark and PRG can be retried.
+        const bool persisted = saveDisplayDisabled(false);
         setDisplayRailPower(true);
 #if defined(HELTEC_V4_OLED)
         dispdev->init();
@@ -1133,10 +1218,15 @@ void Screen::setDisplayDisabled(bool disabled)
             dispdev->flipScreenVertically();
 #endif
         displayDisabled.store(false, std::memory_order_release);
-        saveDisplayDisabled(false);
         handleSetOn(true);
-        LOG_INFO("Display restored by user");
+        if (persisted)
+            LOG_INFO("Display restored by user");
+        else {
+            LOG_WARN("Display restored for this boot; persistent flag was not cleared");
+            showSimpleBanner("Display restored\nsetting not saved", 3000);
+        }
     }
+    return true;
 }
 
 void Screen::setOn(bool on, FrameCallback einkScreensaver)
@@ -1219,11 +1309,13 @@ int32_t Screen::runOnce()
 {
     // If we don't have a screen, don't ever spend any CPU for us.
     if (!useDisplay) {
+        textMessageFrameShown.store(false, std::memory_order_release);
         enabled = false;
         return RUN_SAME;
     }
 
     if (isDisplayDisabled()) {
+        textMessageFrameShown.store(false, std::memory_order_release);
         enabled = false;
         setDisplayRailPower(false);
         return RUN_SAME;
@@ -1365,6 +1457,7 @@ int32_t Screen::runOnce()
 
     if (!screenOn) { // If we didn't just wake and the screen is still off, then
                      // stop updating until it is on again
+        textMessageFrameShown.store(false, std::memory_order_release);
         enabled = false;
         return 0;
     }
@@ -1376,6 +1469,10 @@ int32_t Screen::runOnce()
     // Switch to a low framerate (to save CPU) when we are not in transition
     // but we should only call setTargetFPS when framestate changes, because
     // otherwise that breaks animations.
+
+    textMessageFrameShown.store(showingNormalScreen && framesetInfo.positions.textMessage != 255 && ui &&
+                                    ui->getUiState()->currentFrame == framesetInfo.positions.textMessage,
+                                std::memory_order_release);
 
     uint32_t desiredFramerate = IDLE_FRAMERATE;
 #if HAS_GPS && !defined(USE_EINK)
@@ -2025,25 +2122,27 @@ void Screen::loadFrameVisibility()
 void Screen::saveFrameVisibility()
 {
 #ifdef FSCom
-    spiLock->lock();
-    FSCom.mkdir("/prefs");
-    if (FSCom.exists(frameVisibilityFileName))
-        FSCom.remove(frameVisibilityFileName);
+    FrameVisFile data{};
+    data.magic = FRAMEVIS_MAGIC;
+    data.version = FRAMEVIS_VERSION;
+    data.mask = packHiddenFrames();
+    {
+        concurrency::LockGuard guard(spiLock);
+        FSCom.mkdir("/prefs");
+    }
 
-    auto file = FSCom.open(frameVisibilityFileName, FILE_O_WRITE);
-    if (file) {
-        FrameVisFile data{};
-        data.magic = FRAMEVIS_MAGIC;
-        data.version = FRAMEVIS_VERSION;
-        data.mask = packHiddenFrames();
-        file.write((uint8_t *)&data, sizeof(data));
-        file.flush();
-        file.close();
+    SafeFile file(frameVisibilityFileName, true);
+    size_t written = 0;
+    {
+        concurrency::LockGuard guard(spiLock);
+        written = file.write((uint8_t *)&data, sizeof(data));
+    }
+    const bool closed = file.close();
+    if (written == sizeof(data) && closed) {
         LOG_INFO("Saved frame visibility (mask 0x%08x)", data.mask);
     } else {
-        LOG_WARN("Failed to open %s for writing", frameVisibilityFileName);
+        LOG_WARN("Failed to atomically save %s", frameVisibilityFileName);
     }
-    spiLock->unlock();
 #endif
 }
 
@@ -2551,6 +2650,11 @@ int Screen::handleAdminMessage(AdminModule_ObserverData *arg)
 bool Screen::isOverlayBannerShowing()
 {
     return NotificationRenderer::isOverlayBannerShowing();
+}
+
+bool Screen::isTextMessageFrameShown() const
+{
+    return textMessageFrameShown.load(std::memory_order_acquire);
 }
 
 bool Screen::isGamesFrameShown()

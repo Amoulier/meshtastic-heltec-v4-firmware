@@ -30,10 +30,7 @@ class WaypointListApplet : public Applet, public concurrency::OSThread
 
     WaypointListApplet *asWaypointListApplet() override { return this; } // Identify as WaypointListApplet without RTTI
 
-    // Read-only access for MenuApplet's "Remove Waypoint" page
-    size_t waypointCount() const { return waypointStore.getWaypoints().size(); }
-    uint32_t waypointIdAt(size_t index) const { return waypointStore.getWaypoints().at(index).waypoint.id; }
-    std::string waypointLabelAt(size_t index) { return waypointName(waypointStore.getWaypoints().at(index).waypoint); }
+    std::string waypointLabel(const meshtastic_Waypoint &waypoint) { return waypointName(waypoint); }
 
   protected:
     int32_t runOnce() override;

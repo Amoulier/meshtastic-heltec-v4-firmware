@@ -379,6 +379,18 @@ void MQTT::onClientProxyReceive(meshtastic_MqttClientProxyMessage msg)
 
 void MQTT::onReceive(char *topic, byte *payload, size_t length)
 {
+#if defined(HELTEC_V4_OLED)
+    NodeDB::ExternalStateAccessScope stateAccess(nodeDB);
+    if (!stateAccess)
+        return;
+    // Channel keys may be provisional during a bulk edit. Do not decode or
+    // route network ingress against a generation that is not durable yet.
+    if (nodeDB &&
+        (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive())) {
+        LOG_WARN("Ignore MQTT ingress while a storage transaction is open");
+        return;
+    }
+#endif
     if (length == 0) {
         LOG_WARN("Empty MQTT payload, topic %s", topic);
         return;
@@ -591,6 +603,11 @@ void MQTT::sendSubscriptions()
 
 int32_t MQTT::runOnce()
 {
+#if defined(HELTEC_V4_OLED)
+    NodeDB::ExternalStateAccessScope stateAccess(nodeDB);
+    if (!stateAccess)
+        return 250;
+#endif
     if (!moduleConfig.mqtt.enabled || !(moduleConfig.mqtt.map_reporting_enabled || channels.anyMqttEnabled()))
         return disable();
     bool wantConnection = wantsLink();
@@ -643,29 +660,6 @@ bool MQTT::isValidConfig(const meshtastic_ModuleConfig_MQTTConfig &config, MQTTC
             LOG_ERROR("Invalid MQTT config: tls_enabled unsupported on this node");
             return false;
 #endif
-        }
-        // Perform a lightweight TCP connectivity check without using connectPubSub(),
-        // which mutates the module's isConnected state. This only checks if the server
-        // is reachable - it does not establish an MQTT session.
-        // Settings are always saved regardless of the result.
-        if (isConnectedToNetwork()) {
-            MQTTClient testClient;
-            if (!testClient.connect(parsed.serverAddr.c_str(), parsed.serverPort)) {
-                const char *warning = "Could not reach the MQTT server. Settings will be saved, but please verify the server "
-                                      "address and credentials.";
-                LOG_WARN(warning);
-#ifndef PIO_UNIT_TESTING
-                meshtastic_ClientNotification *cn = clientNotificationPool.allocZeroed();
-                if (cn) {
-                    cn->level = meshtastic_LogRecord_Level_WARNING;
-                    cn->time = getValidTime(RTCQualityFromNet);
-                    strncpy(cn->message, warning, sizeof(cn->message) - 1);
-                    cn->message[sizeof(cn->message) - 1] = '\0';
-                    service->sendClientNotification(cn);
-                }
-#endif
-            }
-            testClient.stop();
         }
 #else
         const char *warning = "Invalid MQTT config: proxy_to_client_enabled must be enabled on nodes that do not have a network";
@@ -723,6 +717,16 @@ void MQTT::publishQueuedMessages()
 
 void MQTT::onSend(const meshtastic_MeshPacket &mp_encrypted, const meshtastic_MeshPacket &mp_decoded, ChannelIndex chIndex)
 {
+#if defined(HELTEC_V4_OLED)
+    NodeDB::ExternalStateAccessScope stateAccess(nodeDB);
+    if (!stateAccess)
+        return;
+    if (nodeDB &&
+        (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive())) {
+        LOG_WARN("Suppress MQTT egress while a storage transaction is open");
+        return;
+    }
+#endif
     if (mp_encrypted.via_mqtt)
         return; // Don't send messages that came from MQTT back into MQTT
 #if USERPREFS_BLOCK_POSITION_ON_EVENT_CHANNEL

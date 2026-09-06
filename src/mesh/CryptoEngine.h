@@ -40,6 +40,10 @@ class CryptoEngine
 #if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN)
     virtual void generateKeyPair(uint8_t *pubKey, uint8_t *privKey);
     virtual bool regeneratePublicKey(uint8_t *pubKey, uint8_t *privKey);
+    /// Restore the live PKI engine from a previous private key after a rejected
+    /// configuration mutation. Passing nullptr clears all local identity and
+    /// derived-key material.
+    virtual bool restoreIdentity(const uint8_t *privKey);
     virtual bool ensurePkiKeys(meshtastic_Config_SecurityConfig &security, meshtastic_User &user);
 #endif
 #if !(MESHTASTIC_EXCLUDE_XEDDSA)

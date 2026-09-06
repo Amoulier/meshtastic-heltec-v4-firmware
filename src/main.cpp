@@ -49,6 +49,9 @@
 #include "mesh/generated/meshtastic/config.pb.h"
 #include "meshUtils.h"
 #include "modules/Modules.h"
+#if !MESHTASTIC_EXCLUDE_ADMIN
+#include "modules/AdminModule.h"
+#endif
 #ifdef MESHTASTIC_HEAP_WATERMARK_CHECK
 #include "memGet.h"
 #endif
@@ -487,6 +490,23 @@ void setup()
 
     initDeepSleep();
 
+#if defined(ARCH_ESP32) && defined(HELTEC_V4_OLED)
+    const bool heltecV4HeadlessTimerWake = wakeCause == ESP_SLEEP_WAKEUP_TIMER;
+    if (heltecV4HeadlessTimerWake) {
+        // These controls are dedicated to the OLED/status indicator and can be
+        // parked immediately. VEXT stays on until after peripheral discovery
+        // because GPIO36 also powers the exported QuickLink/accessory rail.
+#ifdef RESET_OLED
+        pinMode(RESET_OLED, OUTPUT);
+        digitalWrite(RESET_OLED, LOW);
+#endif
+#ifdef LED_POWER
+        pinMode(LED_POWER, OUTPUT);
+        digitalWrite(LED_POWER, LED_STATE_OFF);
+#endif
+    }
+#endif
+
 #if defined(MODEM_POWER_EN)
     pinMode(MODEM_POWER_EN, OUTPUT);
     digitalWrite(MODEM_POWER_EN, LOW);
@@ -524,11 +544,19 @@ void setup()
 
 #ifdef RESET_OLED
     pinMode(RESET_OLED, OUTPUT);
+#if defined(ARCH_ESP32) && defined(HELTEC_V4_OLED)
+    if (!heltecV4HeadlessTimerWake) {
+#endif
     digitalWrite(RESET_OLED, 1);
     delay(2);
     digitalWrite(RESET_OLED, 0);
     delay(10);
     digitalWrite(RESET_OLED, 1);
+#if defined(ARCH_ESP32) && defined(HELTEC_V4_OLED)
+    } else {
+        digitalWrite(RESET_OLED, LOW);
+    }
+#endif
 #endif
 
 #ifdef SENSOR_POWER_CTRL_PIN
@@ -706,11 +734,46 @@ void setup()
     if (wakeCause == ESP_SLEEP_WAKEUP_TIMER) {
         LOG_DEBUG("suppress screen wake: headless timer wakeup");
         i2cScanner->setSuppressScreen();
+#if defined(HELTEC_V4_OLED)
+        // The Heltec screen object is intentionally not constructed on a
+        // headless timer wake. RESET and LED were parked before peripheral
+        // warmup. With OLED reset held low, anything found by this completed
+        // I2C scan is an accessory and must keep the shared VEXT/QuickLink rail.
+#ifdef RESET_OLED
+        pinMode(RESET_OLED, OUTPUT);
+        digitalWrite(RESET_OLED, LOW);
+#endif
+#ifdef VEXT_ENABLE
+        bool persistedDisplayDisabled = false;
+        const bool displayPreferenceRead =
+            graphics::Screen::readDisplayDisabledPreference(persistedDisplayDisabled);
+        const bool i2cAccessoryDetected = i2cCount > 0;
+        if (shouldPowerDownHeltecV4VextOnHeadlessWake(heltecV4HeadlessTimerWake, displayPreferenceRead,
+                                                      persistedDisplayDisabled, i2cAccessoryDetected)) {
+            pinMode(VEXT_ENABLE, OUTPUT);
+            digitalWrite(VEXT_ENABLE, !VEXT_ON_VALUE);
+        }
+#endif
+#ifdef LED_POWER
+        pinMode(LED_POWER, OUTPUT);
+        digitalWrite(LED_POWER, LED_STATE_OFF);
+#endif
+#endif
     }
 #endif
 
 #if HAS_SCREEN
     auto screenInfo = i2cScanner->firstScreen();
+#if defined(HELTEC_V4_OLED)
+    // foundDevices is keyed by bus/address, so subtract the one onboard OLED
+    // response from the completed scan. Any remaining responder is an I2C
+    // accessory whose shared GPIO36/VEXT supply must survive Display Disable.
+    const bool i2cScreenDetected = screenInfo.type != ScanI2C::DeviceType::NONE;
+    const bool i2cAccessoryDetected = i2cCount > (i2cScreenDetected ? 1U : 0U);
+    graphics::Screen::setSharedVextAccessoryDetected(i2cAccessoryDetected);
+    if (i2cAccessoryDetected)
+        LOG_INFO("Heltec V4: preserving shared VEXT for detected I2C accessory");
+#endif
     screen_found = screenInfo.type != ScanI2C::DeviceType::NONE ? screenInfo.address : ScanI2C::ADDRESS_NONE;
 
     if (screen_found.port != ScanI2C::I2CPort::NO_I2C) {
@@ -870,6 +933,9 @@ void setup()
 #ifdef ARCH_ESP32
     // Config is loaded now, and Bluetooth has not been initialized yet. If the
     // saved config will keep Bluetooth inactive, return its reserved memory early.
+#if defined(HELTEC_V4_OLED)
+    if (!nodeDB->requiresConfigRecovery())
+#endif
     esp32ReleaseBluetoothMemoryIfUnused();
 #endif
 
@@ -1199,12 +1265,18 @@ void setup()
 
         // Initialize Wifi
 #if HAS_WIFI
-    initWifi();
+#if defined(HELTEC_V4_OLED)
+    if (!nodeDB || !nodeDB->requiresConfigRecovery())
+#endif
+        initWifi();
 #endif
 
 #if HAS_ETHERNET
     // Initialize Ethernet
-    initEthernet();
+#if defined(HELTEC_V4_OLED)
+    if (!nodeDB || !nodeDB->requiresConfigRecovery())
+#endif
+        initEthernet();
 #endif
 #endif
 
@@ -1320,6 +1392,18 @@ extern meshtastic_DeviceMetadata getDeviceMetadata()
 #if MESHTASTIC_EXCLUDE_AUDIO
     deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_AUDIO_CONFIG;
 #endif
+#if MESHTASTIC_EXCLUDE_MQTT
+    deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_MQTT_CONFIG;
+#endif
+#if MESHTASTIC_EXCLUDE_NEIGHBORINFO
+    deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_NEIGHBORINFO_CONFIG;
+#endif
+#if MESHTASTIC_EXCLUDE_STOREFORWARD
+    deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_STOREFORWARD_CONFIG;
+#endif
+#if !HAS_TELEMETRY
+    deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_TELEMETRY_CONFIG;
+#endif
 // Option to explicitly include canned messages for edge cases, e.g. niche graphics
 #if ((!HAS_SCREEN || NO_EXT_GPIO) || MESHTASTIC_EXCLUDE_CANNEDMESSAGES) && !defined(MESHTASTIC_INCLUDE_NICHE_GRAPHICS)
     deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_CANNEDMSG_CONFIG;
@@ -1336,7 +1420,7 @@ extern meshtastic_DeviceMetadata getDeviceMetadata()
 #if NO_EXT_GPIO && NO_GPS || MESHTASTIC_EXCLUDE_SERIAL
     deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_SERIAL_CONFIG;
 #endif
-#ifndef ARCH_ESP32
+#if !defined(ARCH_ESP32) || MESHTASTIC_EXCLUDE_PAXCOUNTER
     deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_PAXCOUNTER_CONFIG;
 #endif
 #if !defined(HAS_RGB_LED) && !RAK_4631
@@ -1348,14 +1432,12 @@ extern meshtastic_DeviceMetadata getDeviceMetadata()
 // No bluetooth on these targets (yet):
 // Pico W / 2W may get it at some point
 // Portduino and ESP32-C6 are excluded because we don't have a working bluetooth stacks integrated yet.
-#if defined(ARCH_RP2040) || defined(ARCH_PORTDUINO) || defined(ARCH_STM32) || defined(CONFIG_IDF_TARGET_ESP32C6)
+#if defined(ARCH_RP2040) || defined(ARCH_PORTDUINO) || defined(ARCH_STM32) || defined(CONFIG_IDF_TARGET_ESP32C6) || !HAS_BLUETOOTH
     deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_BLUETOOTH_CONFIG;
 #endif
 
-#if defined(ARCH_NRF52) && !HAS_ETHERNET // nrf52 doesn't have network unless it's a RAK ethernet gateway currently
-    deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_NETWORK_CONFIG; // No network on nRF52
-#elif defined(ARCH_RP2040) && !HAS_WIFI && !HAS_ETHERNET
-    deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_NETWORK_CONFIG; // No network on RP2040
+#if !HAS_NETWORKING
+    deviceMetadata.excluded_modules |= meshtastic_ExcludedModules_NETWORK_CONFIG;
 #endif
 
 #if !(MESHTASTIC_EXCLUDE_PKI)
@@ -1480,6 +1562,14 @@ void loop()
 #endif
     power->powerCommandsCheck();
 
+#if !MESHTASTIC_EXCLUDE_ADMIN
+    // Settings are applied in RAM during an Admin edit transaction. Service
+    // its real idle deadline even if the client disappears and sends no later
+    // Admin packet. This piggybacks on normal loop wakeups.
+    if (adminModule)
+        adminModule->serviceEditTransactionTimeout();
+#endif
+
     if (RadioLibInterface::instance != nullptr) {
         static uint32_t lastRadioMissedIrqPoll;
         if (!Throttle::isWithinTimespanMs(lastRadioMissedIrqPoll, 1000)) {
@@ -1487,11 +1577,11 @@ void loop()
             RadioLibInterface::instance->pollMissedIrqs();
         }
 
-        // Periodic AGC reset - warm sleep + recalibrate to prevent stuck AGC gain
+        // Periodic radio upkeep - re-arms RX if it was left off, else AGC reset (stuck-gain prevention)
         static uint32_t lastAgcReset;
         if (!Throttle::isWithinTimespanMs(lastAgcReset, AGC_RESET_INTERVAL_MS)) {
             lastAgcReset = millis();
-            RadioLibInterface::instance->resetAGC();
+            RadioLibInterface::instance->periodicRadioMaintenance();
         }
     }
 

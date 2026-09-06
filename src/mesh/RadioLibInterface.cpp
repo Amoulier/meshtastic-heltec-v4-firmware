@@ -7,6 +7,7 @@
 #include "Throttle.h"
 #include "UptimeClock.h"
 #include "configuration.h"
+#include "concurrency/LockGuard.h"
 #include "error.h"
 #include "main.h"
 #include "mesh-pb-constants.h"
@@ -151,6 +152,22 @@ bool RadioLibInterface::receiveDetected(uint16_t irq, unsigned long syncWordHead
 /// bluetooth comms code.  If the txmit queue is empty it might return an error
 ErrorCode RadioLibInterface::send(meshtastic_MeshPacket *p)
 {
+#if defined(HELTEC_V4_OLED)
+    sendAdmissionDepth.fetch_add(1, std::memory_order_acq_rel);
+    struct SendAdmissionGuard {
+        std::atomic<uint32_t> &depth;
+        ~SendAdmissionGuard() { depth.fetch_sub(1, std::memory_order_release); }
+    } sendAdmissionGuard{sendAdmissionDepth};
+
+    const bool preferenceFenceBlocks =
+        nodeDB && nodeDB->isPreferenceEditTransactionActive() &&
+        (!nodeDB->isPreferenceEditQuiescing() || !nodeDB->hasCurrentExternalStateAccess());
+    if (nodeDB && (preferenceFenceBlocks || nodeDB->isDestructiveStorageMutationActive())) {
+        LOG_WARN("send - storage transaction has parked LoRa");
+        packetPool.release(p);
+        return ERRNO_DISABLED;
+    }
+#endif
 
 #ifndef DISABLE_WELCOME_UNSET
 
@@ -188,7 +205,18 @@ ErrorCode RadioLibInterface::send(meshtastic_MeshPacket *p)
 
     LOG_TRACE("txGood=%d,txRelay=%d,rxGood=%d,rxBad=%d", txGood, txRelay, rxGood, rxBad);
     bool dropped = false;
-    ErrorCode res = txQueue.enqueue(p, &dropped) ? ERRNO_OK : ERRNO_UNKNOWN;
+    ErrorCode res;
+    {
+        // Once the worker has retained a packet across a configuration fence,
+        // do not let a producer consume its eventual queue slot. Keeping this
+        // check and enqueue under the same lock also gives status/cancel paths
+        // a race-free ownership snapshot of configDeferredPacket.
+        concurrency::LockGuard guard(&configDeferredPacketLock);
+        res = configDeferredPacket ? ERRNO_UNKNOWN : (txQueue.enqueue(p, &dropped) ? ERRNO_OK : ERRNO_UNKNOWN);
+    }
+
+    if (res != ERRNO_OK && hasConfigDeferredPacket())
+        LOG_WARN("send - deferred Tx packet is waiting for configuration resume");
 
     if (dropped) {
         txDrop++;
@@ -216,6 +244,8 @@ meshtastic_QueueStatus RadioLibInterface::getQueueStatus()
 
     qs.res = qs.mesh_packet_id = 0;
     qs.free = txQueue.getFree();
+    if (hasConfigDeferredPacket() && qs.free > 0)
+        qs.free--;
     qs.maxlen = txQueue.getMaxLen();
 
     return qs;
@@ -223,15 +253,78 @@ meshtastic_QueueStatus RadioLibInterface::getQueueStatus()
 
 bool RadioLibInterface::canSleep(bool deepSleep)
 {
-    // A packet being actively transmitted has already left the TX queue (sendingPacket), so
-    // check it separately. It only vetoes deep sleep: light sleep keeps the radio powered and
-    // the TX finishes on its own, but deep sleep powers the radio down and would truncate the
-    // packet on air.
-    bool res = txQueue.empty() && !(deepSleep && isSending());
+    const bool rxInFlight = isReceiving && isActivelyReceiving();
+    const bool txDeferred = hasConfigDeferredPacket();
+    bool res = txQueue.empty() && !txDeferred && !(deepSleep && isSending()) && !rxInFlight;
     if (!res) { // only print debug messages if we are vetoing sleep
-        LOG_DEBUG("Radio wait to sleep, txEmpty=%d, txInFlight=%d", txQueue.empty(), isSending());
+        LOG_DEBUG("Radio wait to sleep, txEmpty=%d, txDeferred=%d, txInFlight=%d, rxInFlight=%d", txQueue.empty(),
+                  txDeferred, isSending(), rxInFlight);
     }
     return res;
+}
+
+bool RadioLibInterface::canParkForConfig()
+{
+#if defined(HELTEC_V4_OLED)
+    if (sendAdmissionDepth.load(std::memory_order_acquire) != 0)
+        return false;
+#endif
+    if (radioNotificationDepth.load(std::memory_order_acquire) != 0 || isSending() || isIRQPending())
+        return false;
+    const bool rxInFlight = isReceiving && isActivelyReceiving();
+    // isActivelyReceiving() performs a chip read and can overlap the radio
+    // worker becoming runnable. Re-read both software owners afterwards so a
+    // dequeue/terminal IRQ that crossed the first observation cannot be
+    // mistaken for an idle radio.
+    return !rxInFlight && radioNotificationDepth.load(std::memory_order_acquire) == 0 && !isSending() && !isIRQPending()
+#if defined(HELTEC_V4_OLED)
+           && sendAdmissionDepth.load(std::memory_order_acquire) == 0
+#endif
+        ;
+}
+
+bool RadioLibInterface::hasPendingTransmissionsForConfig()
+{
+    concurrency::LockGuard guard(&configDeferredPacketLock);
+    return configDeferredPacket != nullptr || !txQueue.empty();
+}
+
+void RadioLibInterface::resumeQueuedTransmissions()
+{
+    // Queue ownership remains with the radio worker. Preserve a terminal IRQ
+    // which raced the activation boundary; whichever notification runs next
+    // also consumes this durable wake request.
+#if defined(HELTEC_V4_OLED)
+    configResumeRequested.store(true, std::memory_order_release);
+#endif
+    notifyLater(1, TRANSMIT_DELAY_COMPLETED, false);
+}
+
+void RadioLibInterface::restoreConfigDeferredPacket()
+{
+    concurrency::LockGuard guard(&configDeferredPacketLock);
+    if (!configDeferredPacket || txQueue.getFree() == 0)
+        return;
+
+    bool dropped = false;
+    const bool restored = txQueue.enqueue(configDeferredPacket, &dropped);
+    if (restored) {
+        configDeferredPacket = nullptr;
+        if (dropped) {
+            LOG_ERROR("Deferred Tx restore unexpectedly displaced another packet");
+            RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_INVALID_RADIO_SETTING);
+        }
+    } else {
+        // Retaining sole ownership makes a later queue wake retry this handoff;
+        // it must never leak or duplicate the packet on an invariant failure.
+        LOG_ERROR("Deferred Tx restore unexpectedly failed; retain packet for retry");
+    }
+}
+
+bool RadioLibInterface::hasConfigDeferredPacket() const
+{
+    concurrency::LockGuard guard(&configDeferredPacketLock);
+    return configDeferredPacket != nullptr;
 }
 
 /** Allow other firmware components to ask whether we are currently sending a packet
@@ -245,7 +338,17 @@ bool RadioLibInterface::isSending()
 /** Attempt to cancel a previously sent packet.  Returns true if a packet was found we could cancel */
 bool RadioLibInterface::cancelSending(NodeNum from, PacketId id)
 {
-    auto p = txQueue.remove(from, id);
+    meshtastic_MeshPacket *p = nullptr;
+    {
+        concurrency::LockGuard guard(&configDeferredPacketLock);
+        if (configDeferredPacket && getFrom(configDeferredPacket) == from && configDeferredPacket->id == id) {
+            p = configDeferredPacket;
+            configDeferredPacket = nullptr;
+        }
+    }
+    if (!p) {
+        p = txQueue.remove(from, id);
+    }
     if (p) {
         RadioTxHooks::packetReleased(this, p);
         packetPool.release(p); // free the packet we just removed
@@ -259,6 +362,11 @@ bool RadioLibInterface::cancelSending(NodeNum from, PacketId id)
 /** Attempt to find a packet in the TxQueue. Returns true if the packet was found. */
 bool RadioLibInterface::findInTxQueue(NodeNum from, PacketId id)
 {
+    {
+        concurrency::LockGuard guard(&configDeferredPacketLock);
+        if (configDeferredPacket && getFrom(configDeferredPacket) == from && configDeferredPacket->id == id)
+            return true;
+    }
     return txQueue.find(from, id);
 }
 
@@ -404,7 +512,7 @@ void RadioLibInterface::deliverPendingIrqFromPoll(PendingISR cause)
 
 void RadioLibInterface::onNotify(uint32_t notification)
 {
-
+    radioNotificationDepth.fetch_add(1, std::memory_order_acq_rel);
     switch (notification) {
     case ISR_TX:
         handleTransmitInterrupt(); // completeSending() already restored the radio to the home config
@@ -425,6 +533,16 @@ void RadioLibInterface::onNotify(uint32_t notification)
         break;
     case TRANSMIT_DELAY_COMPLETED:
 
+#if defined(HELTEC_V4_OLED)
+        // Consume the timer while OPEN; activation explicitly resumes this queue.
+        if (nodeDB && nodeDB->isPreferenceEditTransactionActive())
+            break;
+        restoreConfigDeferredPacket();
+#endif
+        // A QUIESCING transaction may have suppressed the next RX window even
+        // with no packet queued. Its resume wake must re-arm listening too.
+        if (rxOffline)
+            startReceive();
         // If we are not currently in receive mode, then restart the random delay (this can happen if the main thread
         // has placed the unit into standby)  FIXME, how will this work if the chipset is in sleep mode?
         if (!txQueue.empty()) {
@@ -459,6 +577,10 @@ void RadioLibInterface::onNotify(uint32_t notification)
                     } else {
                         // Send any outgoing packets we have ready as fast as possible to keep the time between channel scan and
                         // actual transmission as short as possible
+#if defined(HELTEC_V4_OLED)
+                        if (nodeDB && nodeDB->isPreferenceEditTransactionActive())
+                            break;
+#endif
                         txp = txQueue.dequeue();
                         assert(txp);
                         startSend(txp);
@@ -473,6 +595,27 @@ void RadioLibInterface::onNotify(uint32_t notification)
     default:
         assert(0); // We expected to receive a valid notification from the ISR
     }
+#if defined(HELTEC_V4_OLED)
+    if (configResumeRequested.exchange(false, std::memory_order_acq_rel)) {
+        if (nodeDB &&
+            (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive())) {
+            // A new fence won the race with this old wake. Preserve the request;
+            // its eventual NONE transition will notify us again.
+            configResumeRequested.store(true, std::memory_order_release);
+        } else {
+            // The next notification might be a preserved terminal IRQ rather
+            // than TRANSMIT_DELAY_COMPLETED. Restore the rare dequeue-race
+            // packet here as well so that notification ordering cannot strand
+            // it indefinitely.
+            restoreConfigDeferredPacket();
+            if (rxOffline)
+                startReceive();
+            if (!txQueue.empty() || hasConfigDeferredPacket())
+                setTransmitDelay();
+        }
+    }
+#endif
+    radioNotificationDepth.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 void RadioLibInterface::setTransmitDelay()
@@ -527,6 +670,15 @@ void RadioLibInterface::startTransmitTimerRebroadcast(meshtastic_MeshPacket *p)
  */
 void RadioLibInterface::clampToLateRebroadcastWindow(NodeNum from, PacketId id)
 {
+    {
+        concurrency::LockGuard guard(&configDeferredPacketLock);
+        if (configDeferredPacket && getFrom(configDeferredPacket) == from && configDeferredPacket->id == id &&
+            !configDeferredPacket->tx_after) {
+            configDeferredPacket->tx_after = millis() + getTxDelayMsecWeightedWorst(configDeferredPacket->rx_snr);
+            return;
+        }
+    }
+
     // Look for non-late packets only, so we don't do this twice!
     meshtastic_MeshPacket *p = txQueue.remove(from, id, true, false);
     if (p) {
@@ -549,7 +701,18 @@ void RadioLibInterface::clampToLateRebroadcastWindow(NodeNum from, PacketId id)
  */
 bool RadioLibInterface::removePendingTXPacket(NodeNum from, PacketId id, uint32_t hop_limit_lt)
 {
-    meshtastic_MeshPacket *p = txQueue.remove(from, id, true, true, hop_limit_lt);
+    meshtastic_MeshPacket *p = nullptr;
+    {
+        concurrency::LockGuard guard(&configDeferredPacketLock);
+        if (configDeferredPacket && getFrom(configDeferredPacket) == from && configDeferredPacket->id == id &&
+            (!hop_limit_lt || configDeferredPacket->hop_limit < hop_limit_lt)) {
+            p = configDeferredPacket;
+            configDeferredPacket = nullptr;
+        }
+    }
+    if (!p) {
+        p = txQueue.remove(from, id, true, true, hop_limit_lt);
+    }
     if (p) {
         LOG_DEBUG("Drop pending-TX packet 0x%08x, hop limit %d", p->id, p->hop_limit);
         RadioTxHooks::packetReleased(this, p);
@@ -596,8 +759,32 @@ void RadioLibInterface::completeSending()
     }
 }
 
+void RadioLibInterface::abortSending()
+{
+    auto *p = sendingPacket;
+    sendingPacket = nullptr;
+#ifdef LED_LORA
+    digitalWrite(LED_LORA, LED_STATE_OFF);
+#endif
+    if (p) {
+        LOG_WARN("Abort in-flight LoRa transmission");
+        RadioTxHooks::packetReleased(this, p);
+        packetPool.release(p);
+    }
+    powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn);
+}
+
 void RadioLibInterface::handleReceiveInterrupt()
 {
+#if defined(HELTEC_V4_OLED)
+    if (nodeDB &&
+        ((nodeDB->isPreferenceEditTransactionActive() && !nodeDB->isPreferenceEditQuiescing()) ||
+         nodeDB->isDestructiveStorageMutationActive())) {
+        isReceiving = false;
+        LOG_DEBUG("Ignore RX interrupt while storage transaction has parked LoRa");
+        return;
+    }
+#endif
     // when this is called, we should be in receive mode - if we are not, just jump out instead of bombing. Possible Race
     // Condition?
     if (!isReceiving) {
@@ -707,6 +894,10 @@ void RadioLibInterface::handleReceiveInterrupt()
 void RadioLibInterface::startReceive()
 {
     isReceiving = true;
+    // Drivers only reach here once the chip actually accepted the RX start, so the radio is alive again.
+    // This is the sole place the recovery ladder is cleared - nothing short of an armed RX counts as fixed.
+    rxOffline = false;
+    chipRecoveryFailures = 0;
     powerMon->setState(meshtastic_PowerMon_State_Lora_RXOn);
 }
 
@@ -724,6 +915,63 @@ void RadioLibInterface::pollMissedIrqs()
 void RadioLibInterface::resetAGC()
 {
     // Base implementation: no-op. Override in chip-specific subclasses.
+}
+
+void RadioLibInterface::periodicRadioMaintenance()
+{
+#if defined(HELTEC_V4_OLED)
+    if (nodeDB &&
+        (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive())) {
+        // OPEN/COMMITTING owns the radio generation. A recovery or AGC reset
+        // here could power/rearm the chip with provisional settings behind the
+        // transaction owner's back.
+        return;
+    }
+#endif
+    // Recovery calls startReceive(), whose standby transition intentionally
+    // aborts an active transmission. Never run that ladder during a valid TX.
+    if (isSending())
+        return;
+
+    // Every startReceive() call site is event-driven (RX/TX ISR, the CAD-busy branch, reconfigure), and a
+    // radio left with RX off can no longer raise an RX interrupt - on a node with nothing to transmit
+    // nothing would ever re-arm it. This periodic tick is that retry; maybeRecoverChipStateLoss() throttles.
+    if (rxOffline) {
+        LOG_WARN("Radio RX offline, retrying");
+        if (maybeRecoverChipStateLoss())
+            startReceive();
+        return; // a chip just re-inited (or still dead) has no use for an AGC reset this tick
+    }
+
+    resetAGC();
+}
+
+bool RadioLibInterface::maybeRecoverChipStateLoss()
+{
+    // One attempt per window: the transient resets this recovers from need a single re-init, and a
+    // chip that stays dead must not stall the TX/RX paths with a begin() attempt on every call
+    if (lastChipRecoveryMs && Throttle::isWithinTimespanMs(lastChipRecoveryMs, 30 * 1000UL)) {
+        LOG_DEBUG("Radio recovery suppressed, %us since the last attempt", (millis() - lastChipRecoveryMs) / 1000);
+        return false;
+    }
+
+    // The ladder counts re-arms, not re-inits: only RadioLibInterface::startReceive() clears the count, and
+    // only once the chip really accepted RX. Judging the previous attempt here - a throttle window later,
+    // after its retry - is what stops a begin() that succeeded while leaving RX dead from crediting itself.
+    if (chipRecoveryFailures >= MAX_CHIP_RECOVERY_FAILURES && rebootAtMsec == 0) {
+        // Attempts are a throttle window apart, so this is minutes of a provably deaf chip. begin() alone
+        // clearly isn't reviving it; reboot to re-run init(), which redoes the power-on sequence it skips.
+        LOG_ERROR("Radio still deaf after %u re-inits, rebooting", chipRecoveryFailures);
+        rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 1000;
+    }
+    chipRecoveryFailures++;
+
+    lastChipRecoveryMs = millis();
+    RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_INVALID_RADIO_SETTING);
+    LOG_ERROR("Radio chip state lost mid-operation, re-init");
+    bool recovered = recoverChipStateLoss();
+    LOG_INFO("Radio re-init %s", recovered ? "succeeded" : "failed");
+    return recovered;
 }
 
 void RadioLibInterface::checkRxDoneIrqFlag()
@@ -759,7 +1007,35 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
 {
     /* NOTE: Minimize the actions before startTransmit() to keep the time between
              channel scan and actual transmit as low as possible to avoid collisions. */
-    if (disabled || !config.lora.tx_enabled) {
+#if defined(HELTEC_V4_OLED)
+    if (nodeDB && nodeDB->isPreferenceEditTransactionActive()) {
+        bool retained = false;
+        {
+            concurrency::LockGuard guard(&configDeferredPacketLock);
+            if (!configDeferredPacket) {
+                configDeferredPacket = txp;
+                retained = true;
+            }
+        }
+        if (retained) {
+            LOG_DEBUG("Defer queued Tx packet while settings edit owns LoRa");
+        } else {
+            // A single radio worker can normally retain only one packet here.
+            // Fail closed instead of asserting or leaking if that invariant is
+            // ever violated by a future scheduler change.
+            LOG_ERROR("Drop Tx packet: configuration already owns a deferred packet");
+            RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_INVALID_RADIO_SETTING);
+            RadioTxHooks::packetReleased(this, txp);
+            packetPool.release(txp);
+        }
+        return false;
+    }
+#endif
+    if (disabled || !config.lora.tx_enabled
+#if defined(HELTEC_V4_OLED)
+        || (nodeDB && nodeDB->isDestructiveStorageMutationActive())
+#endif
+    ) {
         LOG_WARN("Drop Tx packet: LoRa Tx disabled");
         // Never reaches completeSending(), so any per-packet radio state has to be released here.
         RadioTxHooks::packetReleased(this, txp);
@@ -775,8 +1051,8 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
             LOG_ERROR("startTransmit failed, error=%d", res);
             RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_RADIO_SPI_BUG);
 
-            // This send failed, but make sure to 'complete' it properly
-            completeSending();
+            // Release the failed packet without recording airtime or successful TX.
+            abortSending();
             powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn); // Transmitter off now
             startReceive(); // Restart receive mode (because startTransmit failed to put us in xmit mode)
         } else {

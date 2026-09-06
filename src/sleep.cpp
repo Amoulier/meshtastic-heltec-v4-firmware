@@ -245,12 +245,13 @@ void doDeepSleep(uint32_t msecToWake, bool skipPreflight, bool skipSaveNodeDb, D
         nimbleBluetooth->deinit();
 #endif
 
+    DeepSleepContext deepSleepContext;
 #ifdef ARCH_ESP32
     const bool keepLoraAwake = shouldLoraWake(msecToWake, wakePolicy);
     if (!keepLoraAwake)
-        notifyDeepSleep.notifyObservers(NULL);
+        notifyDeepSleep.notifyObservers(&deepSleepContext);
 #else
-    notifyDeepSleep.notifyObservers(NULL);
+    notifyDeepSleep.notifyObservers(&deepSleepContext);
 #endif
 
     powerMon->setState(meshtastic_PowerMon_State_CPU_DeepSleep);
@@ -303,11 +304,17 @@ void doDeepSleep(uint32_t msecToWake, bool skipPreflight, bool skipSaveNodeDb, D
 #endif
     statusLEDModule->setPowerLED(false);
 #ifdef RESET_OLED
+#if defined(HELTEC_V4_OLED)
+    // Heltec RESET_OLED is active-low. Keep it asserted before removing the
+    // shared display rail so the unpowered panel cannot float or back-power.
+    digitalWrite(RESET_OLED, LOW);
+#else
     digitalWrite(RESET_OLED, 1); // put the display in reset before killing its power
+#endif
 #endif
 
 #if defined(VEXT_ENABLE)
-    digitalWrite(VEXT_ENABLE, !VEXT_ON_VALUE); // turn on the display power
+    digitalWrite(VEXT_ENABLE, !VEXT_ON_VALUE); // turn off the display/accessory power
 #endif
 
 #ifdef ARCH_ESP32
@@ -399,7 +406,7 @@ void doDeepSleep(uint32_t msecToWake, bool skipPreflight, bool skipSaveNodeDb, D
 #endif
 
     console->flush();
-    cpuDeepSleep(msecToWake, wakePolicy);
+    cpuDeepSleep(msecToWake, wakePolicy, deepSleepContext.radioSleepSucceeded);
 }
 
 #ifdef ARCH_ESP32

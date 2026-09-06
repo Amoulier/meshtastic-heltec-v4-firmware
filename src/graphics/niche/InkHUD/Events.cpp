@@ -546,10 +546,10 @@ int InkHUD::Events::onReceiveTextMessage(const meshtastic_MeshPacket *packet)
     if (!isBroadcastMsg) {
         // DMs never pass through ThreadedMessageApplet, so add them to the global store here
         // so they survive reboots. Derive the latestMessage cache entry from the stored result.
-        const StoredMessage *stored = messageStore.tryAddFromPacket(*packet);
-        if (!stored)
+        StoredMessage stored;
+        if (!messageStore.tryAddFromPacket(*packet, &stored))
             return 0;
-        inkhud->persistence->latestMessage.dm = *stored;
+        inkhud->persistence->latestMessage.dm = stored;
     } else {
         // Broadcasts are added to the global store by ThreadedMessageApplet::handleReceived().
         // Here we only update the latestMessage cache used by AllMessageApplet / NotificationApplet.
@@ -561,8 +561,7 @@ int InkHUD::Events::onReceiveTextMessage(const meshtastic_MeshPacket *packet)
         size_t storedLen = packet->decoded.payload.size;
         if (storedLen >= MAX_MESSAGE_SIZE)
             storedLen = MAX_MESSAGE_SIZE - 1;
-        sm.textOffset = MessageStore::storeText(payload, storedLen);
-        sm.textLength = static_cast<uint16_t>(storedLen);
+        MessageStore::setText(sm, payload, storedLen);
     }
 
     return 0; // Tell caller to continue notifying other observers. (No reason to abort this event)

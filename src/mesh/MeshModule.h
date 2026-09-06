@@ -33,6 +33,7 @@ enum class AdminMessageHandleResult {
     NOT_HANDLED = 0,
     HANDLED = 1,
     HANDLED_WITH_RESPONSE = 2,
+    ERROR = 3,
 };
 
 /*

@@ -155,7 +155,7 @@ class WarmNodeStore
     /// Durability point, piggybacked on the node-database save cadence. On the
     /// ring backend this flushes the shared flash page cache; on the file
     /// backend it writes the warm.dat snapshot.
-    bool saveIfDirty();
+    bool saveIfDirty(bool requireDestructivePower = false);
 
   private:
     WarmNodeEntry *entries = nullptr; // WARM_NODE_COUNT slots; PSRAM on ESP32 when available
@@ -195,7 +195,7 @@ class WarmNodeStore
     bool ringReadHeader(uint8_t page, WarmPageHeader &h, WarmFormat *fmt = nullptr) const;
 #endif
 
-    bool save();
+    bool save(bool requireDestructivePower);
 };
 
 #endif // WARM_NODE_COUNT > 0

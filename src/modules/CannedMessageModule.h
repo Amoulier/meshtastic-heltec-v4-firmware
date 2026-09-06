@@ -81,7 +81,7 @@ class CannedMessageModule : public SinglePortModule, public Observable<const UIF
 
     // === Admin Handlers ===
     void handleGetCannedMessageModuleMessages(const meshtastic_MeshPacket &req, meshtastic_AdminMessage *response);
-    void handleSetCannedMessageModuleMessages(const char *from_msg);
+    bool handleSetCannedMessageModuleMessages(const char *from_msg);
 
 #ifdef RAK14014
     cannedMessageModuleRunState getRunState() const { return runState; }

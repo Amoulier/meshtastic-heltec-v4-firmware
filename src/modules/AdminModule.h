@@ -3,8 +3,11 @@
 #include <esp_ota_ops.h>
 #endif
 #include "ProtobufModule.h"
+#include "concurrency/Lock.h"
+#include "concurrency/LockGuard.h"
 #include "meshUtils.h"
 #include <sys/types.h>
+#include <vector>
 #if HAS_WIFI
 #include "mesh/wifi/WiFiAPClient.h"
 #endif
@@ -31,6 +34,85 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
      */
     AdminModule();
 
+    /// Serialize a physical/local configuration mutation with Admin edit
+    /// transactions. The operation is rejected while a live bulk edit is open,
+    /// preventing a button handler from persisting a partially imported config.
+    template <typename Operation> bool runExternalConfigMutation(const Operation &operation)
+    {
+        concurrency::LockGuard transactionGuard(&editTransactionLock);
+        expireStaleEditTransaction();
+        if (hasOpenEditTransaction)
+            return false;
+        operation();
+        return true;
+    }
+
+    /// Variant for a physical/UI operation that mutates preferences. It opens
+    /// the Heltec traffic/storage fence before the closure touches RAM and
+    /// commits every segment (including any nested saveChanges calls) once.
+    template <typename Operation> bool runExternalConfigMutation(int saveWhat, const Operation &operation)
+    {
+        concurrency::LockGuard transactionGuard(&editTransactionLock);
+        expireStaleEditTransaction();
+        if (hasOpenEditTransaction || !prepareExternalConfigMutation(saveWhat))
+            return false;
+        operation();
+        return finishExternalConfigMutation();
+    }
+
+    /// Conditional variant used by menu choices whose validity depends on the
+    /// current configuration. The predicate runs only after the durable fence
+    /// is active, so a stale menu cannot commit a slot/preset calculated for a
+    /// region that changed while the banner was open. A false result must be
+    /// returned before mutating global state.
+    template <typename Operation> bool runExternalValidatedConfigMutation(int saveWhat, const Operation &operation)
+    {
+        concurrency::LockGuard transactionGuard(&editTransactionLock);
+        expireStaleEditTransaction();
+        if (hasOpenEditTransaction || !prepareExternalConfigMutation(saveWhat))
+            return false;
+        if (!operation())
+            return cancelExternalConfigMutation();
+        return finishExternalConfigMutation();
+    }
+
+    bool isEditTransactionOpen()
+    {
+        concurrency::LockGuard transactionGuard(&editTransactionLock);
+        return hasOpenEditTransaction;
+    }
+
+    /// Module-admin handlers run synchronously while AdminModule owns its
+    /// serialization lock. Route their core preference mutations through the
+    /// same transaction and failure propagation as built-in setters.
+    bool persistObservedAdminMutation(int saveWhat, bool shouldReboot = false) { return saveChanges(saveWhat, shouldReboot); }
+
+    /// A physical full reset must remain available even if a client abandoned
+    /// or maliciously renews a bulk edit. Run it under the same lock, but only
+    /// discard edit bookkeeping after the reset was accepted. An early power or
+    /// transfer rejection must leave the partial transaction tracked.
+    template <typename Operation> bool runExternalRecoveryMutation(const Operation &operation)
+    {
+        concurrency::LockGuard transactionGuard(&editTransactionLock);
+        if (!operation())
+            return false;
+        hasOpenEditTransaction = false;
+        editTransactionOwner = 0;
+        deferredEditSegments = 0;
+        deferredEditRequiresReboot = false;
+        deferredEditOwnerChanged = false;
+        deferredFixedPositionAnnouncement = false;
+        deferredMessagePurgeNodes.clear();
+        pendingWarningText[0] = '\0';
+        pendingWarningChannels = 0;
+        pendingWarningCount = 0;
+        pendingWarningNameIssue = false;
+        pendingWarningPskIssue = false;
+        pendingLicenseWarning = false;
+        pendingIdentityMigrationWarning = false;
+        return true;
+    }
+
   protected:
     /** Called to handle a particular incoming message
 
@@ -40,12 +122,23 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
 
   private:
     bool hasOpenEditTransaction = false;
+    NodeNum editTransactionOwner = 0;
     // Each deferred write restarts the clock, so this bounds the gap between writes, not the length
     // of the edit; a bulk import sends them milliseconds apart.
     static constexpr uint32_t EDIT_TRANSACTION_IDLE_MS = 60 * 1000;
-    uint32_t editTransactionActivityMs = 0; // millis() of the last save this transaction deferred
-    int deferredEditSegments = 0;           // segments that transaction has touched but not yet saved
-    /// Retire an open edit transaction whose client stopped talking, persisting what it applied.
+    uint32_t editTransactionActivityMs = 0;         // millis() of the last save this transaction deferred
+    int deferredEditSegments = 0;                   // segments that transaction has touched but not yet saved
+    bool deferredEditRequiresReboot = false;        // runtime/FSM changes that only take effect after restart
+    bool deferredEditOwnerChanged = false;          // announce NodeInfo only after the transaction commits
+    bool deferredFixedPositionAnnouncement = false; // announce only after the complete generation commits
+    std::vector<NodeNum> deferredMessagePurgeNodes; // history follows only a durable ignore decision
+    bool mutationPersistenceFailed = false;         // current Admin request mutated RAM but could not commit it
+    bool externalMutationActive = false;
+    int externalMutationSegments = 0;
+    bool externalMutationRequiresReboot = false;
+    concurrency::Lock editTransactionLock;
+    /// Retire an open edit transaction whose client stopped talking, persisting
+    /// what it applied.
     void expireStaleEditTransaction();
 #ifdef PIO_UNIT_TESTING
     int lastSaveWhatForTest = 0;
@@ -55,7 +148,12 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
     uint32_t session_time = 0;        // millis() when the current session passkey was issued
     bool sessionPasskeyValid = false; // separate flag: millis() 0 at boot is a valid issue time
 
-    void saveChanges(int saveWhat, bool shouldReboot = true);
+    bool saveChanges(int saveWhat, bool shouldReboot = true);
+    bool prepareExternalConfigMutation(int saveWhat);
+    bool cancelExternalConfigMutation();
+    bool finishExternalConfigMutation();
+    void deferOrApplyMessagePurge(NodeNum nodeNum);
+    void applyDeferredMessagePurges();
 
     /**
      * Getters
@@ -80,11 +178,11 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
     /**
      * Setters
      */
-    void handleSetOwner(const meshtastic_User &o);
+    bool handleSetOwner(const meshtastic_User &o);
     void handleSetChannel(const meshtastic_Channel &cc);
 
   protected:
-    void handleSetConfig(const meshtastic_Config &c, bool fromOthers);
+    bool handleSetConfig(const meshtastic_Config &c, bool fromOthers);
 
 #ifdef PIO_UNIT_TESTING
   protected:
@@ -98,6 +196,10 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
     /// Applies licensed-operator settings. False if the request was rejected and nothing changed,
     /// so the caller can answer a want_response client with an error instead of an implicit success.
     bool handleSetHamMode(const meshtastic_HamParameters &req);
+
+    /// Persist/restart an abandoned edit transaction once its idle deadline
+    /// expires. Called from the existing main loop, so it adds no wake timer.
+    void serviceEditTransactionTimeout();
 
     /// Note an admin request leaving this node for a remote, so that remote's response is
     /// accepted. Called from the client-to-mesh path (MeshService::handleToRadio).
@@ -128,10 +230,10 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
     /// see every admin message. Both build a response on the stack, so like the getters above they
     /// stay out of line to keep handleReceivedProtobuf()'s frame small.
     NOINLINE void handleViaModuleApi(const meshtastic_MeshPacket &mp, meshtastic_AdminMessage *r);
-    NOINLINE void handleViaObservers(const meshtastic_AdminMessage *r);
+    NOINLINE void handleViaObservers(const meshtastic_MeshPacket &mp, const meshtastic_AdminMessage *r);
 
-    void handleStoreDeviceUIConfig(const meshtastic_DeviceUIConfig &uicfg);
-    void handleSendInputEvent(const meshtastic_AdminMessage_InputEvent &inputEvent);
+    bool handleStoreDeviceUIConfig(const meshtastic_DeviceUIConfig &uicfg);
+    bool handleSendInputEvent(const meshtastic_AdminMessage_InputEvent &inputEvent);
     void reboot(int32_t seconds);
 
     void setPassKey(meshtastic_AdminMessage *res);
@@ -154,6 +256,7 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
     // Emit the "licensed mode activated" notice, deferring to commit during an edit transaction
     // so repeated triggers (e.g. owner + several channels) produce a single message.
     void warnLicensedMode();
+    void warnLicensedIdentityMigration();
     void flushChannelWarnings();
 
     char pendingWarningText[250] = {};    // the lone queued message, used verbatim when only one fired
@@ -162,6 +265,7 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
     bool pendingWarningNameIssue = false; // any queued warning was about a channel name
     bool pendingWarningPskIssue = false;  // any queued warning was about a PSK
     bool pendingLicenseWarning = false;   // a licensed-mode notice is queued for this transaction
+    bool pendingIdentityMigrationWarning = false;
 };
 
 static constexpr const char *licensedModeMessage =

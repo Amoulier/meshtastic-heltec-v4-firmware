@@ -270,7 +270,8 @@ bool readAndDecrypt(const char *filename, uint8_t *outBuf, size_t outBufSize, si
  * Encrypt plaintext and write to filename.
  * Returns true on success.
  */
-bool encryptAndWrite(const char *filename, const uint8_t *plaintext, size_t plaintextLen, bool fullAtomic = false);
+bool encryptAndWrite(const char *filename, const uint8_t *plaintext, size_t plaintextLen, bool fullAtomic = false,
+                     bool requireDestructivePower = false);
 
 /**
  * Migrate a plaintext proto file to encrypted format in-place.

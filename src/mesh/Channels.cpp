@@ -315,7 +315,7 @@ void Channels::initDefaults()
 #endif
 }
 
-void Channels::onConfigChanged()
+void Channels::onConfigChanged(bool activateRuntime)
 {
     // Make sure the phone hasn't mucked anything up
     bool hasPrimary = false;
@@ -342,7 +342,7 @@ void Channels::onConfigChanged()
         fixupChannel(primaryIndex);
     }
 #if !MESHTASTIC_EXCLUDE_MQTT
-    if (channels.anyMqttEnabled() && mqtt && !mqtt->isEnabled()) {
+    if (activateRuntime && channels.anyMqttEnabled() && mqtt && !mqtt->isEnabled()) {
         LOG_DEBUG("MQTT is enabled on at least one channel, so set MQTT thread to run immediately");
         mqtt->start();
     }
@@ -583,4 +583,13 @@ bool Channels::setDefaultPresetCryptoForHash(ChannelHash channelHash)
 int16_t Channels::setActiveByIndex(ChannelIndex channelIndex)
 {
     return setCrypto(channelIndex);
+}
+
+bool isMutedForPacket(const meshtastic_MeshPacket &mp)
+{
+    if (!isBroadcast(mp.to) && isToUs(&mp))
+        return nodeInfoLiteIsMuted(nodeDB->getMeshNode(mp.from));
+
+    const meshtastic_Channel &ch = channels.getByIndex(mp.channel ? mp.channel : channels.getPrimaryIndex());
+    return ch.settings.has_module_settings && ch.settings.module_settings.is_muted;
 }

@@ -27,7 +27,10 @@ template <class T> class SX126xInterface : public RadioLibInterface
     /// Prepare hardware for sleep.  Call this _only_ for deep sleep, not needed for light sleep.
     virtual bool sleep() override;
 
-    bool isIRQPending() override { return lora.getIrqFlags() != 0; }
+    bool isIRQPending() override
+    {
+        return !radioHardwareParked.load(std::memory_order_acquire) && lora.getIrqFlags() != 0;
+    }
 
     void resetAGC() override;
 
@@ -84,11 +87,33 @@ template <class T> class SX126xInterface : public RadioLibInterface
     uint32_t getPacketTime(uint32_t pl, bool received) override { return computePacketTime(lora, pl, received); }
 
   private:
+    std::atomic<bool> radioHardwareParked{false};
 #ifdef LORA_DIO1_SOFTWARE_POLL
     bool irqPollingActive = false;
     bool pollTxMode = false;
 #endif
     /** Some boards require GPIO control of tx vs rx paths */
     void setTransmitEnable(bool txon);
+
+    /** Program all modem parameters into the chip; returns the first RadioLib error, or RADIOLIB_ERR_NONE */
+    int16_t programModemParams();
+
+    /** begin() and chip-side setup, shared by init() and by reconfigure()'s recovery of a chip that lost its state */
+    bool reinitChip();
+
+    /** Disable IRQ/accounting and shut down external radio/FEM power after an unrecoverable error. */
+    void parkRadioHardware();
+
+    /** setStandby()'s body, returning the standby error instead of asserting - for callers that can recover */
+    int16_t trySetStandby();
+
+    /** Recover a chip that lost its runtime state: hardware-reset via begin() and reprogram. */
+    bool recoverChipStateLoss() override
+    {
+        if (reinitChip() && programModemParams() == RADIOLIB_ERR_NONE)
+            return true;
+        parkRadioHardware();
+        return false;
+    }
 };
 #endif

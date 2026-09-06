@@ -3,23 +3,35 @@
 #if !MESHTASTIC_EXCLUDE_WAYPOINT
 
 #include "FSCommon.h"
+#include "NodeDB.h"
+#include "Power.h"
 #include "SPILock.h"
 #include "SafeFile.h"
 #include "Throttle.h"
 #include "UptimeClock.h"
 #include "WaypointStore.h"
+#include "concurrency/Lock.h"
 #include "concurrency/LockGuard.h"
 #include "gps/RTC.h"
 #include "meshUtils.h"
 #include <cstring>
 #include <pb_decode.h>
 #include <pb_encode.h>
+#include <vector>
 
 namespace
 {
 
 constexpr uint8_t WAYPOINT_STORE_VERSION = 3;
 constexpr const char *WAYPOINT_STORE_FILENAME = "/Waypoints_default.wpts";
+// Serialize autosave with factory-reset erasure; this drains a save that
+// crossed NodeDB's destructive-operation gate immediately before reset.
+concurrency::Lock g_waypointStorePersistenceLock;
+#if defined(HELTEC_V4_OLED)
+constexpr bool WAYPOINT_STORE_FULL_ATOMIC = true;
+#else
+constexpr bool WAYPOINT_STORE_FULL_ATOMIC = false;
+#endif
 
 #ifndef WAYPOINT_AUTOSAVE_INTERVAL_SEC
 #define WAYPOINT_AUTOSAVE_INTERVAL_SEC (2 * 60 * 60)
@@ -39,13 +51,10 @@ bool decodeWaypointPayload(const uint8_t *payload, size_t payloadLength, meshtas
     return pb_decode_from_bytes(payload, payloadLength, &meshtastic_Waypoint_msg, &wp);
 }
 
-uint16_t encodeWaypointPayload(const meshtastic_Waypoint &wp, uint8_t *payload, size_t payloadCapacity)
+size_t encodeWaypointPayload(const meshtastic_Waypoint &wp, uint8_t *payload, size_t payloadCapacity)
 {
-    return (uint16_t)pb_encode_to_bytes(payload, payloadCapacity, &meshtastic_Waypoint_msg, &wp);
+    return pb_encode_to_bytes(payload, payloadCapacity, &meshtastic_Waypoint_msg, &wp);
 }
-
-static bool g_waypointStoreHasUnsavedChanges = false;
-static uint32_t g_lastWaypointAutoSaveMs = 0;
 
 uint32_t autosaveIntervalMs()
 {
@@ -55,19 +64,6 @@ uint32_t autosaveIntervalMs()
     return sec * 1000UL;
 }
 
-void markWaypointStoreUnsaved()
-{
-    g_waypointStoreHasUnsavedChanges = true;
-    if (g_lastWaypointAutoSaveMs == 0)
-        g_lastWaypointAutoSaveMs = Time::getMillis();
-}
-
-void persistWaypointStore()
-{
-    LOG_INFO("Autosaving WaypointStore to flash");
-    waypointStore.saveToFlash();
-}
-
 } // namespace
 
 WaypointStore waypointStore;
@@ -75,6 +71,16 @@ WaypointStore waypointStore;
 void WaypointStore::notifyChanged()
 {
     notifyObservers(this);
+}
+
+void WaypointStore::markUnsavedLocked()
+{
+    ++mutationGeneration;
+#if ENABLE_WAYPOINT_PERSISTENCE
+    hasUnsavedChanges = true;
+    if (lastAutoSaveMs == 0)
+        lastAutoSaveMs = Time::getMillis();
+#endif
 }
 
 bool WaypointStore::isExpired(const meshtastic_Waypoint &wp, uint32_t now)
@@ -118,16 +124,25 @@ void WaypointStore::clearWireNotificationPreferences(meshtastic_Waypoint &wp)
     wp.notify_favorites_only = false;
 }
 
-const StoredWaypoint *WaypointStore::findWaypoint(uint32_t id) const
+std::deque<StoredWaypoint> WaypointStore::getWaypoints() const
 {
-    for (const StoredWaypoint &entry : waypoints) {
-        if (entry.waypoint.id == id)
-            return &entry;
-    }
-    return nullptr;
+    concurrency::LockGuard stateGuard(&stateLock);
+    return waypoints;
 }
 
-bool WaypointStore::removeWaypointById(uint32_t id)
+bool WaypointStore::findWaypoint(uint32_t id, StoredWaypoint &result) const
+{
+    concurrency::LockGuard stateGuard(&stateLock);
+    for (const StoredWaypoint &entry : waypoints) {
+        if (entry.waypoint.id == id) {
+            result = entry;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool WaypointStore::removeWaypointByIdLocked(uint32_t id)
 {
     for (auto it = waypoints.begin(); it != waypoints.end(); ++it) {
         if (it->waypoint.id == id) {
@@ -141,45 +156,49 @@ bool WaypointStore::removeWaypointById(uint32_t id)
 
 bool WaypointStore::removeWaypoint(uint32_t id)
 {
-    const bool removed = removeWaypointById(id);
-    if (!removed)
-        return false;
+    bool removed = false;
+    {
+        concurrency::LockGuard stateGuard(&stateLock);
+        removed = removeWaypointByIdLocked(id);
+        if (removed)
+            markUnsavedLocked();
+    }
+    if (removed)
+        notifyChanged();
 
-#if ENABLE_WAYPOINT_PERSISTENCE
-    markWaypointStoreUnsaved();
-#endif
-    notifyChanged();
-
-    return true;
+    return removed;
 }
 
 bool WaypointStore::setNotificationPreference(uint32_t id, WaypointNotificationPreference preference, bool enabled)
 {
-    for (StoredWaypoint &entry : waypoints) {
-        if (entry.waypoint.id != id)
-            continue;
+    bool found = false;
+    bool changed = false;
+    {
+        concurrency::LockGuard stateGuard(&stateLock);
+        for (StoredWaypoint &entry : waypoints) {
+            if (entry.waypoint.id != id)
+                continue;
 
-        const uint8_t previous = entry.notificationPreferences;
-        if (enabled)
-            entry.notificationPreferences |= preference;
-        else
-            entry.notificationPreferences &= ~preference;
-        if (entry.notificationPreferences == previous)
-            return true;
-
-#if ENABLE_WAYPOINT_PERSISTENCE
-        markWaypointStoreUnsaved();
-#endif
-        notifyChanged();
-        return true;
+            found = true;
+            const uint8_t previous = entry.notificationPreferences;
+            if (enabled)
+                entry.notificationPreferences |= preference;
+            else
+                entry.notificationPreferences &= ~preference;
+            changed = entry.notificationPreferences != previous;
+            if (changed)
+                markUnsavedLocked();
+            break;
+        }
     }
-
-    return false;
+    if (changed)
+        notifyChanged();
+    return found;
 }
 
-void WaypointStore::addStoredWaypoint(const StoredWaypoint &entry)
+void WaypointStore::addStoredWaypointLocked(const StoredWaypoint &entry)
 {
-    removeWaypointById(entry.waypoint.id);
+    removeWaypointByIdLocked(entry.waypoint.id);
 
     waypoints.push_front(entry);
     while (waypoints.size() > WAYPOINT_HISTORY_LIMIT)
@@ -192,39 +211,45 @@ bool WaypointStore::addFromPacket(const meshtastic_MeshPacket &packet, bool loca
     if (!decodeWaypointPayload(packet.decoded.payload.bytes, packet.decoded.payload.size, entry.waypoint))
         return false;
 
-    const StoredWaypoint *existing = findWaypoint(entry.waypoint.id);
-    entry.notificationPreferences = mergeNotificationPreferences(
-        locallyAuthored, existing != nullptr, existing ? existing->notificationPreferences : 0, entry.waypoint);
-    clearWireNotificationPreferences(entry.waypoint);
     entry.receivedTime = packet.rx_time ? packet.rx_time : getTime();
     entry.creatorNodeNum = getFrom(&packet);
 
-    if (stored)
-        *stored = entry;
-
     // rx_time holds uptime, not an epoch, when has_rx_time is false; pass 0 so isExpired() resolves
     // the clock itself rather than comparing an expiry against seconds since boot.
-    if (isExpired(entry, packet.has_rx_time ? packet.rx_time : 0)) {
-        // Respect the lock: only the node a waypoint is locked to may delete it on our device.
-        // An unauthorized deletion attempt is ignored entirely, rather than applied locally.
-        for (const auto &storedEntry : waypoints) {
-            if (storedEntry.waypoint.id != entry.waypoint.id)
-                continue;
-            if (storedEntry.waypoint.locked_to != 0 && storedEntry.waypoint.locked_to != entry.creatorNodeNum)
-                return true; // Packet handled, but the deletion is not honored
-            break;
+    const bool expired = isExpired(entry, packet.has_rx_time ? packet.rx_time : 0);
+    bool changed = false;
+    {
+        concurrency::LockGuard stateGuard(&stateLock);
+        const StoredWaypoint *existing = nullptr;
+        for (const StoredWaypoint &candidate : waypoints) {
+            if (candidate.waypoint.id == entry.waypoint.id) {
+                existing = &candidate;
+                break;
+            }
+        }
+        entry.notificationPreferences = mergeNotificationPreferences(
+            locallyAuthored, existing != nullptr, existing ? existing->notificationPreferences : 0, entry.waypoint);
+        clearWireNotificationPreferences(entry.waypoint);
+
+        if (stored)
+            *stored = entry;
+
+        if (expired) {
+            // Only the node a locked waypoint belongs to may delete it locally.
+            if (existing && existing->waypoint.locked_to != 0 && existing->waypoint.locked_to != entry.creatorNodeNum)
+                return true;
+            changed = removeWaypointByIdLocked(entry.waypoint.id);
+        } else {
+            addStoredWaypointLocked(entry);
+            changed = true;
         }
 
-        removeWaypoint(entry.waypoint.id);
-        return true;
+        if (changed)
+            markUnsavedLocked();
     }
 
-    addStoredWaypoint(entry);
-
-#if ENABLE_WAYPOINT_PERSISTENCE
-    markWaypointStoreUnsaved();
-#endif
-    notifyChanged();
+    if (changed)
+        notifyChanged();
 
     return true;
 }
@@ -233,72 +258,125 @@ bool WaypointStore::purgeExpired(uint32_t now)
 {
     // No local clock normalization: isExpired() owns that policy, including the delete convention.
     bool changed = false;
-    for (auto it = waypoints.begin(); it != waypoints.end();) {
-        if (!isExpired(*it, now)) {
-            ++it;
-            continue;
+    {
+        concurrency::LockGuard stateGuard(&stateLock);
+        for (auto it = waypoints.begin(); it != waypoints.end();) {
+            if (!isExpired(*it, now)) {
+                ++it;
+                continue;
+            }
+
+            it = waypoints.erase(it);
+            changed = true;
         }
-
-        it = waypoints.erase(it);
-        changed = true;
+        if (changed)
+            markUnsavedLocked();
     }
 
-    if (changed) {
-#if ENABLE_WAYPOINT_PERSISTENCE
-        markWaypointStoreUnsaved();
-#endif
+    if (changed)
         notifyChanged();
-    }
 
     return changed;
 }
 
-void WaypointStore::saveToFlash()
+bool WaypointStore::saveToFlash()
 {
+#if defined(HELTEC_V4_OLED)
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive())
+        return false;
+    if (!heltecPreferenceStoragePowerIsSafe()) {
+        LOG_WARN("WaypointStore: deferring persistence while fresh power is unsafe");
+        return false;
+    }
+#endif
     purgeExpired();
+#if defined(HELTEC_V4_OLED)
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive())
+        return false;
+#endif
+    concurrency::LockGuard persistenceGuard(&g_waypointStorePersistenceLock);
+#if defined(HELTEC_V4_OLED)
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive())
+        return false;
+    if (!heltecPreferenceStoragePowerIsSafe()) {
+        LOG_WARN("WaypointStore: deferring persistence after wait because fresh power is unsafe");
+        return false;
+    }
+#endif
+
+    std::deque<StoredWaypoint> snapshot;
+    uint32_t savedGeneration = 0;
+    {
+        concurrency::LockGuard stateGuard(&stateLock);
+#if ENABLE_WAYPOINT_PERSISTENCE
+        if (!hasUnsavedChanges)
+            return true;
+#endif
+        snapshot = waypoints;
+        savedGeneration = mutationGeneration;
+    }
 
 #if ENABLE_WAYPOINT_PERSISTENCE && defined(FSCom)
-    if (!g_waypointStoreHasUnsavedChanges)
-        return;
+    size_t countFull = snapshot.size();
+    if (countFull > WAYPOINT_HISTORY_LIMIT)
+        countFull = WAYPOINT_HISTORY_LIMIT;
+    if (countFull > UINT8_MAX)
+        countFull = UINT8_MAX;
+    const uint8_t count = static_cast<uint8_t>(countFull);
+
+    // Encode every record before opening SafeFile. A protobuf encode failure
+    // must leave the previously verified generation untouched.
+    std::vector<StoredWaypointRecord> records;
+    records.reserve(count);
+    for (uint8_t i = 0; i < count; ++i) {
+        StoredWaypointRecord rec = {};
+        rec.creatorNodeNum = snapshot[i].creatorNodeNum;
+        rec.receivedTime = snapshot[i].receivedTime;
+        rec.notificationPreferences = snapshot[i].notificationPreferences;
+        const size_t payloadLength = encodeWaypointPayload(snapshot[i].waypoint, rec.payload, sizeof(rec.payload));
+        if (payloadLength == 0 || payloadLength > sizeof(rec.payload) || payloadLength > UINT16_MAX) {
+            LOG_ERROR("WaypointStore: refusing malformed encoded record %u", i);
+            return false;
+        }
+        rec.payloadLength = static_cast<uint16_t>(payloadLength);
+        records.push_back(rec);
+    }
 
     spiLock->lock();
     FSCom.mkdir("/");
     spiLock->unlock();
 
-    SafeFile f(WAYPOINT_STORE_FILENAME, false);
+    SafeFile f(WAYPOINT_STORE_FILENAME, WAYPOINT_STORE_FULL_ATOMIC);
 
     spiLock->lock();
     const uint8_t version = WAYPOINT_STORE_VERSION;
-    size_t countFull = waypoints.size();
-    if (countFull > WAYPOINT_HISTORY_LIMIT)
-        countFull = WAYPOINT_HISTORY_LIMIT;
-    if (countFull > UINT8_MAX)
-        countFull = UINT8_MAX;
-    const uint8_t count = (uint8_t)countFull;
 
-    f.write(&version, 1);
-    f.write(&count, 1);
+    bool stored = f.write(&version, 1) == 1;
+    stored = (f.write(&count, 1) == 1) && stored;
 
     for (uint8_t i = 0; i < count; ++i) {
-        StoredWaypointRecord rec = {};
-        rec.creatorNodeNum = waypoints[i].creatorNodeNum;
-        rec.receivedTime = waypoints[i].receivedTime;
-        rec.notificationPreferences = waypoints[i].notificationPreferences;
-        rec.payloadLength = encodeWaypointPayload(waypoints[i].waypoint, rec.payload, sizeof(rec.payload));
-        f.write(reinterpret_cast<const uint8_t *>(&rec), sizeof(rec));
+        stored = (f.write(reinterpret_cast<const uint8_t *>(&records[i]), sizeof(records[i])) == sizeof(records[i])) && stored;
     }
     spiLock->unlock();
-    f.close();
+    stored = f.close() && stored;
+#else
+    const bool stored = true;
 #endif
 
-#if ENABLE_WAYPOINT_PERSISTENCE
-    g_waypointStoreHasUnsavedChanges = false;
-    g_lastWaypointAutoSaveMs = Time::getMillis();
-#endif
+    {
+        concurrency::LockGuard stateGuard(&stateLock);
+        if (stored && mutationGeneration == savedGeneration)
+            hasUnsavedChanges = false;
+        if (stored)
+            lastAutoSaveMs = Time::getMillis();
+    }
+    return stored;
 }
 
 void WaypointStore::loadFromFlash()
 {
+    concurrency::LockGuard persistenceGuard(&g_waypointStorePersistenceLock);
+    concurrency::LockGuard stateGuard(&stateLock);
     std::deque<StoredWaypoint>().swap(waypoints);
 
 #if ENABLE_WAYPOINT_PERSISTENCE && defined(FSCom)
@@ -310,10 +388,10 @@ void WaypointStore::loadFromFlash()
             if (f) {
                 uint8_t version = 0;
                 uint8_t count = 0;
-                f.readBytes(reinterpret_cast<char *>(&version), 1);
-                f.readBytes(reinterpret_cast<char *>(&count), 1);
+                const bool headerRead = f.readBytes(reinterpret_cast<char *>(&version), 1) == 1 &&
+                                        f.readBytes(reinterpret_cast<char *>(&count), 1) == 1;
 
-                if (version != WAYPOINT_STORE_VERSION) {
+                if (!headerRead || version != WAYPOINT_STORE_VERSION) {
                     LOG_WARN("WaypointStore version mismatch (%u)", version);
                     f.close();
                 } else {
@@ -327,6 +405,12 @@ void WaypointStore::loadFromFlash()
                             break;
                         if (rec.payloadLength == 0 || rec.payloadLength > sizeof(rec.payload)) {
                             LOG_WARN("WaypointStore skipping corrupt record %u", i);
+                            continue;
+                        }
+                        constexpr uint8_t validNotificationPreferences =
+                            WAYPOINT_NOTIFY_ENTER | WAYPOINT_NOTIFY_EXIT | WAYPOINT_NOTIFY_FAVORITES_ONLY;
+                        if ((rec.notificationPreferences & ~validNotificationPreferences) != 0) {
+                            LOG_WARN("WaypointStore skipping invalid notification flags in record %u", i);
                             continue;
                         }
                         if (!decodeWaypointPayload(rec.payload, rec.payloadLength, entry.waypoint))
@@ -346,54 +430,110 @@ void WaypointStore::loadFromFlash()
     }
 #endif
 
-#if ENABLE_WAYPOINT_PERSISTENCE
-    g_waypointStoreHasUnsavedChanges = false;
-    g_lastWaypointAutoSaveMs = Time::getMillis();
-#endif
+    ++mutationGeneration;
+    hasUnsavedChanges = false;
+    lastAutoSaveMs = Time::getMillis();
 }
 
-void WaypointStore::clearAllWaypoints()
+bool WaypointStore::clearAllWaypoints(bool requireDestructivePower)
 {
-    const bool hadWaypoints = !waypoints.empty();
-
-    std::deque<StoredWaypoint>().swap(waypoints);
+#if defined(HELTEC_V4_OLED)
+    const auto storagePowerIsSafe = [requireDestructivePower]() {
+        return requireDestructivePower ? heltecDestructiveStoragePowerIsSafe()
+                                       : heltecPreferenceStoragePowerIsSafe();
+    };
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive() &&
+        !nodeDB->isDestructiveStorageMutationOwnerCurrentTask())
+        return false;
+    if (!storagePowerIsSafe()) {
+        LOG_WARN("WaypointStore: refusing clear while fresh power is unsafe");
+        return false;
+    }
+#else
+    (void)requireDestructivePower;
+#endif
+    bool hadWaypoints = false;
+    bool stored = true;
+    {
+        concurrency::LockGuard persistenceGuard(&g_waypointStorePersistenceLock);
+#if defined(HELTEC_V4_OLED)
+        // A clear queued immediately before factory reset must not slip past the
+        // reset's one-shot drain. The destructive owner is the sole exception.
+        if (nodeDB && nodeDB->isDestructiveStorageMutationActive() &&
+            !nodeDB->isDestructiveStorageMutationOwnerCurrentTask())
+            return false;
+        if (!storagePowerIsSafe()) {
+            LOG_WARN("WaypointStore: refusing clear after wait because fresh power is unsafe");
+            return false;
+        }
+#endif
+        uint32_t clearedGeneration = 0;
+        {
+            concurrency::LockGuard stateGuard(&stateLock);
+            hadWaypoints = !waypoints.empty();
+            std::deque<StoredWaypoint>().swap(waypoints);
+            markUnsavedLocked();
+            clearedGeneration = mutationGeneration;
+        }
 
 #if ENABLE_WAYPOINT_PERSISTENCE && defined(FSCom)
-    SafeFile f(WAYPOINT_STORE_FILENAME, false);
-    {
-        concurrency::LockGuard guard(spiLock);
-        const uint8_t version = WAYPOINT_STORE_VERSION;
-        const uint8_t count = 0;
-        f.write(&version, 1);
-        f.write(&count, 1);
-    }
-    f.close();
+        SafeFile f(WAYPOINT_STORE_FILENAME, WAYPOINT_STORE_FULL_ATOMIC, requireDestructivePower);
+        {
+            concurrency::LockGuard guard(spiLock);
+            const uint8_t version = WAYPOINT_STORE_VERSION;
+            const uint8_t count = 0;
+            stored = f.write(&version, 1) == 1;
+            stored = (f.write(&count, 1) == 1) && stored;
+        }
+        stored = f.close() && stored;
 #endif
 
-#if ENABLE_WAYPOINT_PERSISTENCE
-    g_waypointStoreHasUnsavedChanges = false;
-    g_lastWaypointAutoSaveMs = Time::getMillis();
-#endif
+        {
+            concurrency::LockGuard stateGuard(&stateLock);
+            if (stored && mutationGeneration == clearedGeneration)
+                hasUnsavedChanges = false;
+            if (stored)
+                lastAutoSaveMs = Time::getMillis();
+        }
+    }
 
     if (hadWaypoints)
         notifyChanged();
+    return stored;
+}
+
+void WaypointStore::drainPersistenceWrites()
+{
+    concurrency::LockGuard persistenceGuard(&g_waypointStorePersistenceLock);
 }
 
 #if ENABLE_WAYPOINT_PERSISTENCE
+void WaypointStore::autosaveTick()
+{
+    const uint32_t now = Time::getMillis();
+    bool shouldSave = false;
+    {
+        concurrency::LockGuard stateGuard(&stateLock);
+        if (lastAutoSaveMs == 0) {
+            lastAutoSaveMs = now;
+            return;
+        }
+        if (Throttle::isWithinTimespanMs(lastAutoSaveMs, autosaveIntervalMs()))
+            return;
+
+        lastAutoSaveMs = now;
+        shouldSave = hasUnsavedChanges;
+    }
+
+    if (shouldSave) {
+        LOG_INFO("Autosaving WaypointStore to flash");
+        saveToFlash();
+    }
+}
+
 void waypointStoreAutosaveTick()
 {
-    if (!g_waypointStoreHasUnsavedChanges) {
-        if (g_lastWaypointAutoSaveMs == 0)
-            g_lastWaypointAutoSaveMs = Time::getMillis();
-        return;
-    }
-
-    if (g_lastWaypointAutoSaveMs == 0) {
-        g_lastWaypointAutoSaveMs = Time::getMillis();
-        return;
-    }
-
-    Throttle::execute(&g_lastWaypointAutoSaveMs, autosaveIntervalMs(), persistWaypointStore);
+    waypointStore.autosaveTick();
 }
 #endif
 

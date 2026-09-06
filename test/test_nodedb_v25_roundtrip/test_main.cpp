@@ -23,7 +23,7 @@
 #include <vector>
 
 // Friend declared in NodeDB.h (PIO_UNIT_TESTING): exposes the private save path so
-// the tests drive exactly the gate under test, without saveToDisk()'s format-retry.
+// the tests drive exactly the gate under test, without saveToDisk()'s retry.
 class NodeDBTestShim : public NodeDB
 {
   public:
@@ -174,6 +174,26 @@ static void test_identityReady_saveUnlocked(void)
 {
     TEST_ASSERT_EQUAL_MESSAGE(32, owner.public_key.size, "boot keygen did not run - this suite needs an owner key");
     TEST_ASSERT_NOT_NULL(db->getMeshNode(db->getNodeNum()));
+}
+
+static void test_saveProto_reportsAtomicCommitFailure(void)
+{
+    static constexpr const char *target = "/saveproto-commit-blocker";
+    static constexpr const char *temporary = "/saveproto-commit-blocker.tmp";
+
+    if (FSCom.exists(temporary))
+        TEST_ASSERT_TRUE(FSCom.remove(temporary));
+    rmDir(target);
+    TEST_ASSERT_TRUE(FSCom.mkdir(target));
+
+    meshtastic_DeviceState probe{};
+    probe.version = DEVICESTATE_CUR_VER;
+    TEST_ASSERT_FALSE(db->saveProto(target, meshtastic_DeviceState_size, &meshtastic_DeviceState_msg, &probe, true));
+    TEST_ASSERT_TRUE_MESSAGE(FSCom.exists(target), "failed atomic rename must preserve the previous target");
+
+    if (FSCom.exists(temporary))
+        TEST_ASSERT_TRUE(FSCom.remove(temporary));
+    rmDir(target);
 }
 
 // --- updateFrom SNR admission gates (in-RAM policy feeding the persisted bit) ---
@@ -437,8 +457,8 @@ static void test_keylessDevice_skipsNodesProtoWrite(void)
     owner.public_key.size = 0;
     owner.is_licensed = false;
 
-    // Returning success on the skip matters: a false here would propagate into
-    // saveToDisk()'s fsFormat() whole-FS wipe.
+    // Returning success on the skip matters: this is an intentional deferral,
+    // not a failed write that needs an immediate retry.
     TEST_ASSERT_TRUE_MESSAGE(db->saveDatabase(), "keyless save must report success");
 
     std::vector<uint8_t> after;
@@ -647,6 +667,9 @@ NDBR_TEST_ENTRY void setup()
 
     printf("\n=== Preconditions ===\n");
     RUN_TEST(test_identityReady_saveUnlocked);
+
+    printf("\n=== Save commit status ===\n");
+    RUN_TEST(test_saveProto_reportsAtomicCommitFailure);
 
     printf("\n=== updateFrom SNR gates ===\n");
     RUN_TEST(test_updateFrom_snrTransportGates);

@@ -4,6 +4,10 @@
 #include "graphics/Screen.h"
 #include "input/HapticFeedback.h"
 #include "modules/ExternalNotificationModule.h"
+#if defined(HELTEC_V4_OLED)
+#include "modules/AdminModule.h"
+#include "mesh/NodeDB.h"
+#endif
 #include <cstring>
 #ifdef MESHTASTIC_LOCKDOWN
 #include "security/LockdownDisplay.h"
@@ -101,6 +105,13 @@ void InputBroker::queueInputEvent(const InputEvent *event)
     }
 }
 
+bool InputBroker::tryQueueInputEvent(const InputEvent *event)
+{
+    if (xPortInIsrContext() == pdTRUE)
+        return xQueueSendFromISR(inputEventQueue, event, NULL) == pdTRUE;
+    return xQueueSend(inputEventQueue, event, 0) == pdTRUE;
+}
+
 void InputBroker::processInputEventQueue()
 {
     InputEvent event;
@@ -113,6 +124,8 @@ void InputBroker::processInputEventQueue()
 int InputBroker::handleInputEvent(const InputEvent *event)
 {
 #if defined(HELTEC_V4_OLED)
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive())
+        return 0;
     if (screen && screen->isDisplayDisabled()) {
         const bool userButtonLongPress = event && event->source && strcmp(event->source, "UserButton") == 0 &&
                                          event->inputEvent == INPUT_BROKER_SELECT;
@@ -120,6 +133,19 @@ int InputBroker::handleInputEvent(const InputEvent *event)
             screen->setDisplayDisabled(false);
             powerFSM.trigger(EVENT_INPUT);
         }
+        return 0;
+    }
+#endif
+#if defined(HELTEC_V4_OLED)
+    // Physical/menu mutations are not allowed to interleave with a client
+    // settings import. The persistent-display PRG restore path above remains
+    // available because it is a recovery gesture and returns before this gate.
+    const bool physicalRecoveryEvent = event && event->source && strcmp(event->source, "UserButton") == 0 &&
+                                       event->inputEvent == INPUT_BROKER_FACTORY_RST;
+    if (!physicalRecoveryEvent &&
+        ((adminModule && adminModule->isEditTransactionOpen()) ||
+         (nodeDB && nodeDB->isPreferenceEditTransactionActive()))) {
+        LOG_WARN("Ignoring local input while a settings transaction is active");
         return 0;
     }
 #endif

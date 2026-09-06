@@ -5,9 +5,13 @@
 #include "configuration.h"
 #include "power/DeepSleepPolicy.h"
 
+struct DeepSleepContext {
+    bool radioSleepSucceeded = true;
+};
+
 void doDeepSleep(uint32_t msecToWake, bool skipPreflight, bool skipSaveNodeDb,
                  DeepSleepWakePolicy wakePolicy = DeepSleepWakePolicy::ROLE_DEFAULT);
-void cpuDeepSleep(uint32_t msecToWake, DeepSleepWakePolicy wakePolicy);
+void cpuDeepSleep(uint32_t msecToWake, DeepSleepWakePolicy wakePolicy, bool radioSleepSucceeded);
 
 #ifdef ARCH_ESP32
 #include "esp_sleep.h"
@@ -47,7 +51,7 @@ extern bool bluetoothOn;
 /// Called to ask any observers if they want to veto sleep. Return 1 to veto or 0 to allow sleep to happen
 extern Observable<void *> preflightSleep;
 
-/// Called to tell observers we are now entering (deep) sleep and you should prepare.  Must return 0
+/// Called to tell observers we are entering deep sleep. The argument is a DeepSleepContext; callbacks must return 0.
 extern Observable<void *> notifyDeepSleep;
 
 /// Called to tell observers we are rebooting ASAP.  Must return 0

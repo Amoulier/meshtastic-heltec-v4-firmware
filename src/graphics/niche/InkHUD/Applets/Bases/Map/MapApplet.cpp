@@ -174,8 +174,9 @@ void InkHUD::MapApplet::resetZoom()
 
 bool InkHUD::MapApplet::focusWaypoint(uint32_t waypointId)
 {
-    const StoredWaypoint *entry = waypointStore.findWaypoint(waypointId);
-    if (!entry || WaypointStore::isExpired(*entry) || !waypointHasMapGeometry(entry->waypoint))
+    StoredWaypoint entry;
+    if (!waypointStore.findWaypoint(waypointId, entry) || WaypointStore::isExpired(entry) ||
+        !waypointHasMapGeometry(entry.waypoint))
         return false;
 
     s_zoomLocked = false;
@@ -741,15 +742,16 @@ void InkHUD::MapApplet::onRender(bool full)
 void InkHUD::MapApplet::getMapCenter(float *lat, float *lng)
 {
     if (focusedWaypointId != 0) {
-        const StoredWaypoint *entry = waypointStore.findWaypoint(focusedWaypointId);
-        if (entry && !WaypointStore::isExpired(*entry) && waypointHasMapGeometry(entry->waypoint)) {
-            *lat = waypointHasAnchor(entry->waypoint)
-                       ? entry->waypoint.latitude_i * 1e-7f
-                       : ((float)entry->waypoint.bounding_box.latitude_south_i + entry->waypoint.bounding_box.latitude_north_i) *
+        StoredWaypoint entry;
+        if (waypointStore.findWaypoint(focusedWaypointId, entry) && !WaypointStore::isExpired(entry) &&
+            waypointHasMapGeometry(entry.waypoint)) {
+            *lat = waypointHasAnchor(entry.waypoint)
+                       ? entry.waypoint.latitude_i * 1e-7f
+                       : ((float)entry.waypoint.bounding_box.latitude_south_i + entry.waypoint.bounding_box.latitude_north_i) *
                              0.5e-7f;
-            *lng = waypointHasAnchor(entry->waypoint)
-                       ? entry->waypoint.longitude_i * 1e-7f
-                       : ((float)entry->waypoint.bounding_box.longitude_west_i + entry->waypoint.bounding_box.longitude_east_i) *
+            *lng = waypointHasAnchor(entry.waypoint)
+                       ? entry.waypoint.longitude_i * 1e-7f
+                       : ((float)entry.waypoint.bounding_box.longitude_west_i + entry.waypoint.bounding_box.longitude_east_i) *
                              0.5e-7f;
             latCenter = *lat;
             lngCenter = *lng;
@@ -1189,7 +1191,8 @@ void InkHUD::MapApplet::calculateAllMarkers()
     // Clear old markers
     markers.clear();
     waypointMarkers.clear();
-    waypointMarkers.reserve(waypointStore.getWaypoints().size());
+    const auto waypointSnapshot = waypointStore.getWaypoints();
+    waypointMarkers.reserve(waypointSnapshot.size());
 
     // For each node in db
     for (uint32_t i = 0; i < nodeDB->getNumMeshNodes(); i++) {
@@ -1220,7 +1223,7 @@ void InkHUD::MapApplet::calculateAllMarkers()
     }
 
     // Cache waypoint markers once per render pass to avoid repeated geo math below.
-    for (const StoredWaypoint &entry : waypointStore.getWaypoints()) {
+    for (const StoredWaypoint &entry : waypointSnapshot) {
         if (WaypointStore::isExpired(entry))
             continue;
         if (!waypointHasMapGeometry(entry.waypoint))

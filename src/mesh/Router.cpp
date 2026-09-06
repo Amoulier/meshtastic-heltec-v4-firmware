@@ -297,14 +297,86 @@ bool Router::shouldDecrementHopLimit(const meshtastic_MeshPacket *p)
  */
 int32_t Router::runOnce()
 {
-    meshtastic_MeshPacket *mp;
-    while ((mp = fromRadioQueue.dequeuePtr(0)) != NULL) {
+    // Establish the idle baseline before inspecting the queue. Any enqueue or
+    // transaction-resume wake that races this run sets interval 0 afterwards;
+    // returning RUN_SAME preserves that wake instead of overwriting it with an
+    // indefinite delay.
+    setInterval(INT32_MAX);
+#if defined(HELTEC_V4_OLED)
+    const uint32_t previousRunDepth = radioPacketRunDepth.fetch_add(1, std::memory_order_acq_rel);
+    assert(previousRunDepth == 0);
+    (void)previousRunDepth;
+    radioPacketRunOwnerTask.store(reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle()), std::memory_order_release);
+    struct RadioPacketRunGuard {
+        std::atomic<uint32_t> &depth;
+        std::atomic<uintptr_t> &owner;
+        ~RadioPacketRunGuard()
+        {
+            const uint32_t previousDepth = depth.fetch_sub(1, std::memory_order_acq_rel);
+            assert(previousDepth == 1);
+            (void)previousDepth;
+            owner.store(0, std::memory_order_release);
+        }
+    } radioPacketRunGuard{radioPacketRunDepth, radioPacketRunOwnerTask};
+
+    if (nodeDB && nodeDB->isPreferenceEditTransactionActive()) {
+        // BEGIN may have captured the tail of a frame which started under the
+        // committed channel keys. Leave it owned by the queue; beginPreferenceEdit()
+        // will cancel and rearm the old generation, then wake us to decode it.
+        return RUN_SAME;
+    }
+    meshtastic_MeshPacket *mp = configDeferredReceivedPacket.exchange(nullptr, std::memory_order_acq_rel);
+#else
+    meshtastic_MeshPacket *mp = nullptr;
+#endif
+    while (mp != nullptr || (mp = fromRadioQueue.dequeuePtr(0)) != NULL) {
+#if defined(HELTEC_V4_OLED)
+        if (nodeDB && nodeDB->isPreferenceEditTransactionActive()) {
+            // The transaction CAS can land after the gate above and after the
+            // queue transfer. Router has one worker, so this dedicated slot is
+            // the packet's sole owner until NONE wakes us again.
+            meshtastic_MeshPacket *expected = nullptr;
+            const bool deferred = configDeferredReceivedPacket.compare_exchange_strong(
+                expected, mp, std::memory_order_release, std::memory_order_relaxed);
+            assert(deferred);
+            return RUN_SAME;
+        }
+        if (nodeDB && nodeDB->isDestructiveStorageMutationActive()) {
+            // These may have been queued immediately before reset/restore
+            // acquired its fence. Never decode them against replacement RAM.
+            clearRoutingAuthCache();
+            packetPool.release(mp);
+            mp = nullptr;
+            continue;
+        }
+#endif
         // printPacket("handle fromRadioQ", mp);
         perhapsHandleReceived(mp);
+        mp = nullptr;
+#if defined(HELTEC_V4_OLED)
+        // If reader admission filled the sole deferred slot, stop before
+        // dequeuing another packet into it.
+        if (configDeferredReceivedPacket.load(std::memory_order_acquire) != nullptr)
+            return RUN_SAME;
+#endif
     }
 
     // LOG_DEBUG("Sleep forever");
-    return INT32_MAX; // Wait a long time - until we get woken for the message queue
+    return RUN_SAME; // Keep the idle baseline, or a concurrent interval-0 wake.
+}
+
+bool Router::hasPendingRadioPacketsForConfig()
+{
+#if defined(HELTEC_V4_OLED)
+    const bool anotherTaskIsRunning =
+        radioPacketRunDepth.load(std::memory_order_acquire) != 0 &&
+        radioPacketRunOwnerTask.load(std::memory_order_acquire) !=
+            reinterpret_cast<uintptr_t>(xTaskGetCurrentTaskHandle());
+    return anotherTaskIsRunning || configDeferredReceivedPacket.load(std::memory_order_acquire) != nullptr ||
+           !fromRadioQueue.isEmpty();
+#else
+    return !fromRadioQueue.isEmpty();
+#endif
 }
 
 /**
@@ -313,6 +385,13 @@ int32_t Router::runOnce()
  */
 void Router::enqueueReceivedMessage(meshtastic_MeshPacket *p)
 {
+#if defined(HELTEC_V4_OLED)
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive()) {
+        clearRoutingAuthCache();
+        packetPool.release(p);
+        return;
+    }
+#endif
     // Try enqueue until successful
     while (!fromRadioQueue.enqueue(p, 0)) {
         meshtastic_MeshPacket *old_p;
@@ -415,6 +494,27 @@ meshtastic_QueueStatus Router::getQueueStatus()
 
 ErrorCode Router::sendLocal(meshtastic_MeshPacket *p, RxSource src)
 {
+#if defined(HELTEC_V4_OLED)
+    NodeDB::ExternalStateAccessScope stateAccess(nodeDB);
+    if (!stateAccess) {
+        packetPool.release(p);
+        return ERRNO_DISABLED;
+    }
+    // A bulk settings edit mutates channel keys and transport policy in RAM
+    // before one atomic commit. Keep non-local packets from loopback,
+    // encryption, MQTT/UDP and LoRa until that generation is durable.
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive()) {
+        LOG_WARN("sendLocal - destructive storage transaction has parked all mesh traffic");
+        packetPool.release(p);
+        return ERRNO_DISABLED;
+    }
+    if (!isToUs(p) && nodeDB && nodeDB->isPreferenceEditTransactionActive() &&
+        !nodeDB->isPreferenceEditQuiescing()) {
+        LOG_WARN("sendLocal - settings transaction has parked mesh egress");
+        packetPool.release(p);
+        return ERRNO_DISABLED;
+    }
+#endif
     if (p->to == 0) {
         LOG_ERROR("Packet received with to=0");
     }
@@ -469,6 +569,22 @@ ErrorCode Router::sendLocal(meshtastic_MeshPacket *p, RxSource src)
  */
 ErrorCode Router::send(meshtastic_MeshPacket *p)
 {
+#if defined(HELTEC_V4_OLED)
+    NodeDB::ExternalStateAccessScope stateAccess(nodeDB);
+    if (!stateAccess) {
+        packetPool.release(p);
+        return ERRNO_DISABLED;
+    }
+    // This also covers relays and packets injected by network transports,
+    // which do not necessarily pass through sendLocal(). The gate must precede
+    // encryption and MQTT/UDP publication, not merely the physical LoRa queue.
+    if (nodeDB && ((nodeDB->isPreferenceEditTransactionActive() && !nodeDB->isPreferenceEditQuiescing()) ||
+                   nodeDB->isDestructiveStorageMutationActive())) {
+        LOG_WARN("send - storage transaction has parked mesh egress");
+        packetPool.release(p);
+        return ERRNO_DISABLED;
+    }
+#endif
     if (isToUs(p)) {
         LOG_ERROR("BUG! send() with packet for local node");
         packetPool.release(p);
@@ -1636,6 +1752,24 @@ void Router::dispatchReceived(meshtastic_MeshPacket *p, RxSource src)
 
 void Router::perhapsHandleReceived(meshtastic_MeshPacket *p)
 {
+#if defined(HELTEC_V4_OLED)
+    NodeDB::ExternalStateAccessScope stateAccess(nodeDB);
+    if (!stateAccess) {
+        if (nodeDB && nodeDB->isPreferenceEditTransactionActive()) {
+            // BEGIN can cross the final post-dequeue check in runOnce(). Keep
+            // sole ownership until the old generation is restored and NONE
+            // wakes us; never turn that race into a decode failure/drop.
+            meshtastic_MeshPacket *expected = nullptr;
+            const bool deferred = configDeferredReceivedPacket.compare_exchange_strong(
+                expected, p, std::memory_order_release, std::memory_order_relaxed);
+            assert(deferred);
+            return;
+        }
+        clearRoutingAuthCache();
+        packetPool.release(p);
+        return;
+    }
+#endif
 #if ARCH_PORTDUINO
     // Even ignored packets get logged in the trace
     if (portduino_config.traceFilename != "" || portduino_config.logoutputlevel == level_trace) {

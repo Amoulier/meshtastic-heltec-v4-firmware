@@ -33,6 +33,7 @@
 #pragma once
 
 #include "FSCommon.h"
+#include "concurrency/Lock.h"
 #include "configuration.h"
 #include "mesh/generated/meshtastic/xmodem.pb.h"
 
@@ -53,7 +54,14 @@ class XModemAdapter
     void resetForPhone();
 
     // True while a file transfer is in flight; lets callers avoid racing our `file` handle.
-    bool isBusy() const { return isReceiving || isTransmitting; }
+    bool isBusy();
+
+    // Establish an exclusion fence before a multi-file storage transaction.
+    // Once acquired, no new packet can start or continue a transfer until end.
+    // A full physical recovery may cancel an abandoned unprivileged transfer;
+    // ordinary saves/restores must pass false and preserve the transfer.
+    bool beginExclusiveStorageMutation(bool cancelActiveTransfer = false);
+    void endExclusiveStorageMutation();
 
     // Reject a transfer filename that could escape the filesystem root via a ".." path component.
     // Absolute/subdirectory paths are allowed - PortduinoFS confines them to its mountpoint - so
@@ -61,6 +69,8 @@ class XModemAdapter
     static bool isValidFilename(const char *name);
 
   private:
+    concurrency::Lock transactionLock;
+    bool storageMutationBlocked = false;
     bool isReceiving = false;
     bool isTransmitting = false;
     bool isEOT = false;

@@ -364,8 +364,8 @@ static void test_absentSubmessages_noSatelliteGhostRows(void)
 // The truncation firewall: a wide-but-VALID v24 long_name (UserLite allows 40
 // bytes) whose 25-byte slim copy cuts a multi-byte sequence in half. Without
 // migration's sanitizeUtf8, the orphaned lead byte makes the next
-// saveNodeDatabaseToDisk() fail its PB_VALIDATE_UTF8 encode - and a failed
-// save is what triggers saveToDisk()'s fsFormat() wipe on device.
+// saveNodeDatabaseToDisk() fail its PB_VALIDATE_UTF8 encode and leave the
+// migrated database unpersisted.
 static void test_truncatedWideName_sanitizedAndReencodable(void)
 {
     // 23 ASCII bytes then Euro signs straddling the 24-byte truncation boundary.

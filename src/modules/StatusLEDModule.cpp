@@ -6,6 +6,9 @@
 #include <Arduino.h>
 #if defined(HELTEC_V4_OLED)
 #include "graphics/Screen.h"
+#if defined(ARCH_ESP32)
+#include "sleep.h"
+#endif
 #endif
 
 /*
@@ -13,6 +16,21 @@ StatusLEDModule manages the device's status LEDs, updating their states based on
 It reflects charging, charged, discharging, and Bluetooth connection states using the appropriate LEDs.
 */
 StatusLEDModule *statusLEDModule;
+
+#if defined(HELTEC_V4_OLED)
+static bool shouldKeepHeltecV4StatusLedDark()
+{
+    if (screen && screen->isDisplayDisabled())
+        return true;
+#if defined(ARCH_ESP32)
+    // Screen is deliberately not constructed on a timer wake, so the
+    // persistent-display predicate above is unavailable in this headless mode.
+    return wakeCause == ESP_SLEEP_WAKEUP_TIMER;
+#else
+    return false;
+#endif
+}
+#endif
 
 StatusLEDModule::StatusLEDModule() : concurrency::OSThread("StatusLEDModule")
 {
@@ -188,8 +206,9 @@ int32_t StatusLEDModule::runOnce()
 #if defined(HELTEC_V4_OLED)
     // Persistent display-off is the user's explicit unattended/battery mode.
     // Keep the status LED dark as well, but leave Bluetooth state and pairing
-    // behavior untouched. Status observers still wake this thread as needed.
-    if (screen && screen->isDisplayDisabled()) {
+    // behavior untouched. Headless timer wakes have no Screen object, so keep
+    // that wake cycle dark explicitly as well.
+    if (shouldKeepHeltecV4StatusLedDark()) {
         CHARGE_LED_state = LED_STATE_OFF;
         PAIRING_LED_state = LED_STATE_OFF;
         my_interval = 5000;
@@ -303,7 +322,7 @@ void StatusLEDModule::setPowerLED(bool LEDon)
 {
 
 #if defined(HELTEC_V4_OLED)
-    if (screen && screen->isDisplayDisabled()) {
+    if (shouldKeepHeltecV4StatusLedDark()) {
         LEDon = false;
     }
 #endif

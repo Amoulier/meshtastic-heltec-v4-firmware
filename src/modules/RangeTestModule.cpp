@@ -215,8 +215,13 @@ bool RangeTestModuleRadio::appendFile(const meshtastic_MeshPacket &mp)
         LOG_DEBUG("-----------------------------------------");
     */
     concurrency::LockGuard g(spiLock);
-    if (!FSBegin()) {
-        LOG_DEBUG("Filesystem mount error");
+#if defined(HELTEC_V4_OLED)
+    const bool filesystemReady = fsIsMounted();
+#else
+    const bool filesystemReady = FSBegin();
+#endif
+    if (!filesystemReady) {
+        LOG_DEBUG("Filesystem unavailable");
         return 0;
     }
 
@@ -329,8 +334,13 @@ bool RangeTestModuleRadio::appendFile(const meshtastic_MeshPacket &mp)
 bool RangeTestModuleRadio::removeFile()
 {
 #ifdef ARCH_ESP32
-    if (!FSBegin()) {
-        LOG_DEBUG("Filesystem mount error");
+#if defined(HELTEC_V4_OLED)
+    const bool filesystemReady = fsIsMounted();
+#else
+    const bool filesystemReady = FSBegin();
+#endif
+    if (!filesystemReady) {
+        LOG_DEBUG("Filesystem unavailable");
         return 0;
     }
 

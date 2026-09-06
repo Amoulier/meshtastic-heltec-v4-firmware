@@ -64,6 +64,21 @@ char const *contentTypes[][2] = {{".txt", "text/plain"},     {".html", "text/htm
 // Our API to handle messages to and from the radio.
 HttpAPI webAPI;
 
+class ScopedExternalStateAccess
+{
+  public:
+    ScopedExternalStateAccess() : acquired(!nodeDB || nodeDB->beginExternalStateAccess()) {}
+    ~ScopedExternalStateAccess()
+    {
+        if (acquired && nodeDB)
+            nodeDB->endExternalStateAccess();
+    }
+    explicit operator bool() const { return acquired; }
+
+  private:
+    bool acquired;
+};
+
 void registerHandlers(HTTPServer *insecureServer, HTTPSServer *secureServer)
 {
 
@@ -368,9 +383,35 @@ void handleFsDeleteStatic(HTTPRequest *req, HTTPResponse *res)
     res->setHeader("Access-Control-Allow-Origin", "*");
     res->setHeader("Access-Control-Allow-Methods", "DELETE");
 
+#if defined(HELTEC_V4_OLED)
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive()) {
+        res->print("{\"status\":\"Error\"}");
+        return;
+    }
+#endif
+
     if (params->getQueryParameter("delete", paramValDelete)) {
         std::string pathDelete = "/" + paramValDelete;
+#if defined(HELTEC_V4_OLED)
+        const bool outsideStaticTree = pathDelete.rfind("/static/", 0) != 0 || pathDelete.find("..") != std::string::npos ||
+                                       pathDelete.find('\\') != std::string::npos;
+        const bool protectedPath = outsideStaticTree || pathDelete == "/heltec-nvs-reset.pending" ||
+                                   pathDelete == "/heltec-nvs-reset.pending.tmp" || pathDelete == "/prefs" ||
+                                   pathDelete.rfind("/prefs/", 0) == 0 || pathDelete == "/backups" ||
+                                   pathDelete.rfind("/backups/", 0) == 0;
+        if (protectedPath) {
+            LOG_WARN("Refusing HTTP deletion of protected Heltec persistence path");
+            res->print("{\"status\":\"Error\"}");
+            return;
+        }
+#endif
         concurrency::LockGuard g(spiLock);
+#if defined(HELTEC_V4_OLED)
+        if (nodeDB && nodeDB->isDestructiveStorageMutationActive()) {
+            res->print("{\"status\":\"Error\"}");
+            return;
+        }
+#endif
         const char *status = FSCom.remove(pathDelete.c_str()) ? "ok" : "Error";
         LOG_INFO("%s", pathDelete.c_str());
         std::string out = "{\"status\":";
@@ -478,6 +519,12 @@ void handleFormUpload(HTTPRequest *req, HTTPResponse *res)
 
     LOG_DEBUG("Form Upload - Disable keep-alive");
     res->setHeader("Connection", "close");
+#if defined(HELTEC_V4_OLED)
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive()) {
+        res->println("<p>Storage reset in progress.</p>");
+        return;
+    }
+#endif
 
     // First, we need to check the encoding of the form that we have received.
     // The browser will set the Content-Type request header, so we can use it for that purpose.
@@ -547,11 +594,24 @@ void handleFormUpload(HTTPRequest *req, HTTPResponse *res)
             return;
         }
 
+        if (filename == "." || filename == ".." || filename.find('/') != std::string::npos ||
+            filename.find('\\') != std::string::npos) {
+            LOG_WARN("Reject unsafe upload filename");
+            res->println("<p>Invalid filename.</p>");
+            return;
+        }
+
         // You should check file name validity and all that, but we skip that to make the core
         // concepts of the body parser functionality easier to understand.
         std::string pathname = "/static/" + filename;
 
         concurrency::LockGuard g(spiLock);
+#if defined(HELTEC_V4_OLED)
+        if (nodeDB && nodeDB->isDestructiveStorageMutationActive()) {
+            res->println("<p>Storage reset in progress.</p>");
+            return;
+        }
+#endif
         // Create a new file to stream the data into
         File file = FSCom.open(pathname.c_str(), FILE_O_WRITE);
         size_t fileLength = 0;
@@ -598,6 +658,13 @@ void handleFormUpload(HTTPRequest *req, HTTPResponse *res)
 
 void handleReport(HTTPRequest *req, HTTPResponse *res)
 {
+    ScopedExternalStateAccess stateAccess;
+    if (!stateAccess) {
+        res->setStatusCode(503);
+        res->setHeader("Content-Type", "application/json");
+        res->print("{\"status\":\"reset_in_progress\"}");
+        return;
+    }
     ResourceParameters *params = req->getParams();
     std::string content;
 
@@ -730,6 +797,13 @@ void handleReport(HTTPRequest *req, HTTPResponse *res)
 
 void handleNodes(HTTPRequest *req, HTTPResponse *res)
 {
+    ScopedExternalStateAccess stateAccess;
+    if (!stateAccess) {
+        res->setStatusCode(503);
+        res->setHeader("Content-Type", "application/json");
+        res->print("{\"status\":\"reset_in_progress\"}");
+        return;
+    }
     ResourceParameters *params = req->getParams();
     std::string content;
 

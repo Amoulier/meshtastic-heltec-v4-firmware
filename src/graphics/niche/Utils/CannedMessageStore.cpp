@@ -96,8 +96,7 @@ int CannedMessageStore::onAdminMessage(AdminModule_ObserverData *data)
 
     // Client API changing the canned messages
     case meshtastic_AdminMessage_set_canned_message_module_messages_tag:
-        handleSet(data->request);
-        *data->result = AdminMessageHandleResult::HANDLED;
+        *data->result = handleSet(data->request) ? AdminMessageHandleResult::HANDLED : AdminMessageHandleResult::ERROR;
         break;
 
     // Client API wants to know the current canned messages
@@ -114,12 +113,13 @@ int CannedMessageStore::onAdminMessage(AdminModule_ObserverData *data)
 }
 
 // Client API changing the canned messages
-void CannedMessageStore::handleSet(const meshtastic_AdminMessage *request)
+bool CannedMessageStore::handleSet(const meshtastic_AdminMessage *request)
 {
     // Copy into the correct struct (for writing to flash as protobuf)
     meshtastic_CannedMessageModuleConfig cannedMessageModuleConfig;
+    memset(&cannedMessageModuleConfig, 0, sizeof(cannedMessageModuleConfig));
     strncpy(cannedMessageModuleConfig.messages, request->set_canned_message_module_messages,
-            sizeof(cannedMessageModuleConfig.messages));
+            sizeof(cannedMessageModuleConfig.messages) - 1);
 
     // Ensure the directory exists
 #ifdef FSCom
@@ -129,12 +129,14 @@ void CannedMessageStore::handleSet(const meshtastic_AdminMessage *request)
 #endif
 
     // Write to flash
-    nodeDB->saveProto(cannedMessagesConfigFile, meshtastic_CannedMessageModuleConfig_size,
-                      &meshtastic_CannedMessageModuleConfig_msg, &cannedMessageModuleConfig);
+    if (!nodeDB->saveProto(cannedMessagesConfigFile, meshtastic_CannedMessageModuleConfig_size,
+                           &meshtastic_CannedMessageModuleConfig_msg, &cannedMessageModuleConfig))
+        return false;
 
     // Reload from flash, to update the canned messages in RAM
     // (This is a lazy way to handle it)
     load();
+    return true;
 }
 
 // Client API wants to know the current canned messages

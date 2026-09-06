@@ -1,5 +1,8 @@
 #pragma once
 #include "PowerStatus.h"
+#if defined(HELTEC_V4_OLED)
+#include "concurrency/Lock.h"
+#endif
 #include "concurrency/OSThread.h"
 #include "configuration.h"
 
@@ -101,6 +104,10 @@ class Power : public concurrency::OSThread
 
     void powerCommandsCheck();
     void readPowerStatus();
+#if defined(HELTEC_V4_OLED)
+    bool readDestructiveStoragePowerSnapshot(bool &batteryPresent, bool &externalPowerPresent,
+                                             int32_t &batteryVoltageRawMv);
+#endif
     void logHeapUsage();
     virtual bool setup();
     virtual int32_t runOnce() override;
@@ -143,6 +150,9 @@ class Power : public concurrency::OSThread
   private:
     void shutdown();
     void reboot();
+#if defined(HELTEC_V4_OLED)
+    concurrency::Lock batteryLevelLock;
+#endif
     // open circuit voltage lookup table
     uint8_t low_voltage_counter;
     uint32_t lastLogTime = 0;
@@ -153,7 +163,6 @@ class Power : public concurrency::OSThread
     // Periodic free-heap logging: time of the last line emitted, and the reading it carried
     uint32_t lastHeapLogTime = 0;
     uint32_t lastHeapLogFree = 0;
-
 #ifdef ARCH_ESP32
     // Get notified when lightsleep begins and ends
     CallbackObserver<Power, void *> lsObserver = CallbackObserver<Power, void *>(this, &Power::beforeLightSleep);
@@ -169,3 +178,14 @@ class Power : public concurrency::OSThread
 void battery_adcEnable();
 
 extern Power *power;
+
+#if defined(HELTEC_V4_OLED)
+/// Return true only when an ordinary Heltec V4 persistence write has a fresh
+/// battery sample at or above the write floor, or an active USB data host.
+/// This deliberately fails closed when the ADC/power object is not ready.
+bool heltecPreferenceStoragePowerIsSafe();
+
+/// Stronger form used by reset/restore paths that can remove the only durable
+/// generation before replacing it.
+bool heltecDestructiveStoragePowerIsSafe();
+#endif

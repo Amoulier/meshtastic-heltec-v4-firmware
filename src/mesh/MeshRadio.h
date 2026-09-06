@@ -5,6 +5,7 @@
 #include "PointerQueue.h"
 #include "configuration.h"
 #include "detect/LoRaRadioType.h"
+#include <cmath>
 
 // Sentinel marking the end of a modem preset array. Declared `const` rather
 // than `constexpr` because the cast from 0xFF to the enum is out-of-range and
@@ -211,6 +212,62 @@ static inline uint16_t clampBandwidthCode(uint16_t bwCode)
     if (bwCode == 0)
         return bwKHzToCode(LORA_BW_DEFAULT_KHZ);
     return bwCode;
+}
+
+/// Check the encoded SX126x bandwidth, preserving exact decimal mappings.
+static inline bool isSx126xBandwidthCode(uint16_t bwCode)
+{
+    switch (bwCode) {
+    case 8:   // 7.8 kHz
+    case 10:  // 10.4 kHz
+    case 16:  // 15.6 kHz
+    case 21:  // 20.8 kHz
+    case 31:  // 31.25 kHz
+    case 42:  // 41.7 kHz
+    case 62:  // 62.5 kHz
+    case 125: // 125 kHz
+    case 250: // 250 kHz
+    case 500: // 500 kHz
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Check the effective center plus occupied half-bandwidth against both edges.
+static inline bool frequencyOccupancyFitsBounds(float centerMHz, float offsetMHz, float bandwidthKHz, float minMHz,
+                                                float maxMHz)
+{
+    if (!std::isfinite(centerMHz) || !std::isfinite(offsetMHz) || !std::isfinite(bandwidthKHz) ||
+        !std::isfinite(minMHz) || !std::isfinite(maxMHz) || bandwidthKHz <= 0.0f || minMHz > maxMHz) {
+        return false;
+    }
+
+    constexpr float FLOAT_EDGE_TOLERANCE_MHZ = 0.0001f; // tolerate sub-kHz float rounding at an exact band edge
+    const float effectiveCenterMHz = centerMHz + offsetMHz;
+    const float halfBandwidthMHz = bandwidthKHz / 2000.0f;
+    return std::isfinite(effectiveCenterMHz) &&
+           effectiveCenterMHz - halfBandwidthMHz >= minMHz - FLOAT_EDGE_TOLERANCE_MHZ &&
+           effectiveCenterMHz + halfBandwidthMHz <= maxMHz + FLOAT_EDGE_TOLERANCE_MHZ;
+}
+
+/// Count only channels whose occupied bandwidth fits completely in the band.
+static inline uint32_t usableFrequencySlotCount(float minMHz, float maxMHz, float bandwidthKHz, float spacingMHz,
+                                                float paddingMHz)
+{
+    if (!std::isfinite(minMHz) || !std::isfinite(maxMHz) || !std::isfinite(bandwidthKHz) ||
+        !std::isfinite(spacingMHz) || !std::isfinite(paddingMHz) || maxMHz <= minMHz || bandwidthKHz <= 0.0f ||
+        spacingMHz < 0.0f || paddingMHz < 0.0f) {
+        return 0;
+    }
+
+    constexpr float FLOAT_EDGE_TOLERANCE_MHZ = 0.0001f;
+    const float bandwidthMHz = bandwidthKHz / 1000.0f;
+    const float slotWidthMHz = bandwidthMHz + spacingMHz + 2.0f * paddingMHz;
+    const float remainingAfterFirstMHz = (maxMHz - minMHz) - (bandwidthMHz + 2.0f * paddingMHz);
+    if (remainingAfterFirstMHz < -FLOAT_EDGE_TOLERANCE_MHZ)
+        return 0;
+    return 1U + static_cast<uint32_t>(std::floor((remainingAfterFirstMHz + FLOAT_EDGE_TOLERANCE_MHZ) / slotWidthMHz));
 }
 
 static inline void modemPresetToParams(meshtastic_Config_LoRaConfig_ModemPreset preset, bool wideLora, float &bwKHz, uint8_t &sf,

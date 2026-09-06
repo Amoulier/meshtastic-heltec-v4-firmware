@@ -1555,7 +1555,8 @@ bool readAndDecrypt(const char *filename, uint8_t *outBuf, size_t outBufSize, si
 #endif
 }
 
-bool encryptAndWrite(const char *filename, const uint8_t *plaintext, size_t plaintextLen, bool fullAtomic)
+bool encryptAndWrite(const char *filename, const uint8_t *plaintext, size_t plaintextLen, bool fullAtomic,
+                     bool requireDestructivePower)
 {
     if (!dekLoaded) {
         LOG_ERROR("EncryptedStorage: Not unlocked");
@@ -1627,7 +1628,7 @@ bool encryptAndWrite(const char *filename, const uint8_t *plaintext, size_t plai
 
     // SafeFile handles remove-before-write (nRF52) and tmp+readback+rename (other platforms).
     // fullAtomic controls whether the old file is kept until the rename succeeds.
-    SafeFile sf(filename, fullAtomic);
+    SafeFile sf(filename, fullAtomic, requireDestructivePower);
 
     uint32_t magic = MAGIC;
     sf.write((uint8_t *)&magic, 4);
