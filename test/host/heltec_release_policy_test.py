@@ -33,6 +33,7 @@ def function_body(source: str, signature: str) -> str:
 
 release = read(".github/workflows/release_heltec_v4_power.yml")
 build = read(".github/workflows/build_firmware.yml")
+build_environment = read("bin/heltec-ci.env")
 
 # Only the two explicit profiles and the documented Solar Router compatibility
 # alias may be concrete PlatformIO environments in this single-target fork.
@@ -200,7 +201,9 @@ for line in release.splitlines() + build.splitlines():
             f"GitHub Action is not SHA-pinned: {match.group(1)}",
         )
 require(
-    re.search(r"ghcr\.io/meshtastic/gh-action-firmware@sha256:[0-9a-f]{64}", build)
+    re.search(
+        r"ghcr\.io/meshtastic/gh-action-firmware@sha256:[0-9a-f]{64}", build_environment
+    )
     is not None,
     "firmware build container is not digest-pinned",
 )
@@ -542,12 +545,16 @@ require(
     "- native-audit" in release, "release does not depend on native integration audit"
 )
 require(
-    "test/host/heltec_audit_regression.py" in build,
+    "bin/heltec-ci.sh" in build
+    and "bin/ci-host-checks.sh" in read("bin/heltec-ci.sh")
+    and "test/host/heltec_audit_regression.py" in read("bin/ci-host-checks.sh"),
     "real-body fault injection is not a build gate",
 )
 audit_workflow = read(".github/workflows/audit_native_heltec.yml")
 require(
-    "run-heltec-native-audit.py" in audit_workflow, "native suites are not executed"
+    "bin/test-native-docker.sh" in audit_workflow
+    and "run-heltec-native-audit.py" in read("bin/test-native-docker.sh"),
+    "native suites are not executed",
 )
 require("continue-on-error" not in audit_workflow, "native audit is allowed to fail")
 print("Heltec V4 release policy: PASS")

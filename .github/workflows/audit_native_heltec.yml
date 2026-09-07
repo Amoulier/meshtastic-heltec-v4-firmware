@@ -19,79 +19,22 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
-      - name: Verify shipped targets before installing a test-only host fixture
-        run: |
-          set -euo pipefail
-          python3 test/host/heltec_release_policy_test.py
-          python3 test/host/heltec_audit_regression.py
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: meshtastic/firmware
-          ref: 7239fe886a30fa13cd35946fa5ae1a46a2807eeb
-          sparse-checkout: |
-            variants/native
-            src/platform/portduino
-          path: _native_fixture
-          persist-credentials: false
-      - name: Install test-only native configuration without replacing fork source
-        run: |
-          set -euo pipefail
-          test "$(git -C _native_fixture rev-parse HEAD)" = 7239fe886a30fa13cd35946fa5ae1a46a2807eeb
-          mkdir -p variants/native
-          cp _native_fixture/variants/native/portduino.ini variants/native/
-          cp -a _native_fixture/variants/native/portduino variants/native/
-          # This fork omits non-Heltec host adapters. Restore only the absent,
-          # pinned CI adapter; never replace any maintained firmware source.
-          test ! -e src/platform/portduino
-          cp -a _native_fixture/src/platform/portduino src/platform/
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          p = Path('variants/native/portduino/platformio.ini')
-          sections = re.split(r'(?=^\[)', p.read_text(), flags=re.M)
-          keep = {'native_base','env:native','env:coverage'}
-          p.write_text(''.join(s for s in sections if s.startswith('[') and s[1:s.index(']')] in keep))
-          p = Path('platformio.ini')
-          text = p.read_text()
-          needle = '\tvariants/esp32s3/heltec_v4/platformio.ini'
-          assert text.count(needle) == 1
-          p.write_text(text.replace(needle, needle + '\n\tvariants/native/portduino.ini\n\tvariants/native/portduino/platformio.ini'))
-          PY
-          cat test/host/heltec_storage_audit.ini >> variants/native/portduino/platformio.ini
-          rm -rf _native_fixture
-      - name: Install native test prerequisites
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y g++ pkg-config libbluetooth-dev libgpiod-dev libyaml-cpp-dev \
-            libjsoncpp-dev libssl-dev libulfius-dev liborcania-dev libusb-1.0-0-dev libi2c-dev \
-            libuv1-dev libcurl4-gnutls-dev libsdl2-dev libbsd-dev
-          python3 -m venv /tmp/heltec-pio
-          /tmp/heltec-pio/bin/pip install platformio==6.1.19
-          echo /tmp/heltec-pio/bin >> "$GITHUB_PATH"
       - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
-          path: |
-            ~/.platformio
-            .pio
-          key: heltec-native-audit-v2-${{ matrix.group }}-${{ runner.os }}-${{ github.sha }}
+          path: ~/.cache/heltec-ci/native-cache
+          key: heltec-native-container-v1-${{ matrix.group }}-${{ runner.os }}-${{ hashFiles('Dockerfile.test', 'test/host/native-requirements.txt') }}-${{ github.sha }}
           restore-keys: |
-            heltec-native-audit-v2-${{ matrix.group }}-${{ runner.os }}-
-            heltec-native-audit-v1-${{ runner.os }}-
-      - name: Run complete required native suites with AddressSanitizer
-        env:
-          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
-        run: python3 bin/run-heltec-native-audit.py --group ${{ matrix.group }}
+            heltec-native-container-v1-${{ matrix.group }}-${{ runner.os }}-${{ hashFiles('Dockerfile.test', 'test/host/native-requirements.txt') }}-
+      - name: Run the shared local and GitHub native environment
+        run: bash bin/test-native-docker.sh --group ${{ matrix.group }}
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: always()
         with:
-          path: |
-            ~/.platformio
-            .pio
-          key: heltec-native-audit-v2-${{ matrix.group }}-${{ runner.os }}-${{ github.sha }}
+          path: ~/.cache/heltec-ci/native-cache
+          key: heltec-native-container-v1-${{ matrix.group }}-${{ runner.os }}-${{ hashFiles('Dockerfile.test', 'test/host/native-requirements.txt') }}-${{ github.sha }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: heltec-native-audit-${{ matrix.group }}-${{ github.sha }}
-          path: audit-results/
+          path: .pio/ci/native/${{ matrix.group }}/
           if-no-files-found: error

@@ -4,7 +4,7 @@
 >
 > |                |                                                                                                                        |
 > | -------------- | ---------------------------------------------------------------------------------------------------------------------- |
-> | Local tests    | `./bin/run-tests.sh` (exit 0 GREEN · 1 RED · 2 AMBER · 3 FILTERED)                                                     |
+> | Local CI       | `bash bin/heltec-ci.sh all` (Windows: `powershell -NoProfile -ExecutionPolicy Bypass -File bin/heltec-ci.ps1 all`)     |
 > | Hardware tests | [meshtastic/meshtastic-mcp](https://github.com/meshtastic/meshtastic-mcp) (`MESHTASTIC_FIRMWARE_ROOT` → this checkout) |
 > | Format         | `trunk fmt`                                                                                                            |
 > | Mirror docs    | `.github/copilot-instructions.md` (canonical) · `AGENTS.md`                                                            |

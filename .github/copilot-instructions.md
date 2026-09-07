@@ -4,7 +4,7 @@
 >
 > |                |                                                                                                                        |
 > | -------------- | ---------------------------------------------------------------------------------------------------------------------- |
-> | Local tests    | `./bin/run-tests.sh` (exit 0 GREEN · 1 RED · 2 AMBER · 3 FILTERED)                                                     |
+> | Local CI       | `bash bin/heltec-ci.sh all` (Windows: `powershell -NoProfile -ExecutionPolicy Bypass -File bin/heltec-ci.ps1 all`)     |
 > | Hardware tests | [meshtastic/meshtastic-mcp](https://github.com/meshtastic/meshtastic-mcp) (`MESHTASTIC_FIRMWARE_ROOT` → this checkout) |
 > | Format         | `trunk fmt`                                                                                                            |
 > | Mirror docs    | `AGENTS.md` (short pointer for agents that don't read this file) · `CLAUDE.md` (Claude Code)                           |
@@ -518,6 +518,8 @@ Key defines in variant.h:
 ## Build System
 
 ### Agent Tooling Baseline
+
+For this Heltec-only fork, validate changes with `bin/heltec-ci.sh all` (or `bin/heltec-ci.ps1 all` on Windows). The same container launchers run in GitHub; `check`, `build-standard`, `build-solar-router`, and `native` select individual stages. Keep the source unchanged during a validation run. Native host adapters are installed only in disposable snapshots by `bin/test-native-docker.sh`.
 
 Mirror counterpart: `AGENTS.md` under **Agent Tooling Baseline**.
 

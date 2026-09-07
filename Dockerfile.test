@@ -1,26 +1,27 @@
-# Lightweight container for running native PlatformIO tests on non-Linux hosts
-FROM python:3.14-slim-trixie
+FROM alpine:3.22.5@sha256:7c8cb692ae09657cbc4a3f3cbd0e8d5a2690ba38386aaaf252dbb060bf5eb2e6 AS certificates
+FROM ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_ROOT_USER_ACTION=ignore
+COPY --from=certificates /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt
 
+# Ubuntu's dated archive fixes transitive system packages as well as direct dependencies.
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install --no-install-recommends -y \
-        g++ git ca-certificates pkg-config \
-        libgpiod-dev libyaml-cpp-dev libjsoncpp-dev libbluetooth-dev libi2c-dev libuv1-dev \
-        libusb-1.0-0-dev libulfius-dev liborcania-dev libssl-dev \
-        libx11-dev libinput-dev libxkbcommon-x11-dev libsqlite3-dev libsdl2-dev \
+RUN echo 'APT::Snapshot "20260906T000000Z";' > /etc/apt/apt.conf.d/50snapshot \
+    && apt-get update --error-on=any && apt-get install --no-install-recommends -y \
+    ca-certificates git python3 python3-venv g++ pkg-config \
+    libbluetooth-dev libgpiod-dev libyaml-cpp-dev libjsoncpp-dev libssl-dev \
+    libulfius-dev liborcania-dev libusb-1.0-0-dev libi2c-dev libuv1-dev \
+    libcurl4-gnutls-dev libsdl2-dev libbsd-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir platformio==6.1.19 \
-        && useradd --create-home --shell /usr/sbin/nologin meshtastic
+    && python3 -m venv /opt/heltec-pio
 
-WORKDIR /firmware
-RUN chown -R meshtastic:meshtastic /firmware
+COPY test/host/native-requirements.txt /opt/native-requirements.txt
+ENV PATH="/opt/heltec-pio/bin:${PATH}"
+ENV PIP_CONSTRAINT=/opt/native-requirements.txt
+RUN pip install --no-cache-dir --requirement /opt/native-requirements.txt \
+    && pip check
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD platformio --version || exit 1
-
-USER meshtastic
-
-# Run tests by default; override with docker run args for specific filters
-CMD ["platformio", "test", "-e", "coverage", "-v"]
+WORKDIR /workspace
+HEALTHCHECK NONE
+CMD ["python3", "bin/run-heltec-native-audit.py", "--group", "shared"]

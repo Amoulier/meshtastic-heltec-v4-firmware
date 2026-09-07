@@ -1,26 +1,30 @@
-// For format details, see https://aka.ms/devcontainer.json. For config options, see the
-// README at: https://github.com/devcontainers/templates/tree/main/src/cpp
 {
-  "name": "Meshtastic Firmware Dev",
-  "build": {
-    "dockerfile": "Dockerfile"
-  },
-  "features": {
-    "ghcr.io/devcontainers/features/python:1": {
-      "installTools": true,
-      "version": "3.14"
-    }
+  "name": "Heltec V4 GitHub Build Environment",
+  "image": "ghcr.io/meshtastic/gh-action-firmware@sha256:f2fbd6fc139c464385b644f507ff6abeb1e20120c1dda063e7eb42d9de392048",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "workspaceFolder": "/workspace",
+  "remoteUser": "root",
+  "overrideCommand": true,
+  "mounts": [
+    "source=heltec-v4-devcontainer-pio,target=/workspace/.pio,type=volume",
+    "source=heltec-v4-devcontainer-core,target=/pio/core,type=volume",
+    "source=heltec-v4-devcontainer-workspace,target=/pio/workspace,type=volume"
+  ],
+  "containerEnv": {
+    "HELTEC_DEVCONTAINER": "1",
+    "PLATFORMIO_BUILD_DIR": "/workspace/.pio/build",
+    "GIT_CONFIG_COUNT": "2",
+    "GIT_CONFIG_KEY_0": "safe.directory",
+    "GIT_CONFIG_VALUE_0": "/workspace",
+    "GIT_CONFIG_KEY_1": "safe.directory",
+    "GIT_CONFIG_VALUE_1": "/workspace/protobufs"
   },
   "customizations": {
     "vscode": {
-      "extensions": [
-        "ms-vscode.cpptools",
-        "Jason2866.esp-decoder",
-        "pioarduino.pioarduino-ide",
-        "Trunk.io"
-      ],
+      "extensions": ["ms-vscode.cpptools", "Jason2866.esp-decoder", "Trunk.io"],
       "unwantedRecommendations": [
         "ms-azuretools.vscode-docker",
+        "pioarduino.pioarduino-ide",
         "platformio.platformio-ide"
       ],
       "settings": {
@@ -28,13 +32,5 @@
       }
     }
   },
-
-  // Use 'forwardPorts' to make a list of ports inside the container available locally.
-  "forwardPorts": [4403],
-
-  // Use "--device=" to make a local device available inside the container.
-  // "runArgs": ["--device=/dev/ttyACM0"],
-
-  // Run commands to prepare the container for use
-  "postCreateCommand": ".devcontainer/setup.sh"
+  "postCreateCommand": ["git", "submodule", "update", "--init", "--recursive"]
 }

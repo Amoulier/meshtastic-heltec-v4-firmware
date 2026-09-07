@@ -2,14 +2,145 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "type": "PlatformIO",
-      "task": "Build",
-      "problemMatcher": ["$platformio"],
+      "label": "Heltec CI: Validate all",
+      "type": "process",
+      "command": "bash",
+      "args": ["bin/heltec-ci.sh", "all"],
+      "windows": {
+        "command": "powershell.exe",
+        "args": [
+          "-NoLogo",
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}/bin/heltec-ci.ps1",
+          "all"
+        ]
+      },
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$gcc"],
       "group": {
         "kind": "build",
         "isDefault": true
       },
-      "label": "PlatformIO: Build"
+      "detail": "Run both firmware builds and native audits in the GitHub containers from the host."
+    },
+    {
+      "label": "Heltec CI: Check environment",
+      "type": "process",
+      "command": "bash",
+      "args": ["bin/heltec-ci.sh", "check"],
+      "windows": {
+        "command": "powershell.exe",
+        "args": [
+          "-NoLogo",
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}/bin/heltec-ci.ps1",
+          "check"
+        ]
+      },
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Heltec CI: Build Standard",
+      "type": "process",
+      "command": "bash",
+      "args": ["bin/heltec-ci.sh", "build-standard"],
+      "windows": {
+        "command": "powershell.exe",
+        "args": [
+          "-NoLogo",
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}/bin/heltec-ci.ps1",
+          "build-standard"
+        ]
+      },
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$gcc"],
+      "group": "build"
+    },
+    {
+      "label": "Heltec CI: Build Solar Router",
+      "type": "process",
+      "command": "bash",
+      "args": ["bin/heltec-ci.sh", "build-solar-router"],
+      "windows": {
+        "command": "powershell.exe",
+        "args": [
+          "-NoLogo",
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}/bin/heltec-ci.ps1",
+          "build-solar-router"
+        ]
+      },
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$gcc"],
+      "group": "build"
+    },
+    {
+      "label": "Heltec CI: Native audit",
+      "type": "process",
+      "command": "bash",
+      "args": ["bin/heltec-ci.sh", "native"],
+      "windows": {
+        "command": "powershell.exe",
+        "args": [
+          "-NoLogo",
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}/bin/heltec-ci.ps1",
+          "native"
+        ]
+      },
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$gcc"],
+      "group": "test"
+    },
+    {
+      "label": "Heltec Devcontainer: Host checks",
+      "type": "process",
+      "command": "bash",
+      "args": ["bin/ci-host-checks.sh"],
+      "options": { "cwd": "/workspace" },
+      "problemMatcher": ["$gcc"],
+      "detail": "Run source checks inside the firmware devcontainer; run full CI from the host."
+    },
+    {
+      "label": "Heltec Devcontainer: Build Standard",
+      "type": "process",
+      "command": "bash",
+      "args": [
+        "-c",
+        "mkdir -p release && exec bash bin/build-esp32.sh heltec-v4-standard"
+      ],
+      "options": { "cwd": "/workspace" },
+      "problemMatcher": ["$gcc"],
+      "group": "build"
+    },
+    {
+      "label": "Heltec Devcontainer: Build Solar Router",
+      "type": "process",
+      "command": "bash",
+      "args": [
+        "-c",
+        "mkdir -p release && exec bash bin/build-esp32.sh heltec-v4-solar-router"
+      ],
+      "options": { "cwd": "/workspace" },
+      "problemMatcher": ["$gcc"],
+      "group": "build"
     }
   ]
 }
