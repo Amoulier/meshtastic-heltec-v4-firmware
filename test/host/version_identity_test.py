@@ -199,6 +199,26 @@ class VersionIdentityTests(unittest.TestCase):
         self.write("main.cpp", "int value = 1;\n")
         self.assertEqual(clean, self.version())
 
+    def test_native_audit_reports_preserve_version_and_compiler_flags(self):
+        self.write(".gitignore", (ROOT / ".gitignore").read_bytes())
+        self.git("add", ".gitignore")
+        self.git("commit", "-qm", "repository ignore rules")
+        before = self.version()
+        initial_env, _ = self.hooks()
+        for name in (
+            "native-preflight.log",
+            "native.log",
+            "native.xml",
+            "native-summary.json",
+        ):
+            self.write("audit-results/" + name, "first suite\n")
+            self.assertEqual(before, self.version())
+            self.write("audit-results/" + name, "first suite\nsecond suite\n")
+            self.assertEqual(before, self.version())
+        final_env, _ = self.hooks()
+        self.assertEqual(initial_env["CCFLAGS"], final_env["CCFLAGS"])
+        self.assertFalse(self.version()["source"]["dirty"])
+
     def test_untracked_source_and_staging_preserve_same_content_identity(self):
         clean = self.version()
         self.write("src/new file.cpp", "int added = 1;\n")
