@@ -111,6 +111,11 @@ jobs:
             --env MT_PLATFORM \
             --env MT_TARGET \
             --env MT_VERBOSE \
+            --env GIT_CONFIG_COUNT=2 \
+            --env GIT_CONFIG_KEY_0=safe.directory \
+            --env GIT_CONFIG_VALUE_0=/workspace \
+            --env GIT_CONFIG_KEY_1=safe.directory \
+            --env GIT_CONFIG_VALUE_1=/workspace/protobufs \
             --volume "$GITHUB_WORKSPACE:/workspace" \
             "$BUILD_IMAGE"
 
