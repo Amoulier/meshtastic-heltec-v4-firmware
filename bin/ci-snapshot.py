@@ -21,6 +21,12 @@ def snapshot(source, destination):
         text=True,
     )
     check_filemode = mode_setting.stdout.strip() != "false"
+    symlink_setting = subprocess.run(
+        ["git", "-C", str(source), "config", "--bool", "core.symlinks"],
+        capture_output=True,
+        text=True,
+    )
+    check_symlinks = symlink_setting.stdout.strip() != "false"
     if destination.exists() and any(destination.iterdir()):
         raise ValueError(f"Snapshot destination must be empty: {destination}")
     subprocess.run(
@@ -89,6 +95,9 @@ def snapshot(source, destination):
     subprocess.run(
         ["git", "-C", str(destination), "config", "core.filemode", "true"], check=True
     )
+    subprocess.run(
+        ["git", "-C", str(destination), "config", "core.symlinks", "true"], check=True
+    )
     entries = {}
     for row in index.split(b"\0"):
         if not row:
@@ -124,6 +133,8 @@ def snapshot(source, destination):
         copied.parent.mkdir(parents=True, exist_ok=True)
         if original.is_symlink():
             copied.symlink_to(os.readlink(original))
+        elif mode == b"120000" and not check_symlinks:
+            copied.symlink_to(os.fsdecode(original.read_bytes()))
         else:
             content = original.read_bytes()
             attrs = attributes.get(name, {})

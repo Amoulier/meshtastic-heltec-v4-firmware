@@ -322,6 +322,69 @@ class SourceSnapshotTests(unittest.TestCase):
             SNAPSHOT.snapshot(self.source, self.destination)
         self.assertEqual(preserved.read_text(), "keep\n")
 
+    def materialize_symlink(self):
+        self.git(self.source, "config", "core.symlinks", "false")
+        self.write(".dockerignore", b".gitignore")
+        oid = (
+            subprocess.check_output(
+                ["git", "-C", str(self.source), "hash-object", "-w", "--stdin"],
+                input=b".gitignore",
+            )
+            .decode()
+            .strip()
+        )
+        self.git(
+            self.source,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"120000,{oid},.dockerignore",
+        )
+        self.git(self.source, "commit", "-qm", "materialized Windows symlink")
+
+    @unittest.skipUnless(os.name == "posix", "Linux snapshot symlink semantics")
+    def test_materialized_windows_symlink_keeps_clean_git_state(self):
+        self.materialize_symlink()
+        self.assertFalse((self.source / ".dockerignore").is_symlink())
+        self.assertEqual(self.git(self.source, "status", "--porcelain"), b"")
+        before = self.assert_snapshot()
+        self.assertFalse(before["source"]["dirty"])
+        copied = self.destination / ".dockerignore"
+        self.assertTrue(copied.is_symlink())
+        self.assertEqual(os.readlink(copied), ".gitignore")
+        self.assertEqual(self.git(self.destination, "status", "--porcelain"), b"")
+
+    @unittest.skipUnless(os.name == "posix", "Linux snapshot symlink semantics")
+    def test_materialized_symlink_preserves_staged_and_working_target_changes(self):
+        self.materialize_symlink()
+        self.write(".dockerignore", b"staged-ignore")
+        self.git(self.source, "add", ".dockerignore")
+        self.write(".dockerignore", b"working-ignore")
+        before = self.assert_snapshot()
+        self.assertTrue(before["source"]["dirty"])
+        copied = self.destination / ".dockerignore"
+        self.assertTrue(copied.is_symlink())
+        self.assertEqual(os.readlink(copied), "working-ignore")
+
+    @unittest.skipUnless(os.name == "posix", "Linux snapshot symlink semantics")
+    def test_real_symlink_replaced_by_regular_file_remains_a_type_change(self):
+        self.git(self.source, "config", "core.symlinks", "true")
+        original = self.source / ".dockerignore"
+        original.symlink_to(".gitignore")
+        self.git(self.source, "add", ".dockerignore")
+        self.git(self.source, "commit", "-qm", "real symlink")
+        original.unlink()
+        self.write(".dockerignore", b"regular replacement\n")
+        before = self.assert_snapshot()
+        self.assertTrue(before["source"]["dirty"])
+        self.assertFalse((self.destination / ".dockerignore").is_symlink())
+        self.assertEqual(
+            (self.destination / ".dockerignore").read_bytes(), b"regular replacement\n"
+        )
+        self.assertIn(
+            b" T .dockerignore", self.git(self.destination, "status", "--porcelain")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
