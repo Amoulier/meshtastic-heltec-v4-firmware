@@ -1,0 +1,49 @@
+name: Heltec pinned upstream comparison
+on:
+  push:
+    branches: [workbench/heltec-upstream-20261014]
+    paths: [.github/workflows/heltec_upstream_snapshot_20261014.yml]
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: f493aab8dbc17137a672c43bf658c5e9aae8df77
+          fetch-depth: 80
+          submodules: recursive
+          persist-credentials: false
+      - name: Fetch exact official comparison history
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = f493aab8dbc17137a672c43bf658c5e9aae8df77
+          git remote add upstream https://github.com/meshtastic/firmware.git
+          git fetch --no-tags --shallow-since=2026-08-20 upstream +660680cea532ec1caf5d5f3e5dd1932c44b1dccd:refs/remotes/upstream/develop
+          test "$(git rev-parse upstream/develop)" = 660680cea532ec1caf5d5f3e5dd1932c44b1dccd
+          mkdir -p /tmp/heltec-comparison
+          git rev-parse HEAD upstream/develop > /tmp/heltec-comparison/refs.txt
+          git submodule status --recursive > /tmp/heltec-comparison/submodules.txt
+          git log --reverse --format='%H %s' fdb67309..upstream/develop > /tmp/heltec-comparison/official-commits.txt
+          git diff --stat fdb67309 upstream/develop > /tmp/heltec-comparison/official-diff-stat.txt
+          git diff --name-only fdb67309 upstream/develop > /tmp/heltec-comparison/official-paths.txt
+          git log --format='%H %s' -12 HEAD > /tmp/heltec-comparison/fork-history.txt
+          cat /tmp/heltec-comparison/refs.txt /tmp/heltec-comparison/fork-history.txt >> "$GITHUB_STEP_SUMMARY"
+          wc -l /tmp/heltec-comparison/official-commits.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive source and public Git objects for offline comparison
+        run: |
+          set -euo pipefail
+          if git config --local --get-regexp 'http\..*extraheader|credential\.|includeif\.'; then
+            echo 'Refusing to export local credential configuration' >&2
+            exit 1
+          fi
+          tar -czf /tmp/heltec-comparison/source-with-history.tar.gz .
+          sha256sum /tmp/heltec-comparison/source-with-history.tar.gz > /tmp/heltec-comparison/SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: heltec-upstream-f493aab8-660680ce
+          path: /tmp/heltec-comparison/
+          if-no-files-found: error
+          retention-days: 30
