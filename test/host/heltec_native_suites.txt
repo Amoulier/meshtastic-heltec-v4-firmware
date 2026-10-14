@@ -37,3 +37,4 @@ test_traffic_management
 test_uptime_clock
 test_throttle
 test_dmshell_recovery
+test_telemetry_payload_fit

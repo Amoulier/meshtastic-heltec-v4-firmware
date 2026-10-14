@@ -663,7 +663,7 @@ Many devices are battery-powered:
 
 ## GitHub Actions CI/CD
 
-The project uses GitHub Actions extensively for CI/CD. Key workflows are in `.github/workflows/`:
+This Heltec-only fork uses `release_heltec_v4_power.yml`, with reusable firmware builds in `build_firmware.yml` and native audits in `audit_native_heltec.yml`. The other workflows described below belong to upstream; they do not expand this fork's supported firmware targets.
 
 ### Core CI Workflows
 
@@ -724,6 +724,8 @@ Most workflows can be triggered manually via `workflow_dispatch` for testing.
 ## Testing
 
 ### Native unit tests (C++)
+
+For this Heltec-only fork, `test/host/heltec_native_suites.txt` defines the required suites, and `bin/run-heltec-native-audit.py` verifies every listed suite and its reported cases. Run them through `bin/heltec-ci.sh all` or its `native` stage. The full-tree discovery and workflow descriptions below document upstream's broader test harness.
 
 Unit tests in `test/` directory. The canonical suite count is detected on the fly: the `test_*` directories under `test/` are the register, and `bin/run-tests.sh` cross-checks the suites that actually ran against them on every full run. **Never state the count as a literal anywhere** - it is whatever `test/test_*` contains right now. In CI, the `suite-shrinkage-check` job (`test_native.yml`) fails a PR that loses a `test_*` directory relative to its merge base unless the suite is named in the PR title, body, or a commit message - deleting a suite therefore requires saying so. The list below is a partial description of what suites cover, not an inventory:
 

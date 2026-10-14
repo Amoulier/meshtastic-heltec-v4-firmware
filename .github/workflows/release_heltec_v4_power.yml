@@ -1,6 +1,9 @@
 name: Build and Release Heltec V4 Profiles
 
 on:
+  pull_request:
+    branches:
+      - "main"
   push:
     branches:
       - "main"
@@ -32,7 +35,7 @@ jobs:
       pio_env: heltec-v4-solar-router
 
   release:
-    if: github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(heltec-v4):')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(heltec-v4):')
     permissions:
       actions: read
       contents: write
