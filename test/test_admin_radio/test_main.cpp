@@ -1303,12 +1303,6 @@ static void test_handleSetHamMode_blankShortNameKeepsTheExistingOne()
 class HamModeMockRouter : public Router
 {
   public:
-    ~HamModeMockRouter()
-    {
-        delete cryptLock; // the Router ctor asserts this is clear, so a later suite
-                          // can construct one
-        cryptLock = nullptr;
-    }
     ErrorCode send(meshtastic_MeshPacket *p) override
     {
         packetPool.release(p);
@@ -1743,6 +1737,8 @@ static meshtastic_Config_SecurityConfig matchingSecurityFixture(uint8_t fill)
     meshtastic_Config_SecurityConfig value = meshtastic_Config_SecurityConfig_init_zero;
     value.private_key.size = 32;
     memset(value.private_key.bytes, fill, 32);
+    value.private_key.bytes[0] &= 0xF8;
+    value.private_key.bytes[31] = (value.private_key.bytes[31] & 0x7F) | 0x40;
     value.public_key.size = 32;
     TEST_ASSERT_TRUE(nodeDB->derivePublicKeyForValidation(value.private_key.bytes, value.public_key.bytes));
     return value;
@@ -1764,9 +1760,8 @@ static void test_handleSetConfig_security_preservesKeypairWhenPrivateOmitted()
     testAdmin->deferSaves();
     TEST_ASSERT_TRUE(testAdmin->handleSetConfig(c, false));
 
-    uint8_t expectedPriv[32];
-    memset(expectedPriv, 0x11, 32);
     const auto expected = matchingSecurityFixture(0x11);
+    const uint8_t *expectedPriv = expected.private_key.bytes;
     const uint8_t *expectedPub = expected.public_key.bytes;
     TEST_ASSERT_EQUAL_UINT(32, config.security.private_key.size);
     TEST_ASSERT_EQUAL_MEMORY(expectedPriv, config.security.private_key.bytes, 32);
@@ -1789,12 +1784,31 @@ static void test_handleSetConfig_security_acceptsSuppliedKeypair()
     testAdmin->deferSaves();
     TEST_ASSERT_TRUE(testAdmin->handleSetConfig(c, false));
 
-    uint8_t expectedPriv[32];
-    memset(expectedPriv, 0x33, 32);
     const auto expected = matchingSecurityFixture(0x33);
+    const uint8_t *expectedPriv = expected.private_key.bytes;
     const uint8_t *expectedPub = expected.public_key.bytes;
     TEST_ASSERT_EQUAL_MEMORY(expectedPriv, config.security.private_key.bytes, 32);
     TEST_ASSERT_EQUAL_MEMORY(expectedPub, config.security.public_key.bytes, 32);
+}
+
+static void test_handleSetConfig_security_normalizesSuppliedPrivateKey()
+{
+    config.security = matchingSecurityFixture(0x11);
+    const auto expected = matchingSecurityFixture(0x33);
+    meshtastic_Config c = meshtastic_Config_init_zero;
+    c.which_payload_variant = meshtastic_Config_security_tag;
+    c.payload_variant.security = expected;
+    memset(c.payload_variant.security.private_key.bytes, 0x33, 32);
+
+    testAdmin->deferSaves();
+    TEST_ASSERT_TRUE(testAdmin->handleSetConfig(c, false));
+
+    TEST_ASSERT_EQUAL_MEMORY(expected.private_key.bytes, config.security.private_key.bytes, 32);
+    TEST_ASSERT_EQUAL_MEMORY(expected.public_key.bytes, config.security.public_key.bytes, 32);
+    TEST_ASSERT_EQUAL_MEMORY(expected.public_key.bytes, owner.public_key.bytes, 32);
+    uint8_t rederivedPublicKey[32];
+    TEST_ASSERT_TRUE(nodeDB->derivePublicKeyForValidation(config.security.private_key.bytes, rederivedPublicKey));
+    TEST_ASSERT_EQUAL_MEMORY(expected.public_key.bytes, rederivedPublicKey, 32);
 }
 
 // Issue #11073: "regenerate keys" sends a blank SecurityConfig holding only the
@@ -1818,12 +1832,15 @@ static void test_handleSetConfig_security_rotationPreservesAdminKeys()
     c.which_payload_variant = meshtastic_Config_security_tag;
     c.payload_variant.security.private_key.size = 32;
     memset(c.payload_variant.security.private_key.bytes, 0x33, 32);
+    // A generated key arrives clamped; an unclamped one would be clamped in place on derivation.
+    c.payload_variant.security.private_key.bytes[0] &= 0xF8;
+    c.payload_variant.security.private_key.bytes[31] = (c.payload_variant.security.private_key.bytes[31] & 0x7F) | 0x40;
+    uint8_t expectedPriv[32];
+    memcpy(expectedPriv, c.payload_variant.security.private_key.bytes, 32);
 
     testAdmin->deferSaves();
     TEST_ASSERT_TRUE(testAdmin->handleSetConfig(c, false));
 
-    uint8_t expectedPriv[32];
-    memset(expectedPriv, 0x33, 32);
     TEST_ASSERT_EQUAL_UINT(32, config.security.private_key.size);
     TEST_ASSERT_EQUAL_MEMORY(expectedPriv, config.security.private_key.bytes, 32);
 
@@ -3369,6 +3386,7 @@ void setup()
     RUN_TEST(test_handleSetConfig_fromLocal_customBandwidthNonZeroPreserved);
     RUN_TEST(test_handleSetConfig_security_preservesKeypairWhenPrivateOmitted);
     RUN_TEST(test_handleSetConfig_security_acceptsSuppliedKeypair);
+    RUN_TEST(test_handleSetConfig_security_normalizesSuppliedPrivateKey);
     RUN_TEST(test_handleSetConfig_security_rotationPreservesAdminKeys);
     RUN_TEST(test_handleSetConfig_security_clearsAdminKeysWhenKeypairUnchanged);
     RUN_TEST(test_handleSetConfig_security_weakBareCandidatePreservesIdentity);

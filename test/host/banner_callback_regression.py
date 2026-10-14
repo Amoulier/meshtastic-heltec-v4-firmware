@@ -43,7 +43,8 @@ const uint8_t bell_alert[] = {0};
 enum Input { INPUT_BROKER_NONE, INPUT_BROKER_UP, INPUT_BROKER_LEFT,
  INPUT_BROKER_ALT_PRESS, INPUT_BROKER_UP_LONG, INPUT_BROKER_DOWN,
  INPUT_BROKER_RIGHT, INPUT_BROKER_USER_PRESS, INPUT_BROKER_DOWN_LONG,
- INPUT_BROKER_SELECT, INPUT_BROKER_CANCEL, INPUT_BROKER_ALT_LONG };
+ INPUT_BROKER_SELECT, INPUT_BROKER_CANCEL, INPUT_BROKER_ALT_LONG, INPUT_BROKER_ANYKEY };
+using input_broker_event = Input;
 struct InputEvent { Input inputEvent = INPUT_BROKER_NONE; char kbchar = 0; };
 enum class ScreenResolution { UltraLow, Low, High };
 ScreenResolution currentResolution = ScreenResolution::Low;
@@ -75,6 +76,7 @@ void updateUiFrame(OLEDDisplayUi *ui) {
 bool isDisplayDisabled() { return false; }
 void setDisplayRailPower(bool) {}
 uint32_t millis() { return 1; }
+namespace Time { uint32_t timerEndsAtMillis(uint32_t delay) { return delay + 1; } }
 struct meshtastic_NodeInfoLite { uint32_t num = 0; char long_name[25] = {}, short_name[5] = {}; };
 bool nodeInfoLiteHasUser(meshtastic_NodeInfoLite *node) { return node != nullptr; }
 struct NodeDB {
@@ -89,12 +91,12 @@ struct OnScreenKeyboardModule {
  void stop(bool) {}
 };
 namespace graphics {
-enum class notificationTypeEnum { none, text_input, text_banner, pairing_pin, selection_picker, node_picker };
+enum class notificationTypeEnum { none, text_input, text_banner, pairing_pin, selection_picker, node_picker, number_picker, hex_picker, alphanumeric_picker };
 @BANNER_OPTIONS@
 struct Screen {
  enum { FOCUS_PRESERVE }; void setFrames(int) {}
  OLEDDisplayUi *ui;
- void showOverlayBanner(BannerOverlayOptions);
+ void showOverlayBanner(const BannerOverlayOptions &);
 };
 bool isCompactPanel(OLEDDisplay *) { return false; }
 int bannerSignalBars = -1;
@@ -119,6 +121,8 @@ public:
  inline static std::function<void(int)> alertBannerCallback;
  inline static bool pauseBanner = false;
  inline static uint32_t numDigits = 0, currentNumber = 0;
+ inline static char alphanumericValue[16] = {};
+ inline static std::function<void(const std::string &)> textInputCallback;
  inline static notificationTypeEnum current_notification_type = notificationTypeEnum::none;
  inline static uint8_t alertBannerLineCount = 0;
  inline static char alertBannerLines[MAX_LINES + 1][64] = {};
@@ -129,6 +133,7 @@ public:
  static void resetBanner();
  static void drawAlertBannerOverlay(OLEDDisplay *, OLEDDisplayUiState *);
  static void drawNodePicker(OLEDDisplay *, OLEDDisplayUiState *);
+ static void drawCharPicker(OLEDDisplay *, OLEDDisplayUiState *);
  static void drawBannercallback(OLEDDisplay *d, OLEDDisplayUiState *s) { drawAlertBannerOverlay(d, s); }
  @BOX_DECLARATION@
 };
@@ -406,7 +411,57 @@ void testReentrantNodeCallback() {
  assert(Banner::alertBannerMessage[0] == '\0');
 }
 
+
+void testCharacterPickers() {
+ for (auto mode : {notificationTypeEnum::number_picker, notificationTypeEnum::hex_picker}) {
+  Banner::resetBanner();
+  Banner::current_notification_type = mode;
+  Banner::numDigits = 3;
+  Banner::currentNumber = mode == notificationTypeEnum::number_picker ? 123 : 0xABC;
+  Banner::curSelected = -1;
+  std::strcpy(Banner::alertBannerMessage, "Enter value");
+  Banner::drawCharPicker(&display, &state);
+  assert(Banner::curSelected == 0);
+  Banner::inEvent.inputEvent = INPUT_BROKER_LEFT;
+  Banner::drawCharPicker(&display, &state);
+  assert(Banner::curSelected == 0);
+  Banner::curSelected = 2;
+  int result = -1;
+  auto lifetime = std::make_shared<int>(42);
+  std::weak_ptr<int> retained = lifetime;
+  Banner::alertBannerCallback = [&, lifetime](int selected) {
+   result = selected;
+   assert(Banner::inEvent.inputEvent == INPUT_BROKER_NONE);
+   assert(!Banner::alertBannerCallback);
+   assert(!retained.expired());
+   openMenu(options, 2, 1);
+   Banner::alertBannerCallback = [](int) {};
+  };
+  lifetime.reset();
+  Banner::inEvent.inputEvent = INPUT_BROKER_SELECT;
+  Banner::drawCharPicker(&display, &state);
+  assert(result == (mode == notificationTypeEnum::number_picker ? 123 : 0xABC));
+  assert(retained.expired());
+  assert(Banner::alertBannerCallback);
+  assert(Banner::current_notification_type == notificationTypeEnum::selection_picker);
+ }
+ Banner::resetBanner();
+ Banner::current_notification_type = notificationTypeEnum::alphanumeric_picker;
+ Banner::numDigits = 3;
+ std::strcpy(Banner::alphanumericValue, "ABC");
+ std::strcpy(Banner::alertBannerMessage, "Initials");
+ Banner::curSelected = 2;
+ std::string received;
+ Banner::textInputCallback = [&](const std::string &value) { received = value; openMenu(options, 2); };
+ Banner::inEvent.inputEvent = INPUT_BROKER_ANYKEY;
+ Banner::inEvent.kbchar = 'z';
+ Banner::drawCharPicker(&display, &state);
+ assert(received == "ABZ");
+ assert(Banner::current_notification_type == notificationTypeEnum::selection_picker);
+}
+
 int main() {
+ testCharacterPickers();
  testReentrantCallbacks();
  testReentrantNodeCallback();
  for (auto resolution : {ScreenResolution::Low, ScreenResolution::High}) {
@@ -444,7 +499,9 @@ def main():
     methods = "\n".join(
         function_body(source, signature)
         for signature in (
+            "static uint16_t splitBannerMessageLines(",
             "void NotificationRenderer::resetBanner()",
+            "void NotificationRenderer::drawCharPicker(",
             "void NotificationRenderer::drawAlertBannerOverlay(",
             "void NotificationRenderer::drawNodePicker(",
             "void NotificationRenderer::drawNotificationBox(",

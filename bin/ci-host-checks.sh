@@ -29,6 +29,8 @@ done <"$scratch/sources"
 test "${#sources[@]}" -gt 0
 bash bin/lint-ifdef-complexity.sh "${sources[@]}"
 bash bin/lint-node-id-format.sh "${sources[@]}"
+bash bin/lint-unset-sentinel-millis.sh "${sources[@]}"
+bash bin/test-lint-unset-sentinel-millis.sh
 bash bin/lint-unity-exit.sh test/host/deep_sleep_policy_test.cpp
 bash bin/test-lint-unity-exit.sh
 echo 'Host checks: PASS'

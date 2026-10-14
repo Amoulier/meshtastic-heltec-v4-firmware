@@ -17,6 +17,12 @@ void cpuDeepSleep(uint32_t msecToWake, DeepSleepWakePolicy wakePolicy, bool radi
 #include "esp_sleep.h"
 esp_sleep_wakeup_cause_t doLightSleep(uint64_t msecToWake);
 
+/// True while a USB host has the hardware USB-serial/JTAG console open. Light sleep powers the USJ
+/// pad down for its duration, so sleeping under a host costs the port until the board is power
+/// cycled - see lsIdle(). Always false on a target with no USJ console, or when the PHY is routed
+/// to TinyUSB instead.
+bool usbConsoleHostAttached();
+
 extern esp_sleep_source_t wakeCause;
 #endif
 

@@ -23,3 +23,17 @@ test_packet_signing
 test_crypto
 test_channel_keys
 test_waypoint_expiry
+test_ack_proof
+test_admin_keys
+test_low_battery_shutdown
+test_nodedb_lora_slot
+test_nodedb_save_retry
+test_nodeinfo_send_window
+test_notified_worker_thread
+test_radiolib_drivers
+test_rebroadcast_mode
+test_packet_history
+test_traffic_management
+test_uptime_clock
+test_throttle
+test_dmshell_recovery

@@ -439,11 +439,9 @@ bool WaypointStore::clearAllWaypoints(bool requireDestructivePower)
 {
 #if defined(HELTEC_V4_OLED)
     const auto storagePowerIsSafe = [requireDestructivePower]() {
-        return requireDestructivePower ? heltecDestructiveStoragePowerIsSafe()
-                                       : heltecPreferenceStoragePowerIsSafe();
+        return requireDestructivePower ? heltecDestructiveStoragePowerIsSafe() : heltecPreferenceStoragePowerIsSafe();
     };
-    if (nodeDB && nodeDB->isDestructiveStorageMutationActive() &&
-        !nodeDB->isDestructiveStorageMutationOwnerCurrentTask())
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive() && !nodeDB->isDestructiveStorageMutationOwnerCurrentTask())
         return false;
     if (!storagePowerIsSafe()) {
         LOG_WARN("WaypointStore: refusing clear while fresh power is unsafe");
@@ -459,8 +457,7 @@ bool WaypointStore::clearAllWaypoints(bool requireDestructivePower)
 #if defined(HELTEC_V4_OLED)
         // A clear queued immediately before factory reset must not slip past the
         // reset's one-shot drain. The destructive owner is the sole exception.
-        if (nodeDB && nodeDB->isDestructiveStorageMutationActive() &&
-            !nodeDB->isDestructiveStorageMutationOwnerCurrentTask())
+        if (nodeDB && nodeDB->isDestructiveStorageMutationActive() && !nodeDB->isDestructiveStorageMutationOwnerCurrentTask())
             return false;
         if (!storagePowerIsSafe()) {
             LOG_WARN("WaypointStore: refusing clear after wait because fresh power is unsafe");
@@ -477,15 +474,22 @@ bool WaypointStore::clearAllWaypoints(bool requireDestructivePower)
         }
 
 #if ENABLE_WAYPOINT_PERSISTENCE && defined(FSCom)
-        SafeFile f(WAYPOINT_STORE_FILENAME, WAYPOINT_STORE_FULL_ATOMIC, requireDestructivePower);
+        bool onFlash;
         {
             concurrency::LockGuard guard(spiLock);
-            const uint8_t version = WAYPOINT_STORE_VERSION;
-            const uint8_t count = 0;
-            stored = f.write(&version, 1) == 1;
-            stored = (f.write(&count, 1) == 1) && stored;
+            onFlash = FSCom.exists(WAYPOINT_STORE_FILENAME);
         }
-        stored = f.close() && stored;
+        if (onFlash) {
+            SafeFile f(WAYPOINT_STORE_FILENAME, WAYPOINT_STORE_FULL_ATOMIC, requireDestructivePower);
+            {
+                concurrency::LockGuard guard(spiLock);
+                const uint8_t version = WAYPOINT_STORE_VERSION;
+                const uint8_t count = 0;
+                stored = f.write(&version, 1) == 1;
+                stored = (f.write(&count, 1) == 1) && stored;
+            }
+            stored = f.close() && stored;
+        }
 #endif
 
         {

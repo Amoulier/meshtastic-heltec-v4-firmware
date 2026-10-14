@@ -1,8 +1,8 @@
 #pragma once
 
 #include "FloodingRouter.h"
+#include <map>
 #include <optional>
-#include <unordered_map>
 
 /**
  * An identifier for a globally unique message - a pair of the sending nodenum and the packet id assigned
@@ -13,6 +13,7 @@ struct GlobalPacketId {
     PacketId id;
 
     bool operator==(const GlobalPacketId &p) const { return node == p.node && id == p.id; }
+    bool operator<(const GlobalPacketId &p) const { return node != p.node ? node < p.node : id < p.id; }
 
     explicit GlobalPacketId(const meshtastic_MeshPacket *p)
     {
@@ -75,12 +76,6 @@ struct RouteHealth {
 #define NEXTHOP_EARLY_FLOOD_ON_UNVERIFIED 0
 #endif
 
-class GlobalPacketIdHashFunction
-{
-  public:
-    size_t operator()(const GlobalPacketId &p) const { return (std::hash<NodeNum>()(p.node)) ^ (std::hash<PacketId>()(p.id)); }
-};
-
 /*
   Router for direct messages, which only relays if it is the next hop for a packet. The next hop is set by the current
   relayer of a packet, which bases this on information from a previous successful delivery to the destination via flooding.
@@ -107,17 +102,7 @@ class NextHopRouter : public FloodingRouter
     virtual ErrorCode send(meshtastic_MeshPacket *p) override;
 
     /** Do our retransmission handling */
-    virtual int32_t runOnce() override
-    {
-        // Note: We must doRetransmissions FIRST, because it might queue up work for the base class runOnce implementation
-        doRetransmissions();
-
-        int32_t r = FloodingRouter::runOnce();
-
-        // Also after calling runOnce there might be new packets to retransmit
-        auto d = doRetransmissions();
-        return min(d, r);
-    }
+    int32_t runOnce() override;
 
     // Total attempts for directed hop-level delivery, including the initial send.
     constexpr static uint8_t NUM_INTERMEDIATE_RETX = 3;
@@ -134,10 +119,12 @@ class NextHopRouter : public FloodingRouter
     constexpr static uint8_t OPAQUE_SEEN_MAX = 32; // opaque-relay dedup slots (see relayOpaquePacket); ~8B/slot -> ~256B
 
   protected:
+    int32_t getIdleInterval() const override;
+
     /**
      * Pending retransmissions
      */
-    std::unordered_map<GlobalPacketId, PendingPacket, GlobalPacketIdHashFunction> pending;
+    std::map<GlobalPacketId, PendingPacket> pending; // std::map keeps the libstdc++ hashtable out of small images
 
     /**
      * Per-destination route health (M3). Bounded array, reuse-oldest eviction. RAM-only.

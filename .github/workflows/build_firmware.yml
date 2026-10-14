@@ -73,6 +73,8 @@ jobs:
             release/*.mt.json
             release/*.bin
             release/*.elf
+            release/*.ld
+            release/*.map
             release/*.uf2
             release/*.hex
             release/*.zip

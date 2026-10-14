@@ -276,10 +276,10 @@ The fork is periodically audited and synchronized with the official Meshtastic `
 The common source base incorporates official Meshtastic changes through:
 
 ```text
-7239fe886a30fa13cd35946fa5ae1a46a2807eeb
+660680cea532ec1caf5d5f3e5dd1932c44b1dccd
 ```
 
-It also includes selected, audited stability backports from later `develop` history through `fdb67309aa8fb9a019e07160ac72024c3d25ce2d`: filesystem allocation safety, administrative BLE handling, muted-notification behavior, radio state-loss recovery, GPS search-cycle retention, and legacy low-entropy PKI rejection. This remains a 2.8.0-based selective backport and does not claim full synchronization with the in-development 2.8.1 source line.
+The development tree uses the 2.8.2 source line with the Heltec V4 Standard and Solar Router policies retained. Native integration tests use platform adapters from the same upstream commit. The published `v2.8.0.9` package described above remains a separate, older release; this synchronization does not publish firmware.
 
 Because this is a standalone repository rather than a formal GitHub fork, the exact upstream source commit is recorded in synchronization commits and release notes.
 

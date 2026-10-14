@@ -15,8 +15,8 @@ os.chdir(root)
 report = root / "audit-results"
 report.mkdir(exist_ok=True)
 suites = (root / "test/host/heltec_native_suites.txt").read_text().split()
-if len(suites) != 25 or len(suites) != len(set(suites)):
-    raise SystemExit("Expected the complete audited set of 25 distinct native suites")
+if not suites or len(suites) != len(set(suites)):
+    raise SystemExit("Expected a nonempty manifest of distinct required native suites")
 for suite in suites:
     if not (root / "test" / suite).is_dir():
         raise SystemExit(f"Missing required suite: {suite}")
@@ -26,10 +26,11 @@ group = parser.parse_args().group
 # Run each whole suite once, with the storage suite on the exact board-independent
 # Heltec persistence policy. ESP32 GPIO/NVS/timing remain hardware-only checks.
 storage_suites = {"test_nodedb_boot_recovery"}
+if not storage_suites.issubset(suites):
+    raise SystemExit("Missing required storage audit suites")
 suites = [s for s in suites if (s in storage_suites) == (group == "storage")]
-expected_count = 1 if group == "storage" else 24
-if len(suites) != expected_count:
-    raise SystemExit("Incomplete required native audit group")
+if not suites:
+    raise SystemExit("Empty required native audit group")
 environment = "coverage-storage" if group == "storage" else "coverage"
 xml = report / "native.xml"
 xml.unlink(missing_ok=True)
@@ -37,7 +38,7 @@ args = ["pio", "test", "-e", environment, "-v", "--junit-output-path", str(xml)]
 for suite in suites:
     args += ["-f", suite]
 # Compile one complete suite first, so a broken host adapter fails once rather
-# than repeating the same compilation error 25 times. This does not count as a
+# than repeating the same compilation error for every suite. This does not count as a
 # test pass: every suite is still built and executed by the full command below.
 smoke = ["pio", "test", "-e", environment, "-f", suites[0], "--without-testing", "-v"]
 with (report / "native-preflight.log").open("w") as log:

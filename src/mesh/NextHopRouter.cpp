@@ -26,15 +26,58 @@ static void capEventRelayHops(meshtastic_MeshPacket *packet)
 
 NextHopRouter::NextHopRouter() {}
 
+int32_t NextHopRouter::runOnce()
+{
+#if defined(HELTEC_V4_OLED)
+    setInterval(250);
+    NodeDB::ExternalStateAccessScope stateAccess(nodeDB);
+    if (!stateAccess || (nodeDB && (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive())))
+        return RUN_SAME;
+#endif
+    doRetransmissions();
+    FloodingRouter::runOnce();
+#if defined(HELTEC_V4_OLED)
+    if (nodeDB && (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive()))
+        return RUN_SAME;
+#endif
+    doRetransmissions();
+    // Router installed the retry deadline before draining RX; keep any later interval-0 wake.
+    return RUN_SAME;
+}
+
+int32_t NextHopRouter::getIdleInterval() const
+{
+    const uint32_t now = Time::getMillis();
+    int32_t delay = INT32_MAX;
+    for (const auto &entry : pending) {
+        if (Throttle::deadlinePassedAt(now, entry.second.nextTxMsec))
+            return 0;
+        delay = min(delay, static_cast<int32_t>(entry.second.nextTxMsec - now));
+    }
+    return delay;
+}
+
 bool NextHopRouter::relayOpaquePacket(const meshtastic_MeshPacket *p)
 {
-    // Opaque traffic is never admitted to PacketHistory, NodeDB, modules, phone, MQTT, or ACK
-    // handling. Relay only from the immutable outer routing header and let hop exhaustion bound it.
+    // Opaque traffic never reaches PacketHistory, NodeDB, modules, phone, or ACK handling (a PKI DM still
+    // goes to MQTT). Relay only from the immutable outer routing header and let hop exhaustion bound it.
     const auto mode = config.device.rebroadcast_mode;
     if (!iface || isToUs(p) || isFromUs(p) || p->id == 0 || p->hop_limit == 0 || !isRebroadcaster() || owner.is_licensed ||
         !IS_ONE_OF(mode, meshtastic_Config_DeviceConfig_RebroadcastMode_ALL,
-                   meshtastic_Config_DeviceConfig_RebroadcastMode_ALL_SKIP_DECODING) ||
+                   meshtastic_Config_DeviceConfig_RebroadcastMode_ALL_SKIP_DECODING,
+                   meshtastic_Config_DeviceConfig_RebroadcastMode_CORE_PORTNUMS_ONLY,
+                   meshtastic_Config_DeviceConfig_RebroadcastMode_LOCAL_ONLY,
+                   meshtastic_Config_DeviceConfig_RebroadcastMode_KNOWN_ONLY) ||
         (p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop != nodeDB->getLastByteOfNodeNum(getNodeNum())))
+        return false;
+
+    // LOCAL_ONLY and KNOWN_ONLY gate on identity, and the only opaque frame carrying its parties in
+    // the header is a PKI-shaped unicast: relay one just when a party is known, which is the rule
+    // RoutingModule applied before opaque frames stopped reaching modules.
+    if (IS_ONE_OF(mode, meshtastic_Config_DeviceConfig_RebroadcastMode_LOCAL_ONLY,
+                  meshtastic_Config_DeviceConfig_RebroadcastMode_KNOWN_ONLY) &&
+        !(p->channel == 0 && !isBroadcast(p->to) &&
+          (nodeInfoLiteHasUser(nodeDB->getMeshNode(p->from)) || nodeInfoLiteHasUser(nodeDB->getMeshNode(p->to)))))
         return false;
 
     // Dedup opaque relays. Opaque frames deliberately never enter PacketHistory (so unauthenticated
@@ -201,7 +244,7 @@ void NextHopRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtast
                                  p->relay_node, wasAlreadyRelayer, weWereSoleRelayer);
                         origTx->next_hop = p->relay_node;
                     }
-                    noteRouteLearned(p->from, p->relay_node, millis()); // M3: anchor freshness (hot or overflow route)
+                    noteRouteLearned(p->from, p->relay_node, Time::stampMillis()); // M3: anchor freshness (hot or overflow route)
 #if HAS_TRAFFIC_MANAGEMENT
                     // Mirror the confirmed (and now unique-resolved) hop into the TMM overflow cache so it
                     // survives even when the source isn't (or is no longer) in the hot NodeDB.
@@ -313,7 +356,7 @@ std::optional<uint8_t> NextHopRouter::getNextHop(NodeNum to, uint8_t relay_node)
         // a health record that still matches the stored byte; a next_hop set by another path (e.g.
         // TraceRouteModule) with no matching record is left authoritative.
         const RouteHealth *h = findRouteHealth(to);
-        if (h && h->lastNextHop == node->next_hop && isRouteStale(*h, millis())) {
+        if (h && h->lastNextHop == node->next_hop && isRouteStale(*h, Time::stampMillis())) {
             LOG_INFO("Next hop 0x%x for 0x%08x stale (age/fails); flood and clear", node->next_hop, to);
             node->next_hop = NO_NEXT_HOP_PREFERENCE; // clear persisted route
             clearRouteHealth(to);                    // clear RAM health
@@ -345,7 +388,7 @@ std::optional<uint8_t> NextHopRouter::getNextHop(NodeNum to, uint8_t relay_node)
         uint8_t hint = trafficManagementModule->getNextHopHint(to);
         if (hint && hint != relay_node) {
             const RouteHealth *h = findRouteHealth(to);
-            if (h && h->lastNextHop == hint && isRouteStale(*h, millis())) {
+            if (h && h->lastNextHop == hint && isRouteStale(*h, Time::stampMillis())) {
                 LOG_INFO("TMM next hop 0x%x for 0x%08x stale (age/fails); flood and clear", hint, to);
                 trafficManagementModule->clearNextHop(to); // clear overflow route (setNextHop won't store 0)
                 clearRouteHealth(to);                      // clear RAM health
@@ -444,7 +487,7 @@ int32_t NextHopRouter::doRetransmissions()
 {
     // Same clock Throttle reads, so setNextTx() deadlines and this test can't diverge under an
     // injected test clock.
-    uint32_t now = Time::getMillis();
+    uint32_t now = Time::stampMillis();
     int32_t d = INT32_MAX;
 
     // FIXME, we should use a better datastructure rather than walking through this map.
@@ -459,19 +502,20 @@ int32_t NextHopRouter::doRetransmissions()
         // can't stall retransmission.
         if (Throttle::deadlinePassedAt(now, p.nextTxMsec)) {
             if (p.numRetransmissions == 0) {
+                const GlobalPacketId expiredKey = it->first;
                 if (isFromUs(p.packet)) {
                     if (p.mqttImplicitAckSeen) {
                         LOG_DEBUG("LoRa retries exhausted after MQTT implicit ACK, omit contradictory NAK id=0x%08x",
                                   p.packet->id);
                     } else {
-                        LOG_DEBUG("Reliable send failed, return nak fr=0x%08x,to=0x%08x,id=0x%08x", p.packet->from,
-                                  p.packet->to, p.packet->id);
+                        LOG_DEBUG("Reliable send failed, return nak fr=0x%08x,to=0x%08x,id=0x%08x", p.packet->from, p.packet->to,
+                                  p.packet->id);
                         sendAckNak(meshtastic_Routing_Error_MAX_RETRANSMIT, getFrom(p.packet), p.packet->id, p.packet->channel);
                     }
                 }
                 // Remove the completed record directly. A generated NAK is also processed locally, but an MQTT-confirmed
                 // packet intentionally has no terminal NAK to drive that path.
-                stopRetransmission(it->first);
+                stopRetransmission(expiredKey);
                 stillValid = false; // just deleted it
             } else {
                 LOG_DEBUG("Send retransmission fr=0x%08x,to=0x%08x,id=0x%08x, tries left=%d", p.packet->from, p.packet->to,
@@ -623,7 +667,8 @@ void NextHopRouter::noteRouteLearned(NodeNum dest, uint8_t nextHop, uint32_t now
         h->lastNextHop = nextHop;
         h->consecutiveFailures = 0;
     }
-    h->learnedAtMsec = now ? now : 1;
+    // `now` is a parameter, so guard at the store too: 0 is the empty-slot marker.
+    h->learnedAtMsec = Time::skipZero(now);
 }
 
 void NextHopRouter::noteRouteSuccess(NodeNum dest, uint32_t now)
@@ -632,7 +677,7 @@ void NextHopRouter::noteRouteSuccess(NodeNum dest, uint32_t now)
     if (!h)
         return; // only routes we actually learned have health to refresh
     h->consecutiveFailures = 0;
-    h->learnedAtMsec = now ? now : 1;
+    h->learnedAtMsec = Time::skipZero(now); // a parameter, so guard at the store too
 }
 
 void NextHopRouter::noteRouteFailure(NodeNum dest)

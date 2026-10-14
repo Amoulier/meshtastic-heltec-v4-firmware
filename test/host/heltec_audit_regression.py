@@ -73,17 +73,22 @@ sx_prefix = r"""
 #include "power/DeepSleepPolicy.h"
 #define HAS_LORA_FEM 1
 #define LOG_DEBUG(...) ((void)0)
+#define LOG_DEBUG_RADIO(...) ((void)0)
 #define LOG_ERROR(...) ((void)0)
-constexpr int RADIOLIB_ERR_NONE=0;
+constexpr int RADIOLIB_ERR_NONE=0, RADIOLIB_ERR_SPI_CMD_TIMEOUT=-705;
+constexpr int TRANSMIT_DELAY_COMPLETED=3;
 struct FEM { int slept=0; void setSleepModeEnable(){++slept;} void setTxModeEnable(){} void setRxModeEnable(){} } loraFEMInterface;
-struct RadioLibInterface { void setStandby(){} void configHardwareForSend(){} };
+struct RadioLibInterface {
+ struct RadioSequence { explicit RadioSequence(RadioLibInterface*) {} ~RadioSequence() {} };
+ void setStandby(){} void configHardwareForSend(){}
+};
 struct Chip { int standbyResult=0, sleepResult=0, standbyCalls=0, sleepCalls=0;
  int standby(){++standbyCalls; return standbyResult;} int sleep(bool){++sleepCalls; return sleepResult;} };
 template<class T> struct SX126xInterface: RadioLibInterface {
  std::atomic<bool> radioHardwareParked{false}, radioSleepConfirmed{false};
  std::atomic<uint32_t> configHeaderDetectedAt{0};
- bool isReceiving=false; int activeReceiveStart=0; T lora; int aborts=0;
- void disableInterrupt(){} void abortSending(){++aborts;} void checkNotification(){}
+ bool isReceiving=false, rxArmedContinuous=false, cadParamsValid=false; int activeReceiveStart=0; T lora; int aborts=0;
+ void disableInterrupt(){} void abortSending(){++aborts;} void checkNotificationExcept(int){}
  void parkRadioHardware(); bool sleep(); int16_t trySetStandby();
  void configHardwareForSend(); void setTransmitEnable(bool txon);
 };
@@ -242,18 +247,67 @@ for m in re.finditer(
     r"radioHardwareParked\.store\(false, std::memory_order_release\)", sx
 ):
     assert "radioSleepConfirmed.store(false" in sx[max(0, m.start() - 100) : m.start()]
-for path in [
-    "src/graphics/Screen.cpp",
-    "src/graphics/Screen.h",
-    "src/graphics/draw/MessageRenderer.cpp",
-]:
-    text = (ROOT / path).read_text()
-    assert "textMessageFrameShown" not in text and "isTextMessageFrameShown" not in text
-assert (
-    "std::atomic<bool> displayDisabled" in (ROOT / "src/graphics/Screen.h").read_text()
+screen_header = (ROOT / "src/graphics/Screen.h").read_text()
+assert "std::atomic<bool> textMessageFrameShown" in screen_header
+assert "std::atomic<bool> displayDisabled" in screen_header
+snapshot_reader = body(
+    "src/graphics/Screen.cpp", "bool Screen::isTextMessageFrameShown()"
 )
-assert "getMinFreeHeap" not in (ROOT / "src/memGet.h").read_text()
-assert "getMaxAllocHeap" not in (ROOT / "src/memGet.h").read_text()
+assert (
+    "textMessageFrameShown.load()" in snapshot_reader
+    and "getUiState" not in snapshot_reader
+)
+power_off = body("src/graphics/Screen.cpp", "void Screen::handleSetOn(")
+assert power_off.index("textMessageFrameShown = false") < power_off.index(
+    "enabled = false"
+)
+screen_run = body("src/graphics/Screen.cpp", "int32_t Screen::runOnce()")
+disabled = screen_run.index("if (isDisplayDisabled())")
+assert (
+    "textMessageFrameShown = false"
+    in screen_run[disabled : screen_run.index("return RUN_SAME", disabled)]
+)
+message_received = body(
+    "src/graphics/draw/MessageRenderer.cpp", "void handleNewMessage("
+)
+assert "screen->isTextMessageFrameShown()" in message_received
+assert (
+    "shouldWakeOnReceivedMessage()" in message_received
+    and "getUiState" not in message_received
+)
+
+wake_prefix = r"""
+#include <cassert>
+#define IS_ONE_OF(value, a, b, c, d) ((value)==(a)||(value)==(b)||(value)==(c)||(value)==(d))
+enum {meshtastic_Config_DeviceConfig_Role_CLIENT, meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE,
+ meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN, meshtastic_Config_DeviceConfig_Role_CLIENT_BASE, ROUTER};
+struct ScreenStub { bool disabled=false; bool isDisplayDisabled() {return disabled;} } screenState;
+ScreenStub* screen=&screenState;
+struct { struct { bool enabled=false; } external_notification; } moduleConfig;
+struct { struct { int role=meshtastic_Config_DeviceConfig_Role_CLIENT; } device; } config;
+struct PowerStatusStub { int battery=100; int getBatteryChargePercent() {return battery;} } powerState;
+PowerStatusStub* powerStatus=&powerState;
+"""
+wake_tests = r"""
+int main() {
+ assert(shouldWakeOnReceivedMessage());
+ screenState.disabled=true; assert(!shouldWakeOnReceivedMessage());
+ screenState.disabled=false; assert(shouldWakeOnReceivedMessage());
+ moduleConfig.external_notification.enabled=true; assert(!shouldWakeOnReceivedMessage());
+ moduleConfig.external_notification.enabled=false;
+ config.device.role=ROUTER; assert(!shouldWakeOnReceivedMessage());
+ config.device.role=meshtastic_Config_DeviceConfig_Role_CLIENT;
+ powerState.battery=9; assert(!shouldWakeOnReceivedMessage());
+ powerState.battery=10; assert(shouldWakeOnReceivedMessage());
+}
+"""
+build_run(
+    "heltec_display_wake",
+    wake_prefix
+    + body("src/graphics/Screen.cpp", "bool shouldWakeOnReceivedMessage()")
+    + wake_tests,
+    ("-DHELTEC_V4_OLED=1",),
+)
 admin = (ROOT / "src/modules/AdminModule.cpp").read_text()
 reject = admin.index("sendWarning(LOW_ENTROPY_REJECT_WARNING)")
 mutate = admin.index("config.security = incoming;", reject)
@@ -272,4 +326,8 @@ subprocess.run(
 )
 subprocess.run(
     [sys.executable, str(ROOT / "test/host/radio_quiesce_regression.py")], check=True
+)
+subprocess.run(
+    [sys.executable, str(ROOT / "test/host/router_retry_scheduling_regression.py")],
+    check=True,
 )

@@ -12,6 +12,7 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "PowerMon.h"
+#include "UptimeClock.h"
 #include "configuration.h"
 #include "graphics/Screen.h"
 #include "main.h"
@@ -29,7 +30,7 @@
 #endif
 #if MESHTASTIC_EXCLUDE_POWER_FSM
 FakeFsm powerFSM;
-void PowerFSM_setup(){};
+void PowerFSM_setup() {};
 #else
 /// Should we behave as if we have AC power now?
 static bool isPowered()
@@ -113,7 +114,7 @@ extern Power *power;
 static void shutdownEnter()
 {
     LOG_POWERFSM("State: SHUTDOWN");
-    shutdownAtMsec = millis();
+    shutdownAtMsec = Time::skipZero(Time::getMillis());
 }
 
 #include "error.h"
@@ -139,8 +140,14 @@ static void lsIdle()
 
     // Do we have more sleeping to do?
     if (secsSlept < config.power.ls_secs) {
+        // A USB host with the console open cannot survive a light sleep. No shipping chip keeps the
+        // USB-serial/JTAG pad alive across one, and we surface for only 100 ms between 30 s chunks -
+        // far too short for the host to re-enumerate. It gives up, and nothing on this side can ask
+        // it to try again, so the port stays gone until the board is power cycled. Veto the sleep
+        // while a host is there, like the preflight veto below; a node on a battery or a charger
+        // still sleeps.
         // If some other service would stall sleep, don't let sleep happen yet
-        if (doPreflightSleep()) {
+        if (!usbConsoleHostAttached() && doPreflightSleep()) {
             // Briefly come out of sleep long enough to blink the led once every few seconds
             uint32_t sleepTime = SLEEP_TIME;
 
@@ -176,6 +183,13 @@ static void lsIdle()
                 if (pressed) {
                     powerFSM.trigger(EVENT_PRESS);
                 }
+#ifdef MOTION_WAKE_INT_PIN
+                // Not the button: the accelerometer can have raised the line instead.
+                else if (config.display.wake_on_tap_or_motion &&
+                         digitalRead(MOTION_WAKE_INT_PIN) == (MOTION_WAKE_INT_ACTIVE_HIGH ? HIGH : LOW)) {
+                    powerFSM.trigger(EVENT_INPUT);
+                }
+#endif
                 break;
             }
             default:
@@ -185,6 +199,17 @@ static void lsIdle()
                 break;
             }
         } else {
+            // Say why once per stay in LS, so "power saving does nothing while it is plugged in" is
+            // answerable from a log rather than from this comment.
+            static bool loggedUsbVeto = false;
+            if (usbConsoleHostAttached()) {
+                if (!loggedUsbVeto) {
+                    LOG_INFO("Skip light sleep: USB console host attached");
+                    loggedUsbVeto = true;
+                }
+            } else {
+                loggedUsbVeto = false;
+            }
             // Someone says we can't sleep now, so just save some power by sleeping the CPU for 100ms or so
             delay(100);
         }
