@@ -37,14 +37,14 @@ template <typename T> void SX126xInterface<T>::parkRadioHardware()
     RadioSequence seq(this);
     radioSleepConfirmed.store(false, std::memory_order_release);
     rxArmedContinuous = false;
-#ifdef MESHTASTIC_RX_READOUT_TASK
-    rearmState = REARM_NONE;
-    rxArmedBeforeTxDone = false;
-#endif
     isReceiving = false;
     activeReceiveStart = 0;
     configHeaderDetectedAt.store(0, std::memory_order_release);
     disableInterrupt();
+#ifdef MESHTASTIC_RX_READOUT_TASK
+    rearmState = REARM_NONE;
+    rxArmedBeforeTxDone = false;
+#endif
     abortSending();
     RadioLibInterface::setStandby();
 
@@ -695,6 +695,13 @@ template <typename T> void SX126xInterface<T>::rearmReceiveFromTask()
 {
     // Outside any radio-thread sequence. If the thread got there first, it took the re-arm over and left nothing to do.
     RadioSequence seq(this);
+    // A TX_DONE already in flight at detach may queue this task after shutdown cancelled its earlier request.
+    // Only an explicit radio activation may unpark the chip.
+    if (radioHardwareParked.load(std::memory_order_acquire)) {
+        rearmState = REARM_NONE;
+        rxArmedBeforeTxDone = false;
+        return;
+    }
 #if defined(HELTEC_V4_OLED)
     if (nodeDB && (nodeDB->isPreferenceEditTransactionActive() || nodeDB->isDestructiveStorageMutationActive())) {
         rearmState = REARM_NONE;
@@ -1146,11 +1153,12 @@ template <typename T> bool SX126xInterface<T>::sleep()
     // trySetStandby() and the sleep command below are one sequence: a readout landing between them talks to a chip
     // that is on its way down, and the standby would be undone by the arm a readout's caller can follow it with.
     RadioSequence seq(this);
+    int16_t standbyResult = trySetStandby();
 #ifdef MESHTASTIC_RX_READOUT_TASK
+    // Cancel after trySetStandby detached the IRQ: a TX_DONE during standby can publish a new request.
     rearmState = REARM_NONE;
     rxArmedBeforeTxDone = false;
 #endif
-    int16_t standbyResult = trySetStandby();
 
     // turn off TCXO if it was powered
     // FIXME - this isn't correct

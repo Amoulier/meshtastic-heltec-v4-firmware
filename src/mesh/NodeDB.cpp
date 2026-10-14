@@ -37,6 +37,7 @@
 #include "mesh/generated/meshtastic/deviceonly_legacy.pb.h"
 #include "meshUtils.h"
 #include "modules/NeighborInfoModule.h"
+#include "security/SecureZero.h"
 #include "sleep.h"
 #include "target_specific.h"
 #if HAS_VARIABLE_HOPS
@@ -70,7 +71,6 @@ concurrency::Lock heltecV4NvsMutationLock;
 
 #ifdef MESHTASTIC_ENCRYPTED_STORAGE
 #include "security/EncryptedStorage.h"
-#include "security/SecureZero.h"
 #endif
 
 namespace

@@ -70,27 +70,54 @@ sx_prefix = r"""
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <functional>
+#include <utility>
 #include "power/DeepSleepPolicy.h"
 #define HAS_LORA_FEM 1
+#define INTERRUPT_ATTR
 #define LOG_DEBUG(...) ((void)0)
 #define LOG_DEBUG_RADIO(...) ((void)0)
 #define LOG_ERROR(...) ((void)0)
 constexpr int RADIOLIB_ERR_NONE=0, RADIOLIB_ERR_SPI_CMD_TIMEOUT=-705;
 constexpr int TRANSMIT_DELAY_COMPLETED=3;
-struct FEM { int slept=0; void setSleepModeEnable(){++slept;} void setTxModeEnable(){} void setRxModeEnable(){} } loraFEMInterface;
+struct FEM { int slept=0, received=0; void setSleepModeEnable(){++slept;} void setTxModeEnable(){} void setRxModeEnable(){++received;} } loraFEMInterface;
+struct NodeDB { bool editing=false, destructive=false;
+ bool isPreferenceEditTransactionActive(){return editing;}
+ bool isDestructiveStorageMutationActive(){return destructive;}
+} database;
+NodeDB* nodeDB=&database;
 struct RadioLibInterface {
- struct RadioSequence { explicit RadioSequence(RadioLibInterface*) {} ~RadioSequence() {} };
+ int sequenceDepth=0;
+ struct RadioSequence { RadioLibInterface* radio;
+  explicit RadioSequence(RadioLibInterface* radio):radio(radio){++radio->sequenceDepth;}
+  ~RadioSequence(){--radio->sequenceDepth;}
+ };
  void setStandby(){} void configHardwareForSend(){}
 };
 struct Chip { int standbyResult=0, sleepResult=0, standbyCalls=0, sleepCalls=0;
- int standby(){++standbyCalls; return standbyResult;} int sleep(bool){++sleepCalls; return sleepResult;} };
+ std::function<void()> duringStandby;
+ int standby(){++standbyCalls; if(duringStandby){auto hook=std::move(duringStandby);hook();} return standbyResult;}
+ int sleep(bool){++sleepCalls; return sleepResult;} };
 template<class T> struct SX126xInterface: RadioLibInterface {
  std::atomic<bool> radioHardwareParked{false}, radioSleepConfirmed{false};
  std::atomic<uint32_t> configHeaderDetectedAt{0};
  bool isReceiving=false, rxArmedContinuous=false, cadParamsValid=false; int activeReceiveStart=0; T lora; int aborts=0;
- void disableInterrupt(){} void abortSending(){++aborts;} void checkNotificationExcept(int){}
+ std::function<void()> duringDetach;
+ void disableInterrupt(){if(duringDetach){auto hook=std::move(duringDetach);hook();}}
+ void abortSending(){++aborts;} void checkNotificationExcept(int){}
  void parkRadioHardware(); bool sleep(); int16_t trySetStandby();
  void configHardwareForSend(); void setTransmitEnable(bool txon);
+#ifdef MESHTASTIC_RX_READOUT_TASK
+ enum RearmState : uint8_t {REARM_NONE,REARM_PENDING,REARM_ARMED,REARM_FAILED};
+ uint8_t rearmState=REARM_NONE; int16_t rearmErr=0;
+ bool rxArmedBeforeTxDone=false, rxRearmFromTaskPending=false;
+ int rxStarts=0;
+ bool requestRearmFromIsr(){rxRearmFromTaskPending=true;return true;}
+ bool rearmReceiveFromIsr(); void rearmReceiveFromTask();
+ int16_t startRxCommand(){++rxStarts;return RADIOLIB_ERR_NONE;}
+ static void isrRxLevel0(){} void enableInterrupt(void(*)()){}
+ void drainReadoutTask(){assert(sequenceDepth==0);if(rxRearmFromTaskPending){rxRearmFromTaskPending=false;rearmReceiveFromTask();}}
+#endif
 };
 """
 sx_methods = "\n\n".join(
@@ -101,6 +128,13 @@ sx_methods = "\n\n".join(
         "int16_t SX126xInterface<T>::trySetStandby()",
         "void SX126xInterface<T>::configHardwareForSend()",
         "void SX126xInterface<T>::setTransmitEnable(bool txon)",
+    ]
+)
+sx_rearm_methods = "\n\n".join(
+    "template <typename T> " + body("src/mesh/SX126xInterface.cpp", sig)
+    for sig in [
+        "bool INTERRUPT_ATTR SX126xInterface<T>::rearmReceiveFromIsr()",
+        "void SX126xInterface<T>::rearmReceiveFromTask()",
     ]
 )
 sx_tests = r"""
@@ -129,6 +163,36 @@ int main(){
   r.configHardwareForSend(); r.lora.sleepResult=(n%3)?0:-20;
   const bool expected=(n%3)!=0; assert(r.sleep()==expected); assert(r.sleep()==expected);
  }
+#ifdef MESHTASTIC_RX_READOUT_TASK
+ for(int standbyResult : {0,-707}) {
+  SX126xInterface<Chip> late;
+  late.lora.standbyResult=standbyResult;
+  late.lora.duringStandby=[&]{assert(late.sequenceDepth>0);assert(late.rearmReceiveFromIsr());};
+  assert(late.sleep()==(standbyResult==0));
+  assert(late.rearmState==late.REARM_NONE);
+  const int femRx=loraFEMInterface.received;
+  late.drainReadoutTask();
+  assert(late.rxStarts==0);assert(loraFEMInterface.received==femRx);
+  assert(late.rearmState==late.REARM_NONE);assert(!late.rxArmedBeforeTxDone);
+  assert(late.radioHardwareParked);assert(late.radioSleepConfirmed==(standbyResult==0));
+ }
+ SX126xInterface<Chip> parked;
+ parked.duringDetach=[&]{assert(parked.sequenceDepth>0);assert(parked.rearmReceiveFromIsr());};
+ parked.parkRadioHardware();assert(parked.rearmState==parked.REARM_NONE);parked.drainReadoutTask();
+ assert(parked.rxStarts==0);assert(parked.rearmState==parked.REARM_NONE);assert(!parked.sleep());
+ // An ISR already in flight can publish after detach; its task must still leave a parked chip alone.
+ assert(parked.rearmReceiveFromIsr());parked.drainReadoutTask();assert(parked.rxStarts==0);
+ // Explicit activation still admits the next TX_DONE's fast RX handoff.
+ parked.configHardwareForSend();
+ assert(parked.rearmReceiveFromIsr());parked.drainReadoutTask();
+ assert(parked.rxStarts==1);assert(parked.rearmState==parked.REARM_ARMED);
+ assert(parked.rxArmedBeforeTxDone);assert(!parked.radioHardwareParked);assert(!parked.radioSleepConfirmed);
+ for(int fence=0;fence<2;++fence) {
+  parked.configHardwareForSend();database.editing=fence==0;database.destructive=fence==1;
+  assert(parked.rearmReceiveFromIsr());parked.drainReadoutTask();assert(parked.rxStarts==1);
+  database.editing=false;database.destructive=false;
+ }
+#endif
 }
 """
 for label, flags in [
@@ -136,6 +200,11 @@ for label, flags in [
     ("solar", ("-DHELTEC_V4_OLED=1", "-DHELTEC_V4_SOLAR_ROUTER_PROFILE=1")),
 ]:
     build_run(f"sx1262_{label}", sx_prefix + sx_methods + sx_tests, flags)
+    build_run(
+        f"sx1262_{label}_readout_sleep",
+        sx_prefix + sx_methods + sx_rearm_methods + sx_tests,
+        (*flags, "-DMESHTASTIC_RX_READOUT_TASK=1"),
+    )
 
 # Exercise the actual FEM conversion together with RadioInterface's normalization boundary.
 fem_prefix = r"""
