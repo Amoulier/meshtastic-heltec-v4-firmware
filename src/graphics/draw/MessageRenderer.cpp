@@ -1134,9 +1134,10 @@ void handleNewMessage(OLEDDisplay *display, const StoredMessage &sm, const mesht
 {
     if (packet.from != 0) {
         hasUnreadMessage = true;
-        const bool suppressBanner = cannedMessageModule && cannedMessageModule->isFreeTextActive();
-        // Don't let the pop-up clobber a menu/picker the user is interacting with;
-        // the wake below still happens so a message can light the screen back up.
+        const bool suppressBanner =
+            (cannedMessageModule && cannedMessageModule->isFreeTextActive()) || (screen && screen->isTextMessageFrameShown());
+        // Don't let the pop-up clobber a menu/picker the user is interacting with; the wake below
+        // still happens so a message can light the screen back up.
         const bool menuShowing = NotificationRenderer::isMenuShowing();
 
         const bool isMuted = isMutedForPacket(packet);
@@ -1214,9 +1215,14 @@ void handleNewMessage(OLEDDisplay *display, const StoredMessage &sm, const mesht
             screen->setOn(true);
         }
 
-        if (!suppressBanner && !menuShowing) {
+        // Don't let the banner interrupt whatever the user is in the middle of -- it would cover an
+        // active module/game, and worse, a transient banner replaces any interactive overlay, so it
+        // would discard a half-entered picker / text entry (e.g. high-score initials). The message
+        // is still stored, its thread still selected below, and the unread indicator set, so nothing
+        // is lost -- the user just sees it once they're done. (isInteractionBusy() subsumes the
+        // modal-module check this guard used to make.)
+        if (!screen->isInteractionBusy() && !menuShowing && !suppressBanner)
             screen->showSimpleBanner(banner, inThread ? 1000 : 3000);
-        }
     }
 
     // Always focus into the correct conversation thread when a message with real text arrives

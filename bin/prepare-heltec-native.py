@@ -10,7 +10,7 @@ from pathlib import Path
 
 from platformio.package.manager.library import LibraryPackageManager
 
-FIXTURE_REVISION = "7239fe886a30fa13cd35946fa5ae1a46a2807eeb"
+FIXTURE_REVISION = "660680cea532ec1caf5d5f3e5dd1932c44b1dccd"
 ROOT = Path(__file__).resolve().parents[1]
 
 

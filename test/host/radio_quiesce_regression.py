@@ -30,6 +30,7 @@ PREFIX = r"""
 #include <initializer_list>
 #include <vector>
 #define HELTEC_V4_OLED 1
+#define MESHTASTIC_RX_READOUT_TASK 1
 #define FSCom 1
 #define LOG_INFO(...) ((void)0)
 #define LOG_WARN(...) ((void)0)
@@ -37,10 +38,12 @@ PREFIX = r"""
 #define LOG_TRACE(...) ((void)0)
 uint32_t clockMs = 10000, delayCalls = 0, rebootAtMsec = 0, shutdownAtMsec = 0;
 uint32_t millis() { return clockMs; }
+namespace Time { uint32_t getMillis() { return clockMs; } uint32_t skipZero(uint32_t value) { return value ? value : 1; } }
 void delay(uint32_t ms) { clockMs += ms; ++delayCalls; }
 struct Throttle {
  static bool isWithinTimespanMs(uint32_t start, uint32_t duration) { return uint32_t(millis()-start) < duration; }
 };
+constexpr uint8_t RADIOLIB_IRQ_PREAMBLE_DETECTED = 2;
 constexpr uint16_t RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED = 0x0004;
 constexpr uint16_t RADIOLIB_SX126X_IRQ_HEADER_VALID = 0x0010;
 constexpr uint16_t RX_DONE = 0x0002, TX_DONE = 0x0001, HEADER_ERR = 0x0020, CRC_ERR = 0x0040, TIMEOUT = 0x0200;
@@ -58,6 +61,7 @@ struct Chip {
   if (afterRead) afterRead(reads);
   return result;
  }
+ int clearIrq(uint32_t mask) { return clearIrqFlags(mask); }
  int clearIrqFlags(uint16_t mask) {
   cleared.push_back(mask);
   if (!clearResult) flags &= ~mask;
@@ -74,6 +78,13 @@ struct RadioInterface {
  virtual void resumeQueuedTransmissions() = 0;
 };
 struct RadioLibInterface : RadioInterface {
+ struct RadioSequence { explicit RadioSequence(RadioLibInterface*) {} ~RadioSequence() {} };
+ Chip* iface = nullptr;
+ uint8_t rxRingHead = 0, rxRingTail = 0;
+ bool rxRearmFromTaskPending = false, rxArmedBeforeTxDone = false;
+ uint32_t preambleHoldStart = 0;
+ bool preambleHoldActive();
+ void holdOnPreamble();
  std::atomic<uint32_t> sendAdmissionDepth{0}, radioNotificationDepth{0};
  bool isReceiving = true, sending = false;
  uint32_t activeReceiveStart = 0, preambleTimeMsec = 100;
@@ -88,6 +99,7 @@ struct RadioLibInterface : RadioInterface {
 };
 template <typename T> struct SX126xInterface : RadioLibInterface {
  T lora;
+ SX126xInterface() { iface = &lora; }
  std::atomic<bool> radioHardwareParked{false};
  std::atomic<uint32_t> configHeaderDetectedAt{0};
  bool sleepResult = true, reconfigureResult = true, pendingTx = false;
@@ -283,14 +295,36 @@ void test_new_header_between_config_probes_gets_its_own_window() {
  assert(f.db.beginPreferenceEdit(false));
  assert(f.radio.sleeps == 1 && f.radio.lora.cleared.empty());
 }
-void test_normal_receive_detection_retains_its_existing_expiry() {
+void test_normal_receive_detection_holds_and_rechecks_preamble() {
  Fixture f;
  f.radio.activeReceiveStart = 1;
  f.radio.lora.flags = 0x04;
- assert(!f.radio.isActivelyReceiving());
- assert(f.radio.activeReceiveStart == 0 && f.radio.lora.cleared.empty());
  assert(f.radio.isActivelyReceiving());
- assert(f.radio.activeReceiveStart == clockMs);
+ assert(f.radio.preambleHoldStart == clockMs);
+ assert(f.radio.lora.flags == 0 && f.radio.lora.cleared.size() == 1);
+ assert(!f.radio.canParkForConfig());
+ clockMs += 999;
+ assert(f.radio.isActivelyReceiving());
+ ++clockMs;
+ assert(!f.radio.isActivelyReceiving());
+ assert(f.radio.canParkForConfig());
+ f.radio.lora.flags = 0x04;
+ assert(f.radio.isActivelyReceiving());
+ assert(f.radio.lora.cleared.size() == 2);
+}
+void test_readout_owners_block_configuration_until_drained() {
+ for (int owner = 0; owner < 3; ++owner) {
+  Fixture f;
+  if (owner == 0) f.radio.rxRingHead = 1;
+  if (owner == 1) f.radio.rxRearmFromTaskPending = true;
+  if (owner == 2) f.radio.rxArmedBeforeTxDone = true;
+  assert(!f.radio.canParkForConfig());
+  assert(f.radio.lora.reads == 0);
+  f.radio.rxRingTail = f.radio.rxRingHead;
+  f.radio.rxRearmFromTaskPending = false;
+  f.radio.rxArmedBeforeTxDone = false;
+  assert(f.radio.canParkForConfig());
+ }
 }
 void test_other_radio_drivers_keep_conservative_irq_policy() {
  struct ConservativeRadio : Radio {
@@ -425,7 +459,8 @@ int main() {
  test_noise_expiry_preserves_flags_and_survives_repeated_probes();
  test_terminal_irqs_and_new_receive_are_preserved();
  test_new_header_between_config_probes_gets_its_own_window();
- test_normal_receive_detection_retains_its_existing_expiry();
+ test_normal_receive_detection_holds_and_rechecks_preamble();
+ test_readout_owners_block_configuration_until_drained();
  test_other_radio_drivers_keep_conservative_irq_policy();
  test_software_owners_are_rechecked();
  test_busy_returns_to_worker_and_retry_succeeds();
@@ -450,6 +485,8 @@ def main():
         [
             function_body(radio, "bool RadioLibInterface::canParkForConfig()"),
             function_body(radio, "bool RadioLibInterface::receiveDetected("),
+            function_body(radio, "bool RadioLibInterface::preambleHoldActive("),
+            function_body(radio, "void RadioLibInterface::holdOnPreamble("),
             function_body(
                 radio, "bool RadioLibInterface::isActivelyReceivingForConfig("
             ),

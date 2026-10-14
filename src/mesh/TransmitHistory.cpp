@@ -2,8 +2,9 @@
 #include "FSCommon.h"
 #include "NodeDB.h"
 #include "Power.h"
-#include "SafeFile.h"
 #include "SPILock.h"
+#include "SafeFile.h"
+#include "UptimeClock.h"
 #include "gps/RTC.h"
 #include <Throttle.h>
 #include <utility>
@@ -94,7 +95,7 @@ void TransmitHistory::loadFromDisk()
 
 void TransmitHistory::setLastSentToMesh(uint16_t key)
 {
-    const uint32_t nowMillis = millis();
+    const uint32_t nowMillis = Time::skipZero(Time::getMillis());
     const uint32_t now = getTime();
     const uint8_t flags = (getRTCQuality() == RTCQualityNone) ? ENTRY_FLAG_BOOT_RELATIVE : ENTRY_FLAG_NONE;
     bool shouldSave = false;
@@ -175,7 +176,7 @@ uint32_t TransmitHistory::getLastSentAbsoluteMillis(uint32_t storedEpoch) const
         return 0;
     }
 
-    return millis() - msAgo;
+    return Time::skipZero(Time::getMillis() - msAgo);
 }
 
 uint32_t TransmitHistory::getLastSentBootRelativeMillis(uint32_t storedSeconds) const
@@ -191,7 +192,7 @@ uint32_t TransmitHistory::getLastSentBootRelativeMillis(uint32_t storedSeconds) 
         if (secondsAgo > BOOT_RELATIVE_RECOVERY_WINDOW_SEC) {
             return 0;
         }
-        return millis() - (secondsAgo * 1000);
+        return Time::skipZero(Time::getMillis() - (secondsAgo * 1000));
     }
 
     uint32_t secondsAhead = storedSeconds - now;
@@ -199,7 +200,7 @@ uint32_t TransmitHistory::getLastSentBootRelativeMillis(uint32_t storedSeconds) 
         return 0;
     }
 
-    return millis();
+    return Time::skipZero(Time::getMillis());
 }
 
 uint32_t TransmitHistory::getLastSentToMeshMillis(uint16_t key) const
@@ -343,7 +344,7 @@ bool TransmitHistory::saveToDisk()
         concurrency::LockGuard stateGuard(&stateLock);
         if (mutationGeneration == savedGeneration)
             dirty = false;
-        lastDiskSave = millis();
+        lastDiskSave = Time::skipZero(Time::getMillis());
     }
     return true;
 }
@@ -352,11 +353,9 @@ bool TransmitHistory::clear(bool requireDestructivePower)
 {
 #if defined(HELTEC_V4_OLED)
     const auto storagePowerIsSafe = [requireDestructivePower]() {
-        return requireDestructivePower ? heltecDestructiveStoragePowerIsSafe()
-                                       : heltecPreferenceStoragePowerIsSafe();
+        return requireDestructivePower ? heltecDestructiveStoragePowerIsSafe() : heltecPreferenceStoragePowerIsSafe();
     };
-    if (nodeDB && nodeDB->isDestructiveStorageMutationActive() &&
-        !nodeDB->isDestructiveStorageMutationOwnerCurrentTask())
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive() && !nodeDB->isDestructiveStorageMutationOwnerCurrentTask())
         return false;
     if (!storagePowerIsSafe()) {
         LOG_WARN("TransmitHistory: refusing clear while fresh power is unsafe");
@@ -368,8 +367,7 @@ bool TransmitHistory::clear(bool requireDestructivePower)
 
     concurrency::LockGuard persistenceGuard(&persistenceLock);
 #if defined(HELTEC_V4_OLED)
-    if (nodeDB && nodeDB->isDestructiveStorageMutationActive() &&
-        !nodeDB->isDestructiveStorageMutationOwnerCurrentTask())
+    if (nodeDB && nodeDB->isDestructiveStorageMutationActive() && !nodeDB->isDestructiveStorageMutationOwnerCurrentTask())
         return false;
     if (!storagePowerIsSafe()) {
         LOG_WARN("TransmitHistory: refusing clear after wait because fresh power is unsafe");
@@ -422,7 +420,7 @@ void TransmitHistory::loadFromDisk() {}
 void TransmitHistory::setLastSentToMesh(uint16_t key)
 {
     concurrency::LockGuard stateGuard(&stateLock);
-    lastMillis[key] = millis();
+    lastMillis[key] = Time::skipZero(Time::getMillis());
 }
 
 uint32_t TransmitHistory::getLastSentToMeshEpoch(uint16_t key) const

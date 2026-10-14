@@ -13,6 +13,7 @@
 #include "MeshService.h"
 #include "Module.h"
 #include "NodeDB.h"
+#include "UptimeClock.h"
 #include "main.h"
 #include "modules/AdminModule.h"
 #include "modules/ExternalNotificationModule.h"
@@ -98,23 +99,23 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
             if (!bluetoothEnabled) {
                 disableBluetooth();
                 IF_SCREEN(screen->showSimpleBanner("Bluetooth OFF\nRebooting", 3000));
-                rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 2000;
+                rebootAtMsec = Time::timerEndsAtMillis(DEFAULT_REBOOT_SECONDS * 2000);
             } else {
                 IF_SCREEN(screen->showSimpleBanner("Bluetooth ON\nRebooting", 3000));
-                rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 1000;
+                rebootAtMsec = Time::timerEndsAtMillis(DEFAULT_REBOOT_SECONDS * 1000);
             }
 #else
             if (!bluetoothEnabled) {
                 disableBluetooth();
                 if (shouldRestartAfterBluetoothDisable(bluetoothEnabled)) {
                     IF_SCREEN(screen->showSimpleBanner("Bluetooth OFF\nRebooting", 3000));
-                    rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 1000;
+                    rebootAtMsec = Time::timerEndsAtMillis(DEFAULT_REBOOT_SECONDS * 1000);
                 } else {
                     IF_SCREEN(screen->showSimpleBanner("Bluetooth OFF", 3000));
                 }
             } else {
                 IF_SCREEN(screen->showSimpleBanner("Bluetooth ON\nRebooting", 3000));
-                rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 1000;
+                rebootAtMsec = Time::timerEndsAtMillis(DEFAULT_REBOOT_SECONDS * 1000);
             }
 #endif
         }
@@ -135,7 +136,7 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
 #if HAS_SCREEN
             messageStore.saveToFlash();
 #endif
-            rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 1000;
+            rebootAtMsec = Time::timerEndsAtMillis(DEFAULT_REBOOT_SECONDS * 1000);
         });
 #if defined(HELTEC_V4_OLED)
         if (!applied) {
@@ -216,7 +217,7 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
                 IF_SCREEN(screen->showSimpleBanner("GPS change\nnot saved", 3000));
             }
 #else
-            (void)applied;
+        (void)applied;
 #endif
         }
 #endif
@@ -238,7 +239,7 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
         return true;
     // Power control
     case INPUT_BROKER_SHUTDOWN: {
-        const bool applied = runSerializedOperation([&]() { shutdownAtMsec = millis(); });
+        const bool applied = runSerializedOperation([&]() { shutdownAtMsec = Time::skipZero(Time::getMillis()); });
 #if defined(HELTEC_V4_OLED)
         if (!applied) {
             LOG_WARN("Ignore shutdown input while an Admin settings transaction is active");
@@ -259,7 +260,7 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
                 LOG_INFO("Reboot in %d seconds", DEFAULT_REBOOT_SECONDS);
                 if (screen)
                     screen->showSimpleBanner("Rebooting...", 0); // stays on screen
-                rebootAtMsec = (DEFAULT_REBOOT_SECONDS < 0) ? 0 : (millis() + DEFAULT_REBOOT_SECONDS * 1000);
+                rebootAtMsec = (DEFAULT_REBOOT_SECONDS < 0) ? 0 : (Time::timerEndsAtMillis(DEFAULT_REBOOT_SECONDS * 1000));
                 return true;
             } else {
                 LOG_ERROR("Factory reset failed; keeping recovery interfaces available");

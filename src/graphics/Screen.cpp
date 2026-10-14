@@ -24,6 +24,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "NodeDB.h"
 #include "PowerMon.h"
 #include "Throttle.h"
+#include "UptimeClock.h"
 #include "configuration.h"
 #include "meshUtils.h"
 #include <algorithm>
@@ -254,6 +255,7 @@ static bool heartbeat = false;
 
 #include "graphics/ScreenFonts.h"
 #include <Throttle.h>
+#include <cmath>
 
 // Usage: int stringWidth = formatDateTime(datetimeStr, sizeof(datetimeStr), rtc_sec, display);
 // End Functions to write date/time to the screen
@@ -333,7 +335,7 @@ void Screen::showSimpleBanner(const char *message, uint32_t durationMs)
 }
 
 // Called to trigger a banner with custom message and duration
-void Screen::showOverlayBanner(BannerOverlayOptions banner_overlay_options)
+void Screen::showOverlayBanner(const BannerOverlayOptions &banner_overlay_options)
 {
     if (isDisplayDisabled()) {
         setDisplayRailPower(false);
@@ -348,7 +350,7 @@ void Screen::showOverlayBanner(BannerOverlayOptions banner_overlay_options)
     NotificationRenderer::parseBannerMessageWithFonts(NotificationRenderer::alertBannerMessage);
     NotificationRenderer::alertBannerMessage[255] = '\0'; // Ensure null termination
     NotificationRenderer::alertBannerUntil =
-        (banner_overlay_options.durationMs == 0) ? 0 : millis() + banner_overlay_options.durationMs;
+        (banner_overlay_options.durationMs == 0) ? 0 : Time::timerEndsAtMillis(banner_overlay_options.durationMs);
     NotificationRenderer::optionsArrayPtr = banner_overlay_options.optionsArrayPtr;
     NotificationRenderer::optionsEnumPtr = banner_overlay_options.optionsEnumPtr;
     NotificationRenderer::alertBannerOptions =
@@ -373,7 +375,7 @@ void Screen::showNodePicker(const char *message, uint32_t durationMs, std::funct
     // Store the message and set the expiration timestamp
     strncpy(NotificationRenderer::alertBannerMessage, message, 255);
     NotificationRenderer::alertBannerMessage[255] = '\0'; // Ensure null termination
-    NotificationRenderer::alertBannerUntil = (durationMs == 0) ? 0 : millis() + durationMs;
+    NotificationRenderer::alertBannerUntil = (durationMs == 0) ? 0 : Time::timerEndsAtMillis(durationMs);
     NotificationRenderer::alertBannerCallback = bannerCallback;
     NotificationRenderer::pauseBanner = false;
     NotificationRenderer::curSelected = 0;
@@ -395,7 +397,7 @@ void Screen::showNumberPicker(const char *message, uint32_t durationMs, uint8_t 
     // Store the message and set the expiration timestamp
     strncpy(NotificationRenderer::alertBannerMessage, message, 255);
     NotificationRenderer::alertBannerMessage[255] = '\0'; // Ensure null termination
-    NotificationRenderer::alertBannerUntil = (durationMs == 0) ? 0 : millis() + durationMs;
+    NotificationRenderer::alertBannerUntil = (durationMs == 0) ? 0 : Time::timerEndsAtMillis(durationMs);
     NotificationRenderer::alertBannerCallback = bannerCallback;
     NotificationRenderer::pauseBanner = false;
     NotificationRenderer::curSelected = 0;
@@ -424,7 +426,7 @@ void Screen::showAlphanumericPicker(const char *message, const char *initialText
 
     strncpy(NotificationRenderer::alertBannerMessage, message, 255);
     NotificationRenderer::alertBannerMessage[255] = '\0'; // Ensure null termination
-    NotificationRenderer::alertBannerUntil = (durationMs == 0) ? 0 : millis() + durationMs;
+    NotificationRenderer::alertBannerUntil = (durationMs == 0) ? 0 : Time::timerEndsAtMillis(durationMs);
     NotificationRenderer::textInputCallback = bannerCallback;
     NotificationRenderer::pauseBanner = false;
     NotificationRenderer::curSelected = 0;
@@ -461,7 +463,7 @@ void Screen::showTextInput(const char *header, const char *initialText, uint32_t
     // Store the message and set the expiration timestamp (use same pattern as other notifications)
     strncpy(NotificationRenderer::alertBannerMessage, header ? header : "Text Input", 255);
     NotificationRenderer::alertBannerMessage[255] = '\0';
-    NotificationRenderer::alertBannerUntil = (durationMs == 0) ? 0 : millis() + durationMs;
+    NotificationRenderer::alertBannerUntil = (durationMs == 0) ? 0 : Time::timerEndsAtMillis(durationMs);
     NotificationRenderer::pauseBanner = false;
     NotificationRenderer::current_notification_type = notificationTypeEnum::text_input;
 
@@ -512,9 +514,9 @@ static void drawGamesFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int1
 float Screen::estimatedHeading(double lat, double lon)
 {
     static double oldLat, oldLon;
-    static float b = -1.0f;
+    static float b = NAN;
     static uint32_t lastHeadingAtMs = 0;
-    const uint32_t now = millis();
+    const uint32_t now = Time::stampMillis();
     const uint32_t gpsUpdateIntervalSecs =
         Default::getConfiguredOrDefault(config.position.gps_update_interval, default_gps_update_interval);
     uint32_t effectiveUpdateIntervalSecs = gpsUpdateIntervalSecs;
@@ -541,7 +543,7 @@ float Screen::estimatedHeading(double lat, double lon)
     if (d < 10) { // haven't moved enough, keep previous heading (invalid until first real movement)
         if (lastHeadingAtMs != 0 && (now - lastHeadingAtMs) >= headingStaleMs) {
             // Heading is stale after prolonged no-movement; force reacquire.
-            b = -1.0f;
+            b = NAN;
             oldLat = lat;
             oldLon = lon;
         }
@@ -696,6 +698,8 @@ void Screen::doDeepSleep()
 
 void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
 {
+    if (!on)
+        textMessageFrameShown = false;
     if (!useDisplay)
         return;
 
@@ -1257,7 +1261,7 @@ void Screen::forceDisplay(bool forceUiUpdate)
     if (isDisplayDisabled())
         return;
 
-        // Nasty hack to force epaper updates for 'key' frames.  FIXME, cleanup.
+    // Nasty hack to force epaper updates for 'key' frames.  FIXME, cleanup.
 #ifdef USE_EINK
     // If requested, make sure queued commands are run, and UI has rendered a new frame
     if (forceUiUpdate) {
@@ -1308,11 +1312,13 @@ int32_t Screen::runOnce()
 {
     // If we don't have a screen, don't ever spend any CPU for us.
     if (!useDisplay) {
+        textMessageFrameShown = false;
         enabled = false;
         return RUN_SAME;
     }
 
     if (isDisplayDisabled()) {
+        textMessageFrameShown = false;
         enabled = false;
         setDisplayRailPower(false);
         return RUN_SAME;
@@ -1433,7 +1439,11 @@ int32_t Screen::runOnce()
             handleStartFirmwareUpdateScreen();
             break;
         case Cmd::STOP_ALERT_FRAME:
+            // Cleared even while a module holds the screen: START_ALERT_FRAME set it and nothing
+            // else would, so swallowing it here would leave banners suppressed for good.
             NotificationRenderer::pauseBanner = false;
+            if (hasModalModule())
+                break; // only the owning module may take the screen back off its own frame
             // Return from one-off alert mode back to regular frames.
             if (!showingNormalScreen && NotificationRenderer::current_notification_type != notificationTypeEnum::text_input) {
                 setFrames();
@@ -1454,6 +1464,7 @@ int32_t Screen::runOnce()
 
     if (!screenOn) { // If we didn't just wake and the screen is still off, then
                      // stop updating until it is on again
+        textMessageFrameShown = false;
         enabled = false;
         return 0;
     }
@@ -1491,7 +1502,7 @@ int32_t Screen::runOnce()
     // standard screen switching is stopped.
     if (showingNormalScreen) {
         // standard screen loop handling here
-        if (config.display.auto_screen_carousel_secs > 0 &&
+        if (config.display.auto_screen_carousel_secs > 0 && !hasModalModule() &&
             NotificationRenderer::current_notification_type != notificationTypeEnum::text_input &&
             !Throttle::isWithinTimespanMs(lastScreenTransition, config.display.auto_screen_carousel_secs * 1000)) {
 
@@ -1506,6 +1517,9 @@ int32_t Screen::runOnce()
             handleOnPress();
         }
     }
+
+    textMessageFrameShown = showingNormalScreen && framesetInfo.positions.textMessage != 255 && ui &&
+                            ui->getUiState()->currentFrame == framesetInfo.positions.textMessage;
 
     // LOG_DEBUG("want fps %d, fixed=%d", targetFramerate,
     // ui->getUiState()->frameState); If we are scrolling we need to be called
@@ -1546,6 +1560,10 @@ void Screen::setScreensaverFrames(FrameCallback einkScreensaver)
     if (einkScreensaver != NULL) {
         screensaverFrame = einkScreensaver;
         ui->setFrames(&screensaverFrame, 1);
+
+        // Hide the nav bar before the sleep / shutdown screen is rendered
+        static OverlayCallback screensaverOverlays[] = {NotificationRenderer::drawBannercallback};
+        ui->setOverlays(screensaverOverlays, 1);
     }
 
     // Else, display the usual "overlay" screensaver
@@ -2087,6 +2105,19 @@ void Screen::applyHiddenFramesMask(uint32_t mask)
     hiddenFrames.chirpy = getBit(mask, FVBIT_CHIRPY);
 }
 
+bool Screen::isShowingModuleFrame(const MeshModule *m) const
+{
+    if (!m || !showingNormalScreen)
+        return false;
+    // Same effective frame drawModuleFrame() picks: mid-transition the incoming frame is the one
+    // being rendered, so comparing currentFrame would report false while the module is on screen.
+    const OLEDDisplayUiState *state = ui->getUiState();
+    uint8_t frame = state->currentFrame;
+    if (state->frameState == IN_TRANSITION && state->transitionFrameRelationship == TransitionRelationship_INCOMING)
+        frame = state->transitionFrameTarget;
+    return frame < moduleFrames.size() && moduleFrames.at(frame) == m;
+}
+
 void Screen::loadFrameVisibility()
 {
 #ifdef FSCom
@@ -2481,18 +2512,8 @@ int Screen::handleInputEvent(const InputEvent *event)
     // so long as a mesh module isn't using these events for some other purpose
     if (showingNormalScreen) {
 
-        // Ask any MeshModules if they're handling keyboard input right now
-        bool inputIntercepted = false;
-        for (MeshModule *module : moduleFrames) {
-            if (module && module->interceptingKeyboardInput())
-                inputIntercepted = true;
-        }
-#if BASEUI_HAS_GAMES
-        // The games frame isn't a moduleFrame, so check it explicitly: while a game is running it
-        // owns the D-pad (turns/pause) and we must not switch frames or open menus underneath it.
-        if (gamesModule && gamesModule->interceptingKeyboardInput())
-            inputIntercepted = true;
-#endif
+        // Ask any MeshModules (and the games frame) if they're handling keyboard input right now
+        const bool inputIntercepted = anyModuleInterceptingInput();
 
         // If no modules are using the input, move between frames
         if (!inputIntercepted) {
@@ -2518,7 +2539,8 @@ int Screen::handleInputEvent(const InputEvent *event)
 #endif
             if (event->inputEvent == INPUT_BROKER_LEFT || event->inputEvent == INPUT_BROKER_ALT_PRESS) {
                 showFrame(FrameDirection::PREVIOUS);
-            } else if (event->inputEvent == INPUT_BROKER_RIGHT || event->inputEvent == INPUT_BROKER_USER_PRESS) {
+            } else if (event->inputEvent == INPUT_BROKER_RIGHT || event->inputEvent == INPUT_BROKER_USER_PRESS ||
+                       (event->inputEvent == INPUT_BROKER_ANYKEY && event->kbchar == ' ')) {
                 showFrame(FrameDirection::NEXT);
             } else if (event->inputEvent == INPUT_BROKER_FN_F1) {
                 this->ui->switchToFrame(0);
@@ -2644,9 +2666,55 @@ bool Screen::isOverlayBannerShowing()
     return NotificationRenderer::isOverlayBannerShowing();
 }
 
+bool Screen::isTextMessageFrameShown() const
+{
+    return textMessageFrameShown.load();
+}
+
 bool Screen::isGamesFrameShown()
 {
     return framesetInfo.positions.games != 255 && ui && ui->getUiState()->currentFrame == framesetInfo.positions.games;
+}
+
+void Screen::showHomeFrame()
+{
+    if (!ui)
+        return;
+    // Home is optional -- setFrames() only adds it when !hiddenFrames.home, leaving the position
+    // 255. Bouncing to nothing would strand the caller on the frame it wanted to leave, so fall
+    // back to the messages frame, which setFrames() always adds.
+    const uint8_t target =
+        (framesetInfo.positions.home != 255) ? framesetInfo.positions.home : framesetInfo.positions.textMessage;
+    if (target != 255)
+        ui->switchToFrame(target);
+}
+
+bool Screen::anyModuleInterceptingInput()
+{
+    for (MeshModule *module : moduleFrames) {
+        if (module && module->interceptingKeyboardInput())
+            return true;
+    }
+#if BASEUI_HAS_GAMES
+    // The games frame isn't a moduleFrame, so check it explicitly: while a game is running it owns
+    // the D-pad (turns/pause) and we must not switch frames or open menus underneath it.
+    if (gamesModule && gamesModule->interceptingKeyboardInput())
+        return true;
+#endif
+    return false;
+}
+
+bool Screen::isInteractionBusy()
+{
+    // Something is holding the D-pad -- the user is mid-interaction. A modal module owns the whole
+    // screen; an intercepting one owns the keys on its own frame.
+    if (hasModalModule() || anyModuleInterceptingInput())
+        return true;
+    // An interactive overlay (picker / text entry) is open. Showing a transient banner REPLACES the
+    // active overlay, so this would silently discard whatever the user was entering. A plain
+    // text_banner is itself transient, so superseding one of those is fine.
+    const notificationTypeEnum nt = NotificationRenderer::current_notification_type;
+    return nt != notificationTypeEnum::none && nt != notificationTypeEnum::text_banner;
 }
 
 } // namespace graphics

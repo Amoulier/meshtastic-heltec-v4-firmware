@@ -62,6 +62,7 @@ class BuildEnv(dict):
             if row and not row[0].startswith("#")
         ]
         self["custom_mtjson_part"] = json.dumps(parts)
+        self.post_actions = []
         self.build_dir = root / ".pio" / target
         self.build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -108,6 +109,9 @@ class BuildEnv(dict):
 
     def Default(self, *args):
         return None
+
+    def AddPostAction(self, target, callback):
+        self.post_actions.append((target, callback))
 
 
 class VersionIdentityTests(unittest.TestCase):
@@ -457,6 +461,10 @@ class VersionIdentityTests(unittest.TestCase):
             with self.subTest(target=target):
                 env, module = self.hooks(target)
                 version = self.version()
+                self.assertEqual(
+                    env.post_actions,
+                    [("$BUILD_DIR/${PROGNAME}.elf", module["export_link_files"])],
+                )
                 self.assertEqual(
                     env["PROGNAME"], f"firmware-{target}-{version['long']}"
                 )

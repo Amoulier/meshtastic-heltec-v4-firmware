@@ -164,11 +164,11 @@ require(
     f"release package versions disagree: {sorted(package_versions)}",
 )
 require(
-    package_versions == {"v2.8.0.9"},
+    package_versions == {"v2.8.2.9"},
     f"unexpected planned package version: {sorted(package_versions)}",
 )
 require(
-    release.count("heltec-v4-profiles-v2.8.0.9") == 3,
+    release.count("heltec-v4-profiles-v2.8.2.9") == 3,
     "release tag must match in both provenance gates and the publisher",
 )
 require(
@@ -183,13 +183,13 @@ base_version = read("version.properties")
 for component, value in (
     ("major", "2"),
     ("minor", "8"),
-    ("build", "0"),
+    ("build", "2"),
     ("fork_revision", "9"),
 ):
     require(
         re.search(rf"^\s*{component}\s*=\s*{value}\s*$", base_version, re.MULTILINE)
         is not None,
-        f"version.properties {component} no longer matches the 2.8.0 release base",
+        f"version.properties {component} no longer matches the 2.8.2 release base",
     )
 
 # External actions and the build container must remain immutable references.
@@ -213,7 +213,7 @@ require(
     "ESP32 build platform uses a mutable branch archive",
 )
 require(
-    "pioarduino-platform-espressif32/archive/f89295f6a617a8ec611f4bd4eb2f998799dc5dc8.zip"
+    "platform-espressif32/releases/download/55.03.312-1/platform-espressif32.zip"
     in esp32_platform,
     "ESP32 build platform is not pinned to the audited revision",
 )

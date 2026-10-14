@@ -1,6 +1,9 @@
 name: Build and Release Heltec V4 Profiles
 
 on:
+  pull_request:
+    branches:
+      - "main"
   push:
     branches:
       - "main"
@@ -20,19 +23,19 @@ jobs:
   build-standard:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: ${{ github.ref_name == 'main' && 'heltec-v4-standard-v2.8.0.9' || format('heltec-v4-standard-test-{0}', github.sha) }}
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-standard-v2.8.2.9' || format('heltec-v4-standard-test-{0}', github.sha) }}
       platform: esp32s3
       pio_env: heltec-v4-standard
 
   build-solar-router:
     uses: ./.github/workflows/build_firmware.yml
     with:
-      version: ${{ github.ref_name == 'main' && 'heltec-v4-solar-router-v2.8.0.9' || format('heltec-v4-solar-router-test-{0}', github.sha) }}
+      version: ${{ github.ref_name == 'main' && 'heltec-v4-solar-router-v2.8.2.9' || format('heltec-v4-solar-router-test-{0}', github.sha) }}
       platform: esp32s3
       pio_env: heltec-v4-solar-router
 
   release:
-    if: github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(heltec-v4):')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(heltec-v4):')
     permissions:
       actions: read
       contents: write
@@ -63,7 +66,7 @@ jobs:
       - name: Verify release provenance
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: heltec-v4-profiles-v2.8.0.9
+          RELEASE_TAG: heltec-v4-profiles-v2.8.2.9
         run: |
           set -euo pipefail
 
@@ -130,13 +133,13 @@ jobs:
       - name: Download Standard firmware
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: firmware-esp32s3-heltec-v4-standard-heltec-v4-standard-v2.8.0.9
+          name: firmware-esp32s3-heltec-v4-standard-heltec-v4-standard-v2.8.2.9
           path: release-assets/standard
 
       - name: Download Solar Router firmware
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: firmware-esp32s3-heltec-v4-solar-router-heltec-v4-solar-router-v2.8.0.9
+          name: firmware-esp32s3-heltec-v4-solar-router-heltec-v4-solar-router-v2.8.2.9
           path: release-assets/solar-router
 
       - name: Verify and package profile assets
@@ -192,7 +195,7 @@ jobs:
               '.platformioTarget == $target and .version == $version and .mcu == "esp32s3" and
                .repo == "Amoulier/meshtastic-heltec-v4-firmware" and .hwModelSlug == "HELTEC_V4" and
                .partitionScheme == "16MB" and
-               .upstream_version == "2.8.0" and .fork_revision == 9 and
+               .upstream_version == "2.8.2" and .fork_revision == 9 and
                .source.commit == $commit and .source.dirty == false and
                .source.sha256 == $source_sha256 and .identity_sha256 == $identity_sha256 and
                (.part | type == "array" and length == 6) and
@@ -297,7 +300,7 @@ jobs:
       - name: Verify main still points to this release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: heltec-v4-profiles-v2.8.0.9
+          RELEASE_TAG: heltec-v4-profiles-v2.8.2.9
         run: |
           set -euo pipefail
           remote_main=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | awk '{print $1}')
@@ -360,17 +363,17 @@ jobs:
       - name: Publish Heltec V4 profile release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          tag_name: heltec-v4-profiles-v2.8.0.9
+          tag_name: heltec-v4-profiles-v2.8.2.9
           target_commitish: ${{ github.sha }}
-          name: Heltec V4 Standard and Solar Router v2.8.0.9
+          name: Heltec V4 Standard and Solar Router v2.8.2.9
           prerelease: false
           make_latest: true
           generate_release_notes: false
           overwrite_files: false
           body: |
-            Independent Meshtastic 2.8.0 firmware for the Heltec V4 OLED, with Standard and Solar Router profiles.
+            Independent Meshtastic 2.8.2 firmware for the Heltec V4 OLED, with Standard and Solar Router profiles.
 
-            Distribution revision: `v2.8.0.9`. Compiled firmware: `${{ steps.source-version.outputs.firmware_version }}`. The OLED footer displays `2.8.0-h9`.
+            Distribution revision: `v2.8.2.9`. Compiled firmware: `${{ steps.source-version.outputs.firmware_version }}`. The OLED footer displays `2.8.2-h9`.
 
             Changes in this revision:
 
@@ -378,7 +381,7 @@ jobs:
             - Multiplier changes discard readings and filters from the previous scale. Invalid calibration, initialization failures, and failed samples cannot authorize battery-powered storage writes; Solar Router remains in protective sleep when early calibration cannot be trusted and no USB data host is connected.
             - Initial region selection persists a complete configuration generation, and PRG menu callbacks retain valid selection and text storage.
             - Preference transactions drain admitted radio work before parking the SX1262, preserving reception state and preventing maintenance or queued work from reactivating a parked radio.
-            - Firmware filenames, the API, the ESP application descriptor, and manifests share one source-derived identity. Clean builds use `2.8.0-h9g<8-character fingerprint>`; modified sources use `h9d`. Manifests include full source/build-identity SHA256, source commit, and image SHA256. Old images are never renamed into the new release.
+            - Firmware filenames, the API, the ESP application descriptor, and manifests share one source-derived identity. Clean builds use `2.8.2-h9g<8-character fingerprint>`; modified sources use `h9d`. Manifests include full source/build-identity SHA256, source commit, and image SHA256. Old images are never renamed into the new release.
             - Windows installers correctly parse supported esptool versions with CMD delayed expansion enabled.
 
             Choose the profile for the intended use:
@@ -397,8 +400,8 @@ jobs:
             - Clean installation: extract every file from the matching `complete` ZIP and run `device-install.sh` or `device-install.bat` with its `.factory.bin`. This erases existing settings and identity, then writes the application, unified OTA loader, and LittleFS together. Do not erase and flash the `.factory.bin` alone.
             - Installers require esptool 4.5.1 or newer and an explicit serial port. They verify ESP32-S3, 16 MB flash, profile/version, repository provenance, partition layout, sizes, and digests before writing. POSIX scripts also require `jq`.
 
-            Publication is gated by both profile builds, native integration tests, host fault-injection regressions, source checks, and manifest/hash verification. The corrected Solar Router implementation was also tested on a Heltec V4.3 OLED for calibration persistence, PRG navigation, Bluetooth, and configuration preservation. Absolute voltage accuracy requires a reference measurement; validate low-voltage sleep/recovery and autonomy with the actual battery and solar supply before unattended deployment.
+            Publication is gated by both profile builds, native integration tests, host fault-injection regressions, source checks, and manifest/hash verification. The earlier 2.8.0-based Solar Router implementation was tested on a Heltec V4.3 OLED for calibration persistence, PRG navigation, Bluetooth, and configuration preservation. This upstream synchronization still requires hardware validation. Absolute voltage accuracy requires a reference measurement; validate low-voltage sleep/recovery and autonomy with the actual battery and solar supply before unattended deployment.
 
-            Upstream base: Meshtastic `develop` through `7239fe886a30fa13cd35946fa5ae1a46a2807eeb`, with stability backports selected through `fdb67309aa8fb9a019e07160ac72024c3d25ce2d`. This independent release remains on upstream 2.8.0 and is not an official Meshtastic build.
+            Upstream base: Meshtastic `develop` through `660680cea532ec1caf5d5f3e5dd1932c44b1dccd`. This independent release uses upstream 2.8.2 and is not an official Meshtastic build.
           files: publish/*
           fail_on_unmatched_files: true
