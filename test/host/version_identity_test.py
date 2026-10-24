@@ -50,6 +50,18 @@ class BuildEnv(dict):
         self.config.set("env:" + target, "custom_sdkconfig", "CONFIG_SPIRAM=y")
         self.config.set("env:" + target, "custom_meshtastic_hw_model_slug", "HELTEC_V4")
         self.config.set("env:" + target, "custom_meshtastic_partition_scheme", "16MB")
+        profiles = configparser.RawConfigParser()
+        profiles.read(ROOT / "variants/esp32s3/heltec_v4/platformio.ini")
+        section = "env:" + target
+        while profiles.has_section(section):
+            if profiles.has_option(section, "custom_meshtastic_pio_env"):
+                self.config.set(
+                    "env:" + target,
+                    "custom_meshtastic_pio_env",
+                    profiles.get(section, "custom_meshtastic_pio_env"),
+                )
+                break
+            section = profiles.get(section, "extends", fallback="")
         rows = csv.reader((ROOT / "default_16MB.csv").read_text().splitlines())
         parts = [
             dict(
@@ -457,7 +469,12 @@ class VersionIdentityTests(unittest.TestCase):
         return env, module
 
     def test_actual_hooks_bind_api_filename_sdk_cache_epoch_and_manifest(self):
-        for target in ("heltec-v4-standard", "heltec-v4-solar-router"):
+        for target, pio_env in (
+            ("heltec-v4-standard", "heltec-v4"),
+            ("heltec-v4-solar-router", "heltec-v4"),
+            ("heltec-v4", "heltec-v4"),
+            ("heltec-v3", "heltec-v3"),
+        ):
             with self.subTest(target=target):
                 env, module = self.hooks(target)
                 version = self.version()
@@ -470,6 +487,10 @@ class VersionIdentityTests(unittest.TestCase):
                 )
                 self.assertIn("-DAPP_VERSION=" + version["long"], env["CCFLAGS"])
                 self.assertIn("-DAPP_VERSION_SHORT=" + version["short"], env["CCFLAGS"])
+                self.assertEqual(
+                    [flag for flag in env["CCFLAGS"] if flag.startswith("-DAPP_ENV=")],
+                    ["-DAPP_ENV=" + pio_env],
+                )
                 self.assertIn(
                     "-DBUILD_EPOCH=" + str(version["build_epoch"]), env["CCFLAGS"]
                 )
@@ -492,6 +513,8 @@ class VersionIdentityTests(unittest.TestCase):
                 )
                 self.assertEqual(manifest["source"], version["source"])
                 self.assertEqual(manifest["version"], version["long"])
+                self.assertEqual(manifest["platformioTarget"], target)
+                self.assertEqual(manifest["pio_env"], pio_env)
                 self.assertEqual(
                     manifest["identity_sha256"], version["identity_sha256"]
                 )

@@ -21,6 +21,7 @@ def verify(workspace, profile, origin):
         "identity_sha256": expected["identity_sha256"],
         "build_epoch": expected["build_epoch"],
         "platformioTarget": profile,
+        "pio_env": "heltec-v4",
         "mcu": "esp32s3",
         "repo": repo,
     }

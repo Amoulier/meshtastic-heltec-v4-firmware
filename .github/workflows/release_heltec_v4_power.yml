@@ -194,7 +194,7 @@ jobs:
               --arg littlefs_bin "$littlefs_bin" --arg ota_bin "$ota_bin" \
               '.platformioTarget == $target and .version == $version and .mcu == "esp32s3" and
                .repo == "Amoulier/meshtastic-heltec-v4-firmware" and .hwModelSlug == "HELTEC_V4" and
-               .partitionScheme == "16MB" and
+               .partitionScheme == "16MB" and .pio_env == "heltec-v4" and
                .upstream_version == "2.8.2" and .fork_revision == 9 and
                .source.commit == $commit and .source.dirty == false and
                .source.sha256 == $source_sha256 and .identity_sha256 == $identity_sha256 and
@@ -275,8 +275,20 @@ jobs:
           # Publish the normal application images individually for OTA updates. A factory image is
           # intentionally available only inside its complete bundle: after an erase it must be flashed
           # together with the OTA loader and LittleFS image by device-install.*.
-          cp "release-assets/standard/firmware-heltec-v4-standard-${firmware_version}.bin" publish/
-          cp "release-assets/solar-router/firmware-heltec-v4-solar-router-${firmware_version}.bin" publish/
+          cp "release-assets/standard/firmware-heltec-v4-standard-${firmware_version}.bin" \
+            "publish/firmware-heltec-v4-${firmware_version}-standard.bin"
+          cp "release-assets/solar-router/firmware-heltec-v4-solar-router-${firmware_version}.bin" \
+            "publish/firmware-heltec-v4-${firmware_version}-solar-router.bin"
+
+          # Keep the USB payload names for existing profile targets; OTA also needs the canonical board name.
+          for profile in standard solar-router; do
+            directory="release-assets/$profile"
+            original="$directory/firmware-heltec-v4-${profile}-${firmware_version}.bin"
+            mkdir -p "$directory/ota"
+            cp "$original" "$directory/ota/firmware-heltec-v4-${firmware_version}.bin"
+            cmp -s "$original" "$directory/ota/firmware-heltec-v4-${firmware_version}.bin"
+            cmp -s "$original" "publish/firmware-heltec-v4-${firmware_version}-${profile}.bin"
+          done
 
           (
             cd release-assets/standard
@@ -289,6 +301,11 @@ jobs:
 
           standard_zip_listing=$(zipinfo -l "publish/heltec-v4-standard-complete-${firmware_version}.zip")
           solar_zip_listing=$(zipinfo -l "publish/heltec-v4-solar-router-complete-${firmware_version}.zip")
+          for profile in standard solar-router; do
+            unzip -p "publish/heltec-v4-${profile}-complete-${firmware_version}.zip" \
+              "ota/firmware-heltec-v4-${firmware_version}.bin" \
+              | cmp -s - "publish/firmware-heltec-v4-${firmware_version}-${profile}.bin"
+          done
           grep -E '^-rwxr-xr-x .* device-install\.sh$' <<<"$standard_zip_listing" >/dev/null
           grep -E '^-rwxr-xr-x .* device-update\.sh$' <<<"$standard_zip_listing" >/dev/null
           grep -E '^-rwxr-xr-x .* device-install\.sh$' <<<"$solar_zip_listing" >/dev/null
@@ -377,12 +394,10 @@ jobs:
 
             Changes in this revision:
 
-            - Early boot and normal telemetry share one calibrated 15-sample battery ADC reader and the persisted custom multiplier. A verified NVS cache makes the multiplier available before preferences load.
-            - Multiplier changes discard readings and filters from the previous scale. Invalid calibration, initialization failures, and failed samples cannot authorize battery-powered storage writes; Solar Router remains in protective sleep when early calibration cannot be trusted and no USB data host is connected.
-            - Initial region selection persists a complete configuration generation, and PRG menu callbacks retain valid selection and text storage.
-            - Preference transactions drain admitted radio work before parking the SX1262, preserving reception state and preventing maintenance or queued work from reactivating a parked radio.
-            - Firmware filenames, the API, the ESP application descriptor, and manifests share one source-derived identity. Clean builds use `2.8.2-h9g<8-character fingerprint>`; modified sources use `h9d`. Manifests include full source/build-identity SHA256, source commit, and image SHA256. Old images are never renamed into the new release.
-            - Windows installers correctly parse supported esptool versions with CMD delayed expansion enabled.
+            - Both profiles now advertise the canonical `heltec-v4` board identity through the device API and mDNS. Standard and Solar Router remain separate builds with their existing behavior.
+            - Manifests record the common `pio_env` separately from the profile-specific `platformioTarget`; build and release checks require this identity.
+            - The normal OTA assets place the profile after the version so Android accepts them for `heltec-v4`. Each complete ZIP also contains the identical normal application in `ota/` under the canonical board filename.
+            - Nodes still advertising the old profile target can use the root normal application from the matching complete ZIP for this migration. After installation, reconnect the app so it reads the corrected board identity.
 
             Choose the profile for the intended use:
 
@@ -395,7 +410,8 @@ jobs:
 
             Installation:
 
-            - OTA: use the profile-specific normal `.bin` published as an individual asset.
+            - OTA on a node advertising `heltec-v4`: use the matching normal `.bin` individual asset, or the canonical application inside the complete ZIP's `ota/` directory.
+            - OTA migration from `heltec-v4-standard` or `heltec-v4-solar-router`: extract the matching complete ZIP and select its root normal `.bin` (not `.factory.bin`). It retains the old filename required by the installed app target, while the new firmware inside announces `heltec-v4`. Reconnect the app after the update.
             - Wired preserving update: extract the matching `complete` ZIP and run `device-update.sh` or `device-update.bat` with its normal `.bin` and adjacent manifest.
             - Clean installation: extract every file from the matching `complete` ZIP and run `device-install.sh` or `device-install.bat` with its `.factory.bin`. This erases existing settings and identity, then writes the application, unified OTA loader, and LittleFS together. Do not erase and flash the `.factory.bin` alone.
             - Installers require esptool 4.5.1 or newer and an explicit serial port. They verify ESP32-S3, 16 MB flash, profile/version, repository provenance, partition layout, sizes, and digests before writing. POSIX scripts also require `jq`.

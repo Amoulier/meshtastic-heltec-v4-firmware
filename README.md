@@ -18,6 +18,8 @@ The common goal is lower avoidable power consumption, protection against deep-di
 | **Standard**     | `heltec-v4-standard`     | `CLIENT`, `CLIENT_MUTE`, `CLIENT_BASE`, tracker, handheld, mobile, and other regular nodes | Meshtastic's normal 3.10 V threshold, 10 confirming readings, and role-default wake behavior                                                     |
 | **Solar Router** | `heltec-v4-solar-router` | Fixed, elevated, unattended solar infrastructure using `ROUTER` or `ROUTER_LATE`           | 3.50 V threshold, 3 confirming readings, timer-only sleep, peripheral isolation, and a 3.65 V recovery latch with an active USB data-host bypass |
 
+Both profiles report `heltec-v4` as their device/OTA target (`MyInfo.pio_env`). The build environment and manifest `platformioTarget` retain the profile name; manifest `pio_env` records the common device identity.
+
 The firmware profile does **not** change the node role automatically. Select the intended role separately in the Meshtastic app or CLI.
 
 Do not use an advanced routing role merely because a node is stationary. Most personal and mobile nodes should remain on a client role. Use the Solar Router profile only where the node is intentionally part of fixed routing infrastructure and has an appropriate antenna, location, battery, and solar supply.
@@ -192,25 +194,21 @@ Profile isolation is additionally checked by host policy tests and by compiling 
 
 Open the repository's [Releases](https://github.com/Amoulier/meshtastic-heltec-v4-firmware/releases) page and select the latest stable profile release.
 
-The distribution revision is `v2.8.0.9` (full tag: `heltec-v4-profiles-v2.8.0.9`). Its manifests, firmware filenames, ESP application descriptor, and Meshtastic client **About** view identify the compiled image as `2.8.0-h9g<8-character fingerprint>`. Local builds with modified sources use `h9d` instead of `h9g`; the compact OLED footer displays `2.8.0-h9`. The manifest records the full source and build-identity SHA256, source commit, and each image's SHA256. Rebuild after committing source changes; renaming a previous image does not change its embedded identity.
+The distribution revision is `v2.8.2.9` (full tag: `heltec-v4-profiles-v2.8.2.9`). Its manifests, firmware filenames, ESP application descriptor, and Meshtastic client **About** view identify the compiled image as `2.8.2-h9g<8-character fingerprint>`. Local builds with modified sources use `h9d` instead of `h9g`; the compact OLED footer displays `2.8.2-h9`. The manifest records the full source and build-identity SHA256, source commit, and each image's SHA256. Rebuild after committing source changes; renaming a previous image does not change its embedded identity.
 
 ### Standard node
 
-Use files beginning with:
-
-```text
-firmware-heltec-v4-standard-
-```
+Use the standalone OTA asset `firmware-heltec-v4-<version>-standard.bin` or the `heltec-v4-standard-complete-<version>.zip` bundle.
 
 ### Solar router
 
-Use files beginning with:
-
-```text
-firmware-heltec-v4-solar-router-
-```
+Use the standalone OTA asset `firmware-heltec-v4-<version>-solar-router.bin` or the `heltec-v4-solar-router-complete-<version>.zip` bundle.
 
 ### OTA update - recommended
+
+For a node reporting `heltec-v4`, select the matching standalone OTA asset or `ota/firmware-heltec-v4-<version>.bin` from its complete ZIP. The copy in `ota/` has identical contents to that profile's normal application.
+
+For a node still reporting `heltec-v4-standard` or `heltec-v4-solar-router`, extract the matching complete ZIP and select its root normal `.bin` for this migration. Its filename matches the previous target; the firmware inside announces `heltec-v4`. Reconnect the app after updating so it reads the new identity. Installing official firmware afterward replaces the custom profile features.
 
 Use the normal `.bin` image that does not contain `.factory` in its filename. An OTA or normal firmware update preserves the node configuration, every valid keypair, Bluetooth bonds, and persistent display setting. The visible Node ID exceptions described above still apply to a legacy mismatched identity, a clean keyless node, or a rejected low-entropy key.
 
@@ -279,7 +277,7 @@ The common source base incorporates official Meshtastic changes through:
 660680cea532ec1caf5d5f3e5dd1932c44b1dccd
 ```
 
-The development tree uses the 2.8.2 source line with the Heltec V4 Standard and Solar Router policies retained. Native integration tests use platform adapters from the same upstream commit. The published `v2.8.0.9` package described above remains a separate, older release; this synchronization does not publish firmware.
+The `v2.8.2.9` distribution uses this 2.8.2 source line with the Heltec V4 Standard and Solar Router policies retained and the common `heltec-v4` OTA identity restored. Native integration tests use platform adapters from the same upstream commit.
 
 Because this is a standalone repository rather than a formal GitHub fork, the exact upstream source commit is recorded in synchronization commits and release notes.
 

@@ -75,6 +75,134 @@ require(
     "standalone recovery assets are published",
 )
 
+
+# Android 2.8.2 FirmwareFileHandler requires the version immediately after the
+# hardware target. Keep USB profile filenames and their manifest untouched,
+# while providing one byte-identical, target-compatible OTA image per bundle.
+# Contract: Meshtastic-Android 616592901c0595c1cd1a0184a07e63743c846e55,
+# feature/firmware/.../FirmwareFileHandler.kt:isValidFirmwareFile.
+def android_accepts_ota_name(filename: str, target: str = "heltec-v4") -> bool:
+    extension = ".bin"
+    if (
+        filename.startswith(("littlefs-", "bleota", "mt-"))
+        or ".factory." in filename
+        or not target.strip()
+        or not filename.endswith(extension)
+    ):
+        return False
+    target_token = re.escape(target)
+    extension_token = re.escape(extension)
+    version_or_firmware = r"([\-_]v?\d+\.\d+|[\-_.]firmware)"
+    target_pattern = re.compile(
+        rf"(^|.*[\-_]){target_token}({version_or_firmware}.*{extension_token}$|{extension_token}$)"
+    )
+    return target_pattern.fullmatch(filename) is not None
+
+
+copy_commands = set(
+    re.findall(
+        r'^\s*cp\s+"([^"]+)"\s+"([^"]+)"\s*$',
+        release.replace("\\\n", " "),
+        re.MULTILINE,
+    )
+)
+canonical_bundle_name = "firmware-heltec-v4-${firmware_version}.bin"
+require(
+    release.count("for profile in standard solar-router; do") == 2
+    and 'directory="release-assets/$profile"' in release
+    and 'original="$directory/firmware-heltec-v4-${profile}-${firmware_version}.bin"'
+    in release
+    and ("$original", f"$directory/ota/{canonical_bundle_name}") in copy_commands,
+    "complete bundles do not add the canonical OTA image from their own profile",
+)
+for comparison in (
+    f'cmp -s "$original" "$directory/ota/{canonical_bundle_name}"',
+    'cmp -s "$original" "publish/firmware-heltec-v4-${firmware_version}-${profile}.bin"',
+):
+    require(
+        comparison in release,
+        "release does not verify byte identity of each OTA alias and its profile image",
+    )
+require(
+    re.search(
+        r'unzip -p "publish/heltec-v4-\$\{profile\}-complete-\$\{firmware_version\}\.zip"'
+        r'\s+"ota/firmware-heltec-v4-\$\{firmware_version\}\.bin"'
+        r'\s+\| cmp -s - "publish/firmware-heltec-v4-\$\{firmware_version\}-\$\{profile\}\.bin"',
+        release.replace("\\\n", " "),
+    )
+    is not None,
+    "release does not verify the actual ZIP OTA payload against its published profile image",
+)
+for profile in ("standard", "solar-router"):
+    original = f"release-assets/{profile}/firmware-heltec-v4-{profile}-${{firmware_version}}.bin"
+    canonical = f"firmware-heltec-v4-${{firmware_version}}-{profile}.bin"
+    published = f"publish/{canonical}"
+    require(
+        (original, published) in copy_commands,
+        f"{profile} OTA publication is not copied from its verified normal image",
+    )
+    require(
+        release.index(f"validate_profile release-assets/{profile} heltec-v4-{profile}")
+        < release.index(f'cp "{original}"')
+        < release.index('cp "$original" "$directory/ota/'),
+        f"{profile} OTA image is copied before its manifest validation",
+    )
+    for version in ("2.8.2-h9g12345678", "2.8.2-h9gabcdef12"):
+        require(
+            android_accepts_ota_name(canonical.replace("${firmware_version}", version)),
+            f"{profile} published OTA filename is incompatible with Android's hardware target",
+        )
+        require(
+            not android_accepts_ota_name(f"firmware-heltec-v4-{profile}-{version}.bin"),
+            "Android filename fixture no longer reproduces the old profile-name rejection",
+        )
+        archive_names = (
+            f"firmware-heltec-v4-{profile}-{version}.bin",
+            f"firmware-heltec-v4-{profile}-{version}.factory.bin",
+            f"littlefs-heltec-v4-{profile}-{version}.bin",
+            "mt-esp32s3-ota.bin",
+            "ota/" + canonical_bundle_name.replace("${firmware_version}", version),
+        )
+        opposite_profile = "solar-router" if profile == "standard" else "standard"
+        # New identity selects the OTA alias; legacy identity can migrate using
+        # its own original profile filename, without allowing a cross-profile update.
+        for device_target, expected in (
+            ("heltec-v4", [archive_names[-1]]),
+            (f"heltec-v4-{profile}", [archive_names[0]]),
+            (f"heltec-v4-{opposite_profile}", []),
+        ):
+            require(
+                [
+                    name
+                    for name in archive_names
+                    if android_accepts_ota_name(name, device_target)
+                ]
+                == expected,
+                f"{profile} bundle has incorrect OTA candidates for {device_target}",
+            )
+for rejected in (
+    "firmware-heltec-v4-2.8.2-h9g12345678.factory.bin",
+    "littlefs-heltec-v4-2.8.2-h9g12345678.bin",
+    "mt-esp32s3-ota.bin",
+    "firmware-heltec-v4-r8-2.8.2-h9g12345678.bin",
+    "firmware-heltec-v4-tft-2.8.2-h9g12345678.bin",
+    "firmware-heltec-v3-2.8.2-h9g12345678.bin",
+):
+    require(
+        not android_accepts_ota_name(rejected),
+        f"Android filename fixture accepts a recovery image or another board: {rejected}",
+    )
+require(
+    '.pio_env == "heltec-v4"' in release and ".platformioTarget == $target" in release,
+    "release must validate both the canonical device identity and the build profile",
+)
+require(
+    'test "$file_count" -eq 10' in release
+    and 'test -z "$(find "$directory" -mindepth 1 -maxdepth 1 ! -type f -print -quit)"'
+    in release,
+    "release input validation no longer requires exactly ten flat profile files",
+)
+
 # Capture ZIP listings before matching permissions. Under `set -o pipefail`, a
 # producer piped to an early-exiting matcher can turn an otherwise valid bundle
 # into a SIGPIPE-dependent result.

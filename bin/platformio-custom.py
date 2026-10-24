@@ -14,6 +14,7 @@ from readprops import file_sha256, readProps
 Import("env")
 platform = env.PioPlatform()
 progname = env.get("PROGNAME")
+app_env = env.GetProjectOption("custom_meshtastic_pio_env", env.get("PIOENV"))
 lfsbin = f"{progname.replace('firmware-', 'littlefs-')}.bin"
 manifest_ran = False
 
@@ -292,6 +293,7 @@ def manifest_write(files, env, ram_bytes=None, flash_bytes=None):
         "identity_sha256": verObj["identity_sha256"],
         "build_epoch": build_epoch,
         "platformioTarget": env.get("PIOENV"),
+        "pio_env": app_env,
         "mcu": env.get("BOARD_MCU"),
         "repo": repo_owner,
         "files": files,
@@ -455,7 +457,7 @@ build_epoch = verObj["build_epoch"]
 flags = [
     "-DAPP_VERSION=" + verObj["long"],
     "-DAPP_VERSION_SHORT=" + verObj["short"],
-    "-DAPP_ENV=" + env.get("PIOENV"),
+    "-DAPP_ENV=" + app_env,
     "-DAPP_REPO=" + repo_owner,
     "-DBUILD_EPOCH=" + str(build_epoch),
 ] + pref_flags
