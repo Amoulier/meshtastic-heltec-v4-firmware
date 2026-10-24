@@ -564,6 +564,14 @@ Key defines in variant.h:
 
 ## Build System
 
+### Heltec V4 OTA identity contract
+
+- Preserve this contract during upstream merges and release work. Standard, Solar Router, and the legacy alias must compile `APP_ENV=heltec-v4` and report `MyInfo.pio_env=heltec-v4`. Keep `custom_meshtastic_pio_env = heltec-v4` in their shared configuration; never substitute the profile name for the device identity.
+- Keep build environments, USB payload names, and manifest `platformioTarget` profile-specific. Manifest `pio_env` records the shared device identity. Do not collapse the Standard and Solar Router build settings.
+- Publish normal OTA images as `firmware-heltec-v4-<version>-<profile>.bin`. Each complete ZIP must retain its USB payloads and contain the byte-identical normal image at `ota/firmware-heltec-v4-<version>.bin`. Renaming a file does not change its compiled identity.
+- When diagnosing an OTA target mismatch, read the target expected by the app and the currently installed version first. A node still announcing `heltec-v4-standard` or `heltec-v4-solar-router` needs the normal BIN from the matching ZIP's root for its first migration, then an app reconnection. Do not select a factory image or promise cross-profile migration from an old target. A USB firmware update can also replace the old identity; this does not by itself prove BLE loader compatibility or a successful OTA transfer.
+- Keep the real PlatformIO-hook tests in `version_identity_test.py`, the production `PhoneAPI::fillMyInfo` test in `heltec_audit_regression.py`, and the Android filename/migration checks in `heltec_release_policy_test.py`. Run them through `bin/heltec-ci.sh check` (`bin/heltec-ci.ps1 check` on Windows); both firmware builds and native audits remain required before publication. Require canonical `pio_env`, the correct profile, and payload hashes in artifact verification. Report hardware OTA validation separately from compilation and host tests.
+
 ### Agent Tooling Baseline
 
 For this Heltec-only fork, validate changes with `bin/heltec-ci.sh all` (or `bin/heltec-ci.ps1 all` on Windows). The same container launchers run in GitHub; `check`, `build-standard`, `build-solar-router`, and `native` select individual stages. Keep the source unchanged during a validation run. Native host adapters are installed only in disposable snapshots by `bin/test-native-docker.sh`.

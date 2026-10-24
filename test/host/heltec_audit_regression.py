@@ -66,6 +66,92 @@ def build_run(name, cpp, extra=()):
     print(f"{name}: PASS (real production bodies, ASan+UBSan)", flush=True)
 
 
+# Exercise PhoneAPI::fillMyInfo itself: correct build flags and manifests do not
+# prevent a later API edit from advertising an old profile or omitting identity.
+# Access-control redaction must affect only the unauthorized response, not the
+# retained identity needed by a subsequent authorized client.
+phone_info_prefix = r"""
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <initializer_list>
+#define xstr(s) ystr(s)
+#define ystr(s) #s
+#define optstr(s) (xstr(s)[0] ? xstr(s) : "unset")
+constexpr int meshtastic_FromRadio_my_info_tag=3;
+struct MyInfo {
+ uint32_t my_node_num=0, min_app_version=0;
+ struct { uint16_t size=0; uint8_t bytes[16]={}; } device_id;
+ char pio_env[40]={}; uint16_t nodedb_count=0;
+} myNodeInfo;
+struct NodeDB { size_t count=0; size_t getNumMeshNodes(){return count;} } database;
+NodeDB* nodeDB=&database;
+struct PhoneAPI {
+ struct { int which_payload_variant=0; MyInfo my_info; } fromRadioScratch;
+ bool authorized=true;
+ bool getAdminAuthorized(){return authorized;}
+ void fillMyInfo();
+};
+"""
+phone_info_tests = r"""
+int main(){
+ PhoneAPI api;
+ myNodeInfo.my_node_num=0x12345678; myNodeInfo.min_app_version=30200;
+ myNodeInfo.device_id.size=sizeof(myNodeInfo.device_id.bytes);
+ memset(myNodeInfo.device_id.bytes,0xa5,sizeof(myNodeInfo.device_id.bytes));
+ for(unsigned count : {0u,7u,250u}) {
+  database.count=count; myNodeInfo.nodedb_count=1;
+  strcpy(myNodeInfo.pio_env,"heltec-v4-standard");
+  strcpy(api.fromRadioScratch.my_info.pio_env,"heltec-v4-solar-router");
+  api.fromRadioScratch.which_payload_variant=0;
+  api.fillMyInfo();
+  const auto& out=api.fromRadioScratch.my_info;
+  assert(api.fromRadioScratch.which_payload_variant==meshtastic_FromRadio_my_info_tag);
+  assert(strcmp(out.pio_env,"heltec-v4")==0);
+  assert(strcmp(myNodeInfo.pio_env,"heltec-v4")==0);
+  assert(out.nodedb_count==count); assert(myNodeInfo.nodedb_count==count);
+  assert(out.my_node_num==0x12345678); assert(out.min_app_version==30200);
+  assert(out.device_id.size==16);
+  for(auto byte : out.device_id.bytes)assert(byte==0xa5);
+ }
+ api.authorized=false; database.count=17;
+ api.fillMyInfo();
+ const auto& redacted=api.fromRadioScratch.my_info;
+ assert(redacted.my_node_num==0x12345678); assert(redacted.nodedb_count==17);
+#ifdef MESHTASTIC_PHONEAPI_ACCESS_CONTROL
+ for(auto ch : redacted.pio_env)assert(ch==0);
+ assert(redacted.min_app_version==0); assert(redacted.device_id.size==0);
+ for(auto byte : redacted.device_id.bytes)assert(byte==0);
+#else
+ assert(strcmp(redacted.pio_env,"heltec-v4")==0);
+ assert(redacted.min_app_version==30200); assert(redacted.device_id.size==16);
+ for(auto byte : redacted.device_id.bytes)assert(byte==0xa5);
+#endif
+ assert(strcmp(myNodeInfo.pio_env,"heltec-v4")==0);
+ assert(myNodeInfo.min_app_version==30200); assert(myNodeInfo.device_id.size==16);
+ for(auto byte : myNodeInfo.device_id.bytes)assert(byte==0xa5);
+ api.authorized=true; database.count=23;
+ api.fillMyInfo();
+ const auto& restored=api.fromRadioScratch.my_info;
+ assert(strcmp(restored.pio_env,"heltec-v4")==0);
+ assert(restored.nodedb_count==23); assert(restored.min_app_version==30200);
+ assert(restored.device_id.size==16);
+ for(auto byte : restored.device_id.bytes)assert(byte==0xa5);
+}
+"""
+phone_info_impl = body("src/mesh/PhoneAPI.cpp", "void PhoneAPI::fillMyInfo()")
+for label, flags in (
+    ("public", ()),
+    ("access_control", ("-DMESHTASTIC_PHONEAPI_ACCESS_CONTROL=1",)),
+):
+    build_run(
+        f"phone_api_ota_identity_{label}",
+        phone_info_prefix + phone_info_impl + phone_info_tests,
+        ("-DAPP_ENV=heltec-v4", *flags),
+    )
+
+
 sx_prefix = r"""
 #include <atomic>
 #include <cassert>

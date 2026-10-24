@@ -15,6 +15,16 @@ Import("env")
 platform = env.PioPlatform()
 progname = env.get("PROGNAME")
 app_env = env.GetProjectOption("custom_meshtastic_pio_env", env.get("PIOENV"))
+if env.get("PIOENV") in (
+    "heltec-v4-standard",
+    "heltec-v4-solar-router",
+    "heltec-v4",
+) and app_env != "heltec-v4":
+    raise ValueError(
+        "Heltec V4 OTA identity must be 'heltec-v4': "
+        f"{env.get('PIOENV')} resolves to {app_env!r}. "
+        "Set custom_meshtastic_pio_env = heltec-v4; keep the profile in PIOENV."
+    )
 lfsbin = f"{progname.replace('firmware-', 'littlefs-')}.bin"
 manifest_ran = False
 

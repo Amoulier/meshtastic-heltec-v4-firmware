@@ -459,14 +459,48 @@ class VersionIdentityTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertFalse(calls.exists())
 
-    def hooks(self, target="heltec-v4-standard"):
+    def hooks(self, target="heltec-v4-standard", configure=None):
         env = BuildEnv(self.root, target)
+        if configure is not None:
+            configure(env)
         globals_ = {"env": env, "projenv": env, "Import": lambda name: None}
         runpy.run_path(str(ROOT / "bin/platformio-pre.py"), init_globals=globals_)
         module = runpy.run_path(
             str(ROOT / "bin/platformio-custom.py"), init_globals=globals_
         )
         return env, module
+
+    def test_actual_hook_rejects_noncanonical_heltec_ota_identity(self):
+        # Reject the original profile-name regression before any firmware is built,
+        # even when the caller runs PlatformIO without the CI host checks.
+        for target in ("heltec-v4-standard", "heltec-v4-solar-router", "heltec-v4"):
+            for identity in (
+                "heltec-v4-standard",
+                "heltec-v4-solar-router",
+                "heltec-v3",
+                "HELTEC_V4",
+                "heltec-v4 ",
+                "",
+            ):
+                with self.subTest(target=target, identity=identity):
+                    with self.assertRaisesRegex(ValueError, "Heltec V4 OTA identity"):
+                        self.hooks(
+                            target,
+                            lambda env: env.config.set(
+                                "env:" + target, "custom_meshtastic_pio_env", identity
+                            ),
+                        )
+
+    def test_actual_hook_rejects_profile_name_fallback(self):
+        for target in ("heltec-v4-standard", "heltec-v4-solar-router"):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(ValueError, "Heltec V4 OTA identity"):
+                    self.hooks(
+                        target,
+                        lambda env: env.config.remove_option(
+                            "env:" + target, "custom_meshtastic_pio_env"
+                        ),
+                    )
 
     def test_actual_hooks_bind_api_filename_sdk_cache_epoch_and_manifest(self):
         for target, pio_env in (

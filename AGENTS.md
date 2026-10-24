@@ -26,6 +26,8 @@ This repository is the [Meshtastic](https://meshtastic.org) firmware - a C++17 e
 
 This file (`AGENTS.md`) is a short pointer + quick reference for agents that don't read `.github/copilot-instructions.md` by default.
 
+For every Heltec V4 review, upstream merge, or release, preserve the [OTA identity contract](.github/copilot-instructions.md#heltec-v4-ota-identity-contract), including the checks and first-update path for nodes with an older profile identity.
+
 ## Quick command reference
 
 | Action                           | Command                                                                                                                                                               |
